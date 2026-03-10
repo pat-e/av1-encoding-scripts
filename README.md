@@ -7,10 +7,13 @@ This repository contains Python scripts for batch-processing MKV files to encode
 
 *   **`aom_opus_encoder.py`**: Uses the `aom` encoder (specifically designed for the `aom-psy101` fork) via `av1an`. It is tuned for high perceptual quality with specific psychovisual parameters and film grain synthesis.
 *   **`svt_opus_encoder.py`**: Uses the `svt-av1` encoder (specifically designed for the `SVT-AV1-Essential` fork) via `av1an`. It provides a good balance between encoding speed and quality, and allows customization of speed, quality, and film-grain presets from the command line.
+*   **`hdr_svt_opus_encoder.py`**: A specialized script for 4K HDR movies using the `SVT-AV1-Essential` encoder. It is designed for pre-processed CFR inputs, preserves original surround sound audio without downmixing, and retains HDR metadata.
 
 ## Encoding Parameters Documentation
 
-For detailed information on the specific FFmpeg arguments, audio downmixing logic, VFR-to-CFR conversion processes, and the special SVT-AV1/AomEnc parameters used by these scripts, please refer to the [`parameters.md`](parameters.md) file.
+For detailed information on the specific FFmpeg arguments, audio downmixing logic, VFR-to-CFR conversion processes, and the special SVT-AV1/AomEnc parameters used by the standard scripts, please refer to the [`parameters.md`](parameters.md) file.
+
+For the HDR-specific encoder parameters and settings used in `hdr_svt_opus_encoder.py`, please see [`parameters_hdr.md`](parameters_hdr.md).
 
 ## Prerequisites
 
@@ -60,7 +63,7 @@ python aom_opus_encoder.py [options]
 *   `--no-downmix`: Preserve original audio channel layout (do not downmix 5.1/7.1 to stereo).
 *   `--autocrop`: Automatically detect and crop black bars from the video.
 *   `--grain <int>`: Set the `photon-noise` value for grain synthesis (default: 8).
-*   `--crf <int>`: Set the constant quality level (`cq-level`) for video encoding (default: 28).
+*   `--crf <int>`: Set the constant quality level (`cq-level`) for video encoding (default: 25).
 
 ### `svt_opus_encoder.py`
 
@@ -74,6 +77,17 @@ python svt_opus_encoder.py [options]
 *   `--speed <str>`: Set the SVT-AV1 encoding speed preset (e.g., `slower`, `slow`, `medium`, `fast`, `faster`). Defaults to `slower`.
 *   `--quality <str>`: Set the SVT-AV1 encoding quality preset (e.g., `lowest`, `low`, `medium`, `high`, `higher`). Defaults to `medium`.
 *   `--grain <int>`: Set the `film-grain` value. Adjusts the film grain synthesis level. Defaults to 6.
+
+### `hdr_svt_opus_encoder.py`
+
+```bash
+python hdr_svt_opus_encoder.py [options]
+```
+
+**Options:**
+*   `--speed <str>`: Set the SVT-AV1 encoding speed preset (e.g., `slower`, `slow`, `medium`, `fast`, `faster`).
+*   `--quality <str>`: Set the SVT-AV1 encoding quality preset (e.g., `lowest`, `low`, `medium`, `high`, `higher`).
+*   `--grain <int>`: Set the `film-grain` value. Adjusts the film grain synthesis level.
 
 ## Process Workflow
 

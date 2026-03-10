@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""
-NOTE: This script requires the custom aom-psy101 encoder.
-Please download the correct version from: https://gitlab.com/damian101/aom-psy101
-"""
+
+# Note: This script is configured to use a custom version of aom 
+# called "aom-psy101" from https://gitlab.com/damian101/aom-psy101
+
 import os
 import sys
 import subprocess
@@ -22,6 +22,30 @@ DIR_ORIGINAL = Path("original")
 DIR_CONV_LOGS = Path("conv_logs") # Directory for conversion logs
 
 REMUX_CODECS = {"aac", "opus"}  # Using a set for efficient lookups
+
+AOM_AV1_PARAMS = {
+    "bit-depth": 10,                 # Force 10-bit encoding for better color precision and less banding
+    "cpu-used": 2,                   # Speed preset. Lower is slower/better quality. 4 is default, 2 is slow/high quality
+    "end-usage": "q",                # Constant Quality mode
+    "cq-level": 25,                  # The target quality level (0-63). Lower is better quality/larger file
+    "min-q": 6,                      # Minimum allowable quantizer to prevent bitrate spikes on flat frames
+    "threads": 2,                    # Threads per av1an worker
+    "tune-content": "psy",           # Specialized tuning for psychovisual quality (needs aom-psy101)
+    "frame-parallel": 1,             # Enable frame parallel decoding
+    "tile-columns": 1,               # Use 2 tile columns (2^1) for faster decoding
+    "gf-max-pyr-height": 4,          # Golden Frame pyramid height (max is 5)
+    "deltaq-mode": 2,                # Enable perceptual quantizer (AQ mode based on variance)
+    "enable-keyframe-filtering": 0,  # We disable internal KF filtering as av1an handles chunking
+    "disable-kf": "",                # Disable internal keyframes (av1an inserts them at scene cuts)
+    "enable-fwd-kf": 0,              # Disable forward keyframes
+    "kf-max-dist": 9999,             # Set max keyframe distance arbitrarily high
+    "sb-size": "dynamic",            # Allow the encoder to choose 64x64 or 128x128 superblocks dynamically
+    "enable-chroma-deltaq": 1,       # Enable chroma quantization adjustment
+    "enable-qm": 1,                  # Enable quantization matrices for better high-frequency detail retention
+    "color-primaries": "bt709",      # Standard SDR color space
+    "transfer-characteristics": "bt709",
+    "matrix-coefficients": "bt709"
+}
 
 
 def check_tools():
@@ -122,7 +146,7 @@ def convert_audio_track(index, ch, lang, audio_temp_dir, source_file, should_dow
     ])
     return final_opus
 
-def convert_video(source_file_base, source_file_full, is_vfr, target_cfr_fps_for_handbrake, autocrop_filter=None, grain=8, crf=28):
+def convert_video(source_file_base, source_file_full, is_vfr, target_cfr_fps_for_handbrake, autocrop_filter=None):
     print("  --- Starting Video Processing ---")
     # source_file_base is file_path.stem (e.g., "my.anime.episode.01")
     vpy_file = Path(f"{source_file_base}.vpy")
@@ -207,11 +231,11 @@ clip.set_output()
     workers = max(1, (total_cores // 2) - 1) # Half the cores minus one, with a minimum of 1 worker.
     print(f"    - Using {workers} workers for av1an (Total Cores: {total_cores}, Logic: (Cores/2)-1).")
 
-    aom_video_params_str = f" --bit-depth=10 --cpu-used=2 --end-usage=q --cq-level={crf} --min-q=6 --threads=2 --tune-content=psy --frame-parallel=1 --tile-columns=1 --gf-max-pyr-height=4 --deltaq-mode=2 --enable-keyframe-filtering=0 --disable-kf --enable-fwd-kf=0 --kf-max-dist=9999 --sb-size=dynamic --enable-chroma-deltaq=1 --enable-qm=1 --color-primaries=bt709 --transfer-characteristics=bt709 --matrix-coefficients=bt709 "
+    aom_video_params_str = " ".join([f"--{key}={value}" if value != "" else f"--{key}" for key, value in AOM_AV1_PARAMS.items()])
 
     av1an_enc_args = [
         "av1an", "-i", str(vpy_file), "-o", str(encoded_video_file), "-n",
-        "-e", "aom", "--photon-noise", str(grain), "--resume", "--sc-pix-format", "yuv420p", "-c", "mkvmerge",
+        "-e", "aom", "--resume", "--sc-pix-format", "yuv420p", "-c", "mkvmerge",
         "--set-thread-affinity", "2", "--pix-format", "yuv420p10le", "--force", "--no-defaults",
         "-w", str(workers), "--passes", "2",
         "-v", aom_video_params_str
@@ -459,8 +483,16 @@ def detect_autocrop_filter(input_file, significant_crop_threshold=5.0, min_crop=
         return None
     return _analyze_video_cropdetect(input_file, duration, width, height, max(1, os.cpu_count() // 2), significant_crop_threshold, min_crop, debug)
 
-def main(no_downmix=False, autocrop=False, grain=8, crf=25):
+def main(no_downmix=False, autocrop=False, grain=None, crf=None):
     check_tools()
+
+    if grain is not None:
+        AOM_AV1_PARAMS["photon-noise"] = grain
+    elif "photon-noise" not in AOM_AV1_PARAMS:
+        AOM_AV1_PARAMS["photon-noise"] = 8
+
+    if crf is not None:
+        AOM_AV1_PARAMS["cq-level"] = crf
 
     current_dir = Path(".")
     files_to_process = sorted(
@@ -574,7 +606,7 @@ def main(no_downmix=False, autocrop=False, grain=8, crf=25):
                     else:
                         print("    - No crop needed or detected.")
                 encoded_video_file, handbrake_intermediate_for_cleanup = convert_video(
-                    file_path.stem, str(input_file_abs), is_vfr, target_cfr_fps_for_handbrake, autocrop_filter=autocrop_filter, grain=grain, crf=crf
+                    file_path.stem, str(input_file_abs), is_vfr, target_cfr_fps_for_handbrake, autocrop_filter=autocrop_filter
                 )
 
                 print("--- Starting Audio Processing ---")
@@ -747,7 +779,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Batch-process MKV files with resumable video encoding, audio downmixing, per-file logging, and optional autocrop.")
     parser.add_argument("--no-downmix", action="store_true", help="Preserve original audio channel layout.")
     parser.add_argument("--autocrop", action="store_true", help="Automatically detect and crop black bars from video using cropdetect.")
-    parser.add_argument("--grain", type=int, default=8, help="Set the photon-noise value for grain synthesis (default: 8).")
-    parser.add_argument("--crf", type=int, default=28, help="Set the constant quality level (cq-level) for video encoding (default: 28).")
+    parser.add_argument("--grain", type=int, help="Set the photon-noise value for grain synthesis (default: 8).")
+    parser.add_argument("--crf", type=int, help="Set the constant quality level (cq-level) for video encoding (default: 25).")
     args = parser.parse_args()
     main(no_downmix=args.no_downmix, autocrop=args.autocrop, grain=args.grain, crf=args.crf)

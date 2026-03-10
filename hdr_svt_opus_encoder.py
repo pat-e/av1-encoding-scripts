@@ -24,18 +24,18 @@ DIR_CONV_LOGS = Path("conv_logs")
 REMUX_CODECS = {"aac", "opus"}
 
 SVT_AV1_PARAMS = {
-    "speed": "slower",
-    "quality": "medium",
-    "film-grain": 12,
-    "color-primaries": 9,
-    "transfer-characteristics": 16,
-    "matrix-coefficients": 9,
-    "scd": 0,
-    "keyint": 0,
-    "lp": 2,
-    "auto-tiling": 1,
-    "tune": 1,
-    "progress": 2,
+    "speed": "slower",                 # Speed preset. Slower yields better compression efficiency/quality. ("slower", "slow", "medium", "fast", "faster")
+    "quality": "medium",               # Quality preset for SVT-AV1-Essential. ("higher", "high", "medium", "low", "lower")
+    "film-grain": 12,                  # Film grain synthesis level. HDR content often benefits from a slightly higher grain (12).
+    "color-primaries": 9,              # BT.2020 color primaries for HDR.
+    "transfer-characteristics": 16,    # SMPTE 2084 (PQ) transfer characteristics for HDR10.
+    "matrix-coefficients": 9,          # BT.2020 non-constant luminance matrix coefficients for HDR.
+    "scd": 0,                          # Scene change detection OFF (av1an handles scene cuts).
+    "keyint": 0,                       # Keyframe interval OFF (av1an inserts keyframes).
+    "lp": 2,                           # Logical Processors to use per av1an worker (perfect for leaving cores free).
+    "auto-tiling": 1,                  # Automatically determine the number of tiles based on resolution.
+    "tune": 1,                         # 0 = VQ, 1 = PSNR, 2 = SSIM (SVT-AV1-Essential default recommended).
+    "progress": 2,                     # Detailed progress output.
 }
 
 def check_tools():

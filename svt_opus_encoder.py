@@ -24,18 +24,18 @@ DIR_CONV_LOGS = Path("conv_logs") # Directory for conversion logs
 REMUX_CODECS = {"aac", "opus"}  # Using a set for efficient lookups
 
 SVT_AV1_PARAMS = {
-    "speed": "slower",  # "slower", "slow", "medium", "fast", "faster"
-    "quality": "medium",  # "higher", "high", "medium", "low", "lower"
-    "film-grain": 6,
-    "color-primaries": 1,
-    "transfer-characteristics": 1,
-    "matrix-coefficients": 1,
-    "scd": 0,  # Scene change detection OFF for Av1an use
-    "keyint": 0,  # Keyframe interval, 0 disables automatic keyframes placement at a constant interval
-    "lp": 2, # Level of parallelism
-    "auto-tiling": 1,  # Auto tiling ON
-    "tune": 1,  # 0 = VQ, 1 = PSNR, 2 = SSIM
-    "progress": 2,  # Detailed progress output
+    "speed": "slower",                 # Speed preset. Slower yields better compression efficiency/quality. ("slower", "slow", "medium", "fast", "faster")
+    "quality": "medium",               # Quality preset for SVT-AV1-Essential. ("higher", "high", "medium", "low", "lower")
+    "film-grain": 6,                   # Film grain synthesis level. Adds artificial grain to preserve detail and prevent banding.
+    "color-primaries": 1,              # BT.709 color primaries (Standard SDR).
+    "transfer-characteristics": 1,     # BT.709 transfer characteristics (Standard SDR).
+    "matrix-coefficients": 1,          # BT.709 matrix coefficients (Standard SDR).
+    "scd": 0,                          # Scene change detection OFF (av1an handles scene cuts).
+    "keyint": 0,                       # Keyframe interval OFF (av1an inserts keyframes).
+    "lp": 2,                           # Logical Processors to use per av1an worker.
+    "auto-tiling": 1,                  # Automatically determine the number of tiles based on resolution.
+    "tune": 1,                         # 0 = VQ, 1 = PSNR, 2 = SSIM (SVT-AV1-Essential default recommended).
+    "progress": 2,                     # Detailed progress output.
 }
 
 def check_tools():
