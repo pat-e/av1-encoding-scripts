@@ -51,12 +51,14 @@ Both scripts require several external tools to be installed and available in you
 
 ## Usage
 
-Place the script in the directory containing your `.mkv` files and execute it. 
+It is highly recommended to place these scripts (or symbolic links to them) in a directory that is included in your system's `PATH` variable (e.g., `~/bin` on Linux/macOS, or a custom Scripts folder on Windows). This allows you to run the commands directly from any directory.
+
+To use the scripts, open your terminal (bash, PowerShell, etc.), navigate to the folder containing your `.mkv` files, and simply type the name of the script.
 
 ### `aom_opus_encoder.py`
 
 ```bash
-python aom_opus_encoder.py [options]
+aom_opus_encoder.py [options]
 ```
 
 **Options:**
@@ -68,7 +70,7 @@ python aom_opus_encoder.py [options]
 ### `svt_opus_encoder.py`
 
 ```bash
-python svt_opus_encoder.py [options]
+svt_opus_encoder.py [options]
 ```
 
 **Options:**
@@ -81,7 +83,7 @@ python svt_opus_encoder.py [options]
 ### `hdr_svt_opus_encoder.py`
 
 ```bash
-python hdr_svt_opus_encoder.py [options]
+hdr_svt_opus_encoder.py [options]
 ```
 
 **Options:**
