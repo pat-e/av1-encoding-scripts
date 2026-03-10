@@ -87,9 +87,9 @@ hdr_svt_opus_encoder.py [options]
 ```
 
 **Options:**
-*   `--speed <str>`: Set the SVT-AV1 encoding speed preset (e.g., `slower`, `slow`, `medium`, `fast`, `faster`).
-*   `--quality <str>`: Set the SVT-AV1 encoding quality preset (e.g., `lowest`, `low`, `medium`, `high`, `higher`).
-*   `--grain <int>`: Set the `film-grain` value. Adjusts the film grain synthesis level.
+*   `--speed <str>`: Set the SVT-AV1 encoding speed preset (e.g., `slower`, `slow`, `medium`, `fast`, `faster`). Defaults to `slower`.
+*   `--quality <str>`: Set the SVT-AV1 encoding quality preset (e.g., `lowest`, `low`, `medium`, `high`, `higher`). Defaults to `medium`.
+*   `--grain <int>`: Set the `film-grain` value. Adjusts the film grain synthesis level. Defaults to 12.
 
 ## Process Workflow
 
