@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+
+# Note: This script is configured to use a custom version of SVT-AV1 
+# called "SVT-AV1-Essential" from https://github.com/nekotrix/SVT-AV1-Essential
+
 import os
 import sys
 import subprocess
