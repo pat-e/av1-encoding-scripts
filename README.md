@@ -6,7 +6,7 @@ This repository contains Python scripts for batch-processing MKV files to encode
 ## Scripts Overview
 
 *   **`aom_opus_encoder.py`**: Uses the `aom` encoder (specifically designed for the `aom-psy101` fork) via `av1an`. It is tuned for high perceptual quality with specific psychovisual parameters and film grain synthesis.
-*   **`svt_opus_encoder.py`**: Uses the `svt-av1` encoder (specifically designed for the `SVT-AV1-Essential` fork) via `av1an`. It provides a good balance between encoding speed and quality, and allows customization of speed, quality, and film-grain presets from the command line.
+*   **`svt_opus_encoder.py`**: Uses the `svt-av1` encoder (specifically designed for the `SVT-AV1-Essential` fork) via `av1an`. It provides a good balance between encoding speed and quality, and allows customization of preset, crf, and film-grain from the command line.
 *   **`hdr_svt_opus_encoder.py`**: A specialized script for 4K HDR movies using the `SVT-AV1-Essential` encoder. It is designed for pre-processed CFR inputs, preserves original surround sound audio without downmixing, and retains HDR metadata.
 
 ## Encoding Parameters Documentation
@@ -76,8 +76,8 @@ svt_opus_encoder.py [options]
 **Options:**
 *   `--no-downmix`: Preserve original audio channel layout (do not downmix 5.1/7.1 to stereo).
 *   `--autocrop`: Automatically detect and crop black bars from the video.
-*   `--speed <str>`: Set the SVT-AV1 encoding speed preset (e.g., `slower`, `slow`, `medium`, `fast`, `faster`). Defaults to `slower`.
-*   `--quality <str>`: Set the SVT-AV1 encoding quality preset (e.g., `lowest`, `low`, `medium`, `high`, `higher`). Defaults to `medium`.
+*   `--preset <int>`: Set the SVT-AV1 encoding speed preset (e.g., 0-13). Lower is slower and yields better compression. Defaults to 0.
+*   `--crf <int>`: Set the SVT-AV1 Constant Rate Factor (CRF) for video quality (e.g., 0-63). Lower is better quality. Defaults to 30.
 *   `--grain <int>`: Set the `film-grain` value. Adjusts the film grain synthesis level. Defaults to 6.
 
 ### `hdr_svt_opus_encoder.py`
@@ -87,8 +87,8 @@ hdr_svt_opus_encoder.py [options]
 ```
 
 **Options:**
-*   `--speed <str>`: Set the SVT-AV1 encoding speed preset (e.g., `slower`, `slow`, `medium`, `fast`, `faster`). Defaults to `slower`.
-*   `--quality <str>`: Set the SVT-AV1 encoding quality preset (e.g., `lowest`, `low`, `medium`, `high`, `higher`). Defaults to `medium`.
+*   `--preset <int>`: Set the SVT-AV1 encoding speed preset (e.g., 0-13). Lower is slower and yields better compression. Defaults to 0.
+*   `--crf <int>`: Set the SVT-AV1 Constant Rate Factor (CRF) for video quality (e.g., 0-63). Lower is better quality. Defaults to 30.
 *   `--grain <int>`: Set the `film-grain` value. Adjusts the film grain synthesis level. Defaults to 12.
 
 ## Process Workflow

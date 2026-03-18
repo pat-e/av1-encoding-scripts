@@ -24,8 +24,8 @@ DIR_CONV_LOGS = Path("conv_logs")
 REMUX_CODECS = {"aac", "opus"}
 
 SVT_AV1_PARAMS = {
-    "speed": "slower",                 # Speed preset. Slower yields better compression efficiency/quality. ("slower", "slow", "medium", "fast", "faster")
-    "quality": "high",                 # Quality preset for SVT-AV1-Essential. ("higher", "high", "medium", "low", "lower")
+    "preset": 0,                       # Speed preset. Lower is slower and yields better compression efficiency.
+    "crf": 30,                         # Constant Rate Factor (CRF). Lower is better quality.
     "film-grain": 12,                  # Film grain synthesis level. HDR content often benefits from a slightly higher grain (12).
     "color-primaries": 9,              # BT.2020 color primaries for HDR.
     "transfer-characteristics": 16,    # SMPTE 2084 (PQ) transfer characteristics for HDR10.
@@ -168,13 +168,13 @@ clip.set_output()
     print("  --- Finished Video Processing ---")
     return encoded_video_file
 
-def main(speed=None, quality=None, grain=None):
+def main(preset=None, crf=None, grain=None):
     check_tools()
 
-    if speed:
-        SVT_AV1_PARAMS["speed"] = speed
-    if quality:
-        SVT_AV1_PARAMS["quality"] = quality
+    if preset is not None:
+        SVT_AV1_PARAMS["preset"] = preset
+    if crf is not None:
+        SVT_AV1_PARAMS["crf"] = crf
     if grain is not None:
         SVT_AV1_PARAMS["film-grain"] = grain
 
@@ -348,8 +348,8 @@ def main(speed=None, quality=None, grain=None):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Batch-process HDR MKV files.")
-    parser.add_argument("--speed", type=str, help="Set the encoding speed for SVT-AV1.")
-    parser.add_argument("--quality", type=str, help="Set the encoding quality for SVT-AV1.")
+    parser.add_argument("--preset", type=int, help="Set the encoding preset for SVT-AV1. Lower is slower/better compression.")
+    parser.add_argument("--crf", type=int, help="Set the Constant Rate Factor (CRF) for SVT-AV1. Lower is better quality.")
     parser.add_argument("--grain", type=int, help="Set the film-grain value for SVT-AV1.")
     args = parser.parse_args()
-    main(speed=args.speed, quality=args.quality, grain=args.grain)
+    main(preset=args.preset, crf=args.crf, grain=args.grain)

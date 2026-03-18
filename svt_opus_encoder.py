@@ -24,8 +24,8 @@ DIR_CONV_LOGS = Path("conv_logs") # Directory for conversion logs
 REMUX_CODECS = {"aac", "opus"}  # Using a set for efficient lookups
 
 SVT_AV1_PARAMS = {
-    "speed": "slower",                 # Speed preset. Slower yields better compression efficiency/quality. ("slower", "slow", "medium", "fast", "faster")
-    "quality": "medium",               # Quality preset for SVT-AV1-Essential. ("higher", "high", "medium", "low", "lower")
+    "preset": 0,                       # Speed preset. Lower is slower and yields better compression efficiency.
+    "crf": 30,                         # Constant Rate Factor (CRF). Lower is better quality.
     "film-grain": 6,                   # Film grain synthesis level. Adds artificial grain to preserve detail and prevent banding.
     "color-primaries": 1,              # BT.709 color primaries (Standard SDR).
     "transfer-characteristics": 1,     # BT.709 transfer characteristics (Standard SDR).
@@ -474,14 +474,14 @@ def detect_autocrop_filter(input_file, significant_crop_threshold=5.0, min_crop=
         return None
     return _analyze_video_cropdetect(input_file, duration, width, height, max(1, os.cpu_count() // 2), significant_crop_threshold, min_crop, debug)
 
-def main(no_downmix=False, autocrop=False, speed=None, quality=None, grain=None):
+def main(no_downmix=False, autocrop=False, preset=None, crf=None, grain=None):
     check_tools()
 
     # Override default SVT-AV1 params if provided via command line
-    if speed:
-        SVT_AV1_PARAMS["speed"] = speed
-    if quality:
-        SVT_AV1_PARAMS["quality"] = quality
+    if preset is not None:
+        SVT_AV1_PARAMS["preset"] = preset
+    if crf is not None:
+        SVT_AV1_PARAMS["crf"] = crf
     if grain is not None:
         SVT_AV1_PARAMS["film-grain"] = grain
 
@@ -770,8 +770,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Batch-process MKV files with resumable video encoding, audio downmixing, per-file logging, and optional autocrop.")
     parser.add_argument("--no-downmix", action="store_true", help="Preserve original audio channel layout.")
     parser.add_argument("--autocrop", action="store_true", help="Automatically detect and crop black bars from video using cropdetect.")
-    parser.add_argument("--speed", type=str, help="Set the encoding speed. Possible values: slower, slow, medium, fast, faster.")
-    parser.add_argument("--quality", type=str, help="Set the encoding quality. Possible values: lowest, low, medium, high, higher.")
+    parser.add_argument("--preset", type=int, help="Set the encoding preset. Lower is slower/better compression.")
+    parser.add_argument("--crf", type=int, help="Set the Constant Rate Factor (CRF). Lower is better quality.")
     parser.add_argument("--grain", type=int, help="Set the film-grain value (number). Adjusts the film grain synthesis level.")
     args = parser.parse_args()
-    main(no_downmix=args.no_downmix, autocrop=args.autocrop, speed=args.speed, quality=args.quality, grain=args.grain)
+    main(no_downmix=args.no_downmix, autocrop=args.autocrop, preset=args.preset, crf=args.crf, grain=args.grain)
