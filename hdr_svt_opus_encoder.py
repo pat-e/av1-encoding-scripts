@@ -25,7 +25,7 @@ REMUX_CODECS = {"aac", "opus"}
 
 SVT_AV1_PARAMS = {
     "speed": "slower",                 # Speed preset. Slower yields better compression efficiency/quality. ("slower", "slow", "medium", "fast", "faster")
-    "quality": "medium",               # Quality preset for SVT-AV1-Essential. ("higher", "high", "medium", "low", "lower")
+    "quality": "high",                 # Quality preset for SVT-AV1-Essential. ("higher", "high", "medium", "low", "lower")
     "film-grain": 12,                  # Film grain synthesis level. HDR content often benefits from a slightly higher grain (12).
     "color-primaries": 9,              # BT.2020 color primaries for HDR.
     "transfer-characteristics": 16,    # SMPTE 2084 (PQ) transfer characteristics for HDR10.
