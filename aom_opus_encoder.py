@@ -27,7 +27,7 @@ AOM_AV1_PARAMS = {
     "bit-depth": 10,                 # Force 10-bit encoding for better color precision and less banding
     "cpu-used": 2,                   # Speed preset. Lower is slower/better quality. 4 is default, 2 is slow/high quality
     "end-usage": "q",                # Constant Quality mode
-    "cq-level": 25,                  # The target quality level (0-63). Lower is better quality/larger file
+    "cq-level": 27,                  # The target quality level (0-63). Lower is better quality/larger file
     "min-q": 6,                      # Minimum allowable quantizer to prevent bitrate spikes on flat frames
     "threads": 2,                    # Threads per av1an worker
     "tune-content": "psy",           # Specialized tuning for psychovisual quality (needs aom-psy101)
