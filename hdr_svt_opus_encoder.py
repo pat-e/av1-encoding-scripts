@@ -24,7 +24,7 @@ DIR_CONV_LOGS = Path("conv_logs")
 REMUX_CODECS = {"aac", "opus"}
 
 SVT_AV1_PARAMS = {
-    "preset": 0,                       # Speed preset. Lower is slower and yields better compression efficiency.
+    "preset": 1,                       # Speed preset. Lower is slower and yields better compression efficiency.
     "crf": 30,                         # Constant Rate Factor (CRF). Lower is better quality.
     "film-grain": 12,                  # Film grain synthesis level. HDR content often benefits from a slightly higher grain (12).
     "color-primaries": 9,              # BT.2020 color primaries for HDR.
