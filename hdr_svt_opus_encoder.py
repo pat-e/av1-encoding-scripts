@@ -305,6 +305,7 @@ def main(speed=None, quality=None, grain=None):
                 video_temp_files = [
                     current_dir / f"{file_path.stem}.vpy",
                     current_dir / f"temp-{file_path.stem}.mkv",
+                    current_dir / f"{file_path.name}.ffindex",
                 ]
                 for temp_vid_file in video_temp_files:
                     if temp_vid_file.exists():
