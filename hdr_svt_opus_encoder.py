@@ -143,7 +143,7 @@ def convert_video(source_file_base, source_file_full):
 core = vs.core
 core.num_threads = 4
 clip = core.ffms2.Source(source=r'{source_full_path}')
-clip = core.resize.Point(clip, format=vs.YUV420P10, matrix_in_s="2020_ncl")
+clip = core.resize.Point(clip, format=vs.YUV420P10, matrix_in_s="2020ncl")
 clip.set_output()
 '''
     with vpy_file.open("w", encoding="utf-8") as f:
