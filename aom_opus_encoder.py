@@ -146,7 +146,7 @@ def convert_audio_track(index, ch, lang, audio_temp_dir, source_file, should_dow
     ])
     return final_opus
 
-def convert_video(source_file_base, source_file_full, is_vfr, target_cfr_fps_for_handbrake, autocrop_filter=None):
+def convert_video(source_file_base, source_file_full, is_vfr, target_cfr_fps_for_handbrake, autocrop_filter=None, photon_noise=8):
     print("  --- Starting Video Processing ---")
     # source_file_base is file_path.stem (e.g., "my.anime.episode.01")
     vpy_file = Path(f"{source_file_base}.vpy")
@@ -237,7 +237,7 @@ clip.set_output()
         "av1an", "-i", str(vpy_file), "-o", str(encoded_video_file), "-n",
         "-e", "aom", "--resume", "--sc-pix-format", "yuv420p", "-c", "mkvmerge",
         "--set-thread-affinity", "2", "--pix-format", "yuv420p10le", "--force", "--no-defaults",
-        "-w", str(workers), "--passes", "2",
+        "-w", str(workers), "--passes", "2", "--photon-noise", str(photon_noise),
         "-v", aom_video_params_str
     ]
     print(f"    - Using aom-psy101 parameters: {aom_video_params_str}")
@@ -486,10 +486,7 @@ def detect_autocrop_filter(input_file, significant_crop_threshold=5.0, min_crop=
 def main(no_downmix=False, autocrop=False, grain=None, crf=None):
     check_tools()
 
-    if grain is not None:
-        AOM_AV1_PARAMS["photon-noise"] = grain
-    elif "photon-noise" not in AOM_AV1_PARAMS:
-        AOM_AV1_PARAMS["photon-noise"] = 8
+    photon_noise_val = 8 if grain is None else grain
 
     if crf is not None:
         AOM_AV1_PARAMS["cq-level"] = crf
@@ -606,7 +603,7 @@ def main(no_downmix=False, autocrop=False, grain=None, crf=None):
                     else:
                         print("    - No crop needed or detected.")
                 encoded_video_file, handbrake_intermediate_for_cleanup = convert_video(
-                    file_path.stem, str(input_file_abs), is_vfr, target_cfr_fps_for_handbrake, autocrop_filter=autocrop_filter
+                    file_path.stem, str(input_file_abs), is_vfr, target_cfr_fps_for_handbrake, autocrop_filter=autocrop_filter, photon_noise=photon_noise_val
                 )
 
                 print("--- Starting Audio Processing ---")
