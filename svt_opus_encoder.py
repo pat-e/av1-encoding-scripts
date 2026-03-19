@@ -24,7 +24,7 @@ DIR_CONV_LOGS = Path("conv_logs") # Directory for conversion logs
 REMUX_CODECS = {"aac", "opus"}  # Using a set for efficient lookups
 
 SVT_AV1_PARAMS = {
-    "preset": 0,                       # Speed preset. Lower is slower and yields better compression efficiency.
+    "preset": 1,                       # Speed preset. Lower is slower and yields better compression efficiency.
     "crf": 30,                         # Constant Rate Factor (CRF). Lower is better quality.
     "film-grain": 6,                   # Film grain synthesis level. Adds artificial grain to preserve detail and prevent banding.
     "color-primaries": 1,              # BT.709 color primaries (Standard SDR).

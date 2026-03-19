@@ -76,7 +76,7 @@ svt_opus_encoder.py [options]
 **Options:**
 *   `--no-downmix`: Preserve original audio channel layout (do not downmix 5.1/7.1 to stereo).
 *   `--autocrop`: Automatically detect and crop black bars from the video.
-*   `--preset <int>`: Set the SVT-AV1 encoding speed preset (e.g., 0-13). Lower is slower and yields better compression. Defaults to 0.
+*   `--preset <int>`: Set the SVT-AV1 encoding speed preset (e.g., 0-13). Lower is slower and yields better compression. Defaults to 1.
 *   `--crf <int>`: Set the SVT-AV1 Constant Rate Factor (CRF) for video quality (e.g., 0-63). Lower is better quality. Defaults to 30.
 *   `--grain <int>`: Set the `film-grain` value. Adjusts the film grain synthesis level. Defaults to 6.
 
@@ -87,7 +87,7 @@ hdr_svt_opus_encoder.py [options]
 ```
 
 **Options:**
-*   `--preset <int>`: Set the SVT-AV1 encoding speed preset (e.g., 0-13). Lower is slower and yields better compression. Defaults to 0.
+*   `--preset <int>`: Set the SVT-AV1 encoding speed preset (e.g., 0-13). Lower is slower and yields better compression. Defaults to 1.
 *   `--crf <int>`: Set the SVT-AV1 Constant Rate Factor (CRF) for video quality (e.g., 0-63). Lower is better quality. Defaults to 30.
 *   `--grain <int>`: Set the `film-grain` value. Adjusts the film grain synthesis level. Defaults to 12.
 
