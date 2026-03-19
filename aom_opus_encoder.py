@@ -777,6 +777,6 @@ if __name__ == "__main__":
     parser.add_argument("--no-downmix", action="store_true", help="Preserve original audio channel layout.")
     parser.add_argument("--autocrop", action="store_true", help="Automatically detect and crop black bars from video using cropdetect.")
     parser.add_argument("--grain", type=int, help="Set the photon-noise value for grain synthesis (default: 8).")
-    parser.add_argument("--crf", type=int, help="Set the constant quality level (cq-level) for video encoding (default: 25).")
+    parser.add_argument("--crf", type=int, help=f"Set the constant quality level (cq-level) for video encoding (default: {AOM_AV1_PARAMS['cq-level']}).")
     args = parser.parse_args()
     main(no_downmix=args.no_downmix, autocrop=args.autocrop, grain=args.grain, crf=args.crf)

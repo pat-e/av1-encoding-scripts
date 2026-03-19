@@ -348,8 +348,8 @@ def main(preset=None, crf=None, grain=None):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Batch-process HDR MKV files.")
-    parser.add_argument("--preset", type=int, help="Set the encoding preset for SVT-AV1. Lower is slower/better compression.")
-    parser.add_argument("--crf", type=int, help="Set the Constant Rate Factor (CRF) for SVT-AV1. Lower is better quality.")
-    parser.add_argument("--grain", type=int, help="Set the film-grain value for SVT-AV1.")
+    parser.add_argument("--preset", type=int, help=f"Set the encoding preset for SVT-AV1. Lower is slower/better compression. (default: {SVT_AV1_PARAMS['preset']})")
+    parser.add_argument("--crf", type=int, help=f"Set the Constant Rate Factor (CRF) for SVT-AV1. Lower is better quality. (default: {SVT_AV1_PARAMS['crf']})")
+    parser.add_argument("--grain", type=int, help=f"Set the film-grain value for SVT-AV1. (default: {SVT_AV1_PARAMS['film-grain']})")
     args = parser.parse_args()
     main(preset=args.preset, crf=args.crf, grain=args.grain)
