@@ -28,7 +28,7 @@ AOM_AV1_PARAMS = {
     "cpu-used": 2,                   # Speed preset. Lower is slower/better quality. 4 is default, 2 is slow/high quality
     "end-usage": "q",                # Constant Quality mode
     "cq-level": 27,                  # The target quality level (0-63). Lower is better quality/larger file
-    "min-q": 6,                      # Minimum allowable quantizer to prevent bitrate spikes on flat frames
+    "min-q": 14,                      # Minimum allowable quantizer to prevent bitrate spikes on flat frames
     "threads": 2,                    # Threads per av1an worker
     "tune-content": "psy",           # Specialized tuning for psychovisual quality (needs aom-psy101)
     "frame-parallel": 1,             # Enable frame parallel decoding
