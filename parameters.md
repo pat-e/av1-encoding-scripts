@@ -57,7 +57,7 @@ Parameters parsed to the `aom` encoder:
 --cpu-used=2 \
 --end-usage=q \
 --cq-level=<crf_value> \
---min-q=6 \
+--min-q=12 \
 --threads=2 \
 --tune-content=psy \
 --frame-parallel=1 \
