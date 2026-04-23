@@ -34,7 +34,7 @@ SVT_AV1_PARAMS = {
     "keyint": 0,                       # Keyframe interval OFF (av1an inserts keyframes).
     "lp": 2,                           # Logical Processors to use per av1an worker.
     "auto-tiling": 1,                  # Automatically determine the number of tiles based on resolution.
-    "tune": 1,                         # 0 = VQ, 1 = PSNR, 2 = SSIM (SVT-AV1-Essential default recommended).
+    "tune": 0,                         # 0 = VQ, 1 = PSNR, 2 = SSIM (SVT-AV1-Essential default recommended).
     "progress": 2,                     # Detailed progress output.
 }
 
