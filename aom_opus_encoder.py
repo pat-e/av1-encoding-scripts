@@ -32,9 +32,6 @@ AOM_AV1_PARAMS = {
     "threads": 2,                    # Threads per av1an worker
     "tune-content": "psy",           # Specialized tuning for psychovisual quality (needs aom-psy101)
     "tune": "ssim",                  # Protects structural edges universally
-    "sharpness": 1,                  # Edge protection that won't cause halos in live-action
-    "arnr-maxframes": 5,             # Middle-ground temporal filtering (default is 7)
-    "arnr-strength": 3,              # Middle-ground filtering strength (default is 5)
     "quant-b-adapt": 1,              # Universal B-frame efficiency
     "frame-parallel": 1,             # Enable frame parallel decoding
     "tile-columns": 1,               # Use 2 tile columns (2^1) for faster decoding
