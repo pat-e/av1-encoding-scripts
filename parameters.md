@@ -56,10 +56,12 @@ Parameters parsed to the `aom` encoder:
 --bit-depth=10 \
 --cpu-used=2 \
 --end-usage=q \
---cq-level=<crf_value> \
+--cq-level=25 \
 --min-q=12 \
 --threads=2 \
 --tune-content=psy \
+--tune=ssim \
+--quant-b-adapt=1 \
 --frame-parallel=1 \
 --tile-columns=1 \
 --gf-max-pyr-height=4 \
@@ -75,16 +77,16 @@ Parameters parsed to the `aom` encoder:
 --transfer-characteristics=bt709 \
 --matrix-coefficients=bt709
 ```
-*(Note: `--cq-level` dynamically defaults to `28` but can be overwritten when executing the script via the `--crf` argument).*
+*(Note: `--cq-level` dynamically defaults to `25` but can be overwritten when executing the script via the `--crf` argument).*
 
 ### SVT-AV1 (SVT-AV1-Essential)
 > **Special Version Repository**: [https://github.com/nekotrix/SVT-AV1-Essential/](https://github.com/nekotrix/SVT-AV1-Essential/)
 
 Parameters initialized for the `svt-av1` encoder:
 ```text
---speed slower \
---quality medium \
---film-grain <grain_value> \
+--preset 2 \
+--crf 30 \
+--film-grain 6 \
 --color-primaries 1 \
 --transfer-characteristics 1 \
 --matrix-coefficients 1 \
@@ -92,10 +94,10 @@ Parameters initialized for the `svt-av1` encoder:
 --keyint 0 \
 --lp 2 \
 --auto-tiling 1 \
---tune 1 \
+--tune 0 \
 --progress 2
 ```
-*(Note: Parameters such as `--speed`, `--quality`, and `--film-grain` can be overridden when executing the script).*
+*(Note: Parameters such as `--preset`, `--crf`, and `--film-grain` can be overridden when executing the script).*
 
 ## av1an Initiation Commands
 

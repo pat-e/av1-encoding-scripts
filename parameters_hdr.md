@@ -28,8 +28,8 @@ Audio is encoded with the following bitrates based on the original channel count
 
 Default parameters initialized for the `svt-av1` encoder for HDR content:
 ```text
---speed slower
---quality medium
+--preset 2
+--crf 30
 --film-grain 12
 --color-primaries 9
 --transfer-characteristics 16
@@ -41,7 +41,7 @@ Default parameters initialized for the `svt-av1` encoder for HDR content:
 --tune 1
 --progress 2
 ```
-*(Note: Parameters such as `--speed`, `--quality`, and `--film-grain` can be overridden with command-line arguments when executing the script).*\
+*(Note: Parameters such as `--preset`, `--crf`, and `--film-grain` can be overridden with command-line arguments when executing the script).*\
 \
 ## av1an Initiation Command
 
