@@ -52,51 +52,58 @@ HandBrakeCLI \
 > **Special Version Repository**: [https://gitlab.com/damian101/aom-psy101](https://gitlab.com/damian101/aom-psy101)
 
 Parameters parsed to the `aom` encoder:
-```text
---bit-depth=10 \
---cpu-used=2 \
---end-usage=q \
---cq-level=25 \
---min-q=12 \
---threads=2 \
---tune-content=psy \
---tune=ssim \
---quant-b-adapt=1 \
---frame-parallel=1 \
---tile-columns=1 \
---gf-max-pyr-height=4 \
---deltaq-mode=2 \
---enable-keyframe-filtering=0 \
---disable-kf \
---enable-fwd-kf=0 \
---kf-max-dist=9999 \
---sb-size=dynamic \
---enable-chroma-deltaq=1 \
---enable-qm=1 \
---color-primaries=bt709 \
---transfer-characteristics=bt709 \
---matrix-coefficients=bt709
-```
+
+| Parameter | Value | Description |
+| :--- | :--- | :--- |
+| `--bit-depth` | `10` | Force 10-bit encoding for better color precision and less banding |
+| `--cpu-used` | `2` | Speed preset. Lower is slower/better quality. 4 is default, 2 is slow/high quality |
+| `--end-usage` | `q` | Constant Quality mode |
+| `--cq-level` | `25` | The target quality level (0-63). Lower is better quality/larger file |
+| `--min-q` | `12` | Minimum allowable quantizer to prevent bitrate spikes on flat frames |
+| `--threads` | `2` | Threads per av1an worker |
+| `--tune-content` | `psy` | Specialized tuning for psychovisual quality (needs aom-psy101) |
+| `--tune` | `ssim` | Protects structural edges universally |
+| `--sharpness` | `1` | Edge protection that won't cause halos in live-action |
+| `--arnr-maxframes` | `5` | Middle-ground temporal filtering (default is 7) |
+| `--arnr-strength` | `3` | Middle-ground filtering strength (default is 5) |
+| `--quant-b-adapt` | `1` | Universal B-frame efficiency |
+| `--frame-parallel` | `1` | Enable frame parallel decoding |
+| `--tile-columns` | `1` | Use 2 tile columns (2^1) for faster decoding |
+| `--gf-max-pyr-height` | `4` | Golden Frame pyramid height (max is 5) |
+| `--deltaq-mode` | `2` | Enable perceptual quantizer (AQ mode based on variance) |
+| `--enable-keyframe-filtering` | `0` | We disable internal KF filtering as av1an handles chunking |
+| `--disable-kf` | *(flag)* | Disable internal keyframes (av1an inserts them at scene cuts) |
+| `--enable-fwd-kf` | `0` | Disable forward keyframes |
+| `--kf-max-dist` | `9999` | Set max keyframe distance arbitrarily high |
+| `--sb-size` | `dynamic` | Allow the encoder to choose 64x64 or 128x128 superblocks dynamically |
+| `--enable-chroma-deltaq` | `1` | Enable chroma quantization adjustment |
+| `--enable-qm` | `1` | Enable quantization matrices for better high-frequency detail retention |
+| `--color-primaries` | `bt709` | Standard SDR color space |
+| `--transfer-characteristics`| `bt709` | Standard SDR transfer characteristics |
+| `--matrix-coefficients` | `bt709` | Standard SDR matrix coefficients |
+
 *(Note: `--cq-level` dynamically defaults to `25` but can be overwritten when executing the script via the `--crf` argument).*
 
 ### SVT-AV1 (SVT-AV1-Essential)
 > **Special Version Repository**: [https://github.com/nekotrix/SVT-AV1-Essential/](https://github.com/nekotrix/SVT-AV1-Essential/)
 
 Parameters initialized for the `svt-av1` encoder:
-```text
---preset 2 \
---crf 30 \
---film-grain 6 \
---color-primaries 1 \
---transfer-characteristics 1 \
---matrix-coefficients 1 \
---scd 0 \
---keyint 0 \
---lp 2 \
---auto-tiling 1 \
---tune 0 \
---progress 2
-```
+
+| Parameter | Value | Description |
+| :--- | :--- | :--- |
+| `--preset` | `2` | Speed preset. Lower is slower and yields better compression efficiency. |
+| `--crf` | `30` | Constant Rate Factor (CRF). Lower is better quality. |
+| `--film-grain` | `6` | Film grain synthesis level. Adds artificial grain to preserve detail and prevent banding. |
+| `--color-primaries` | `1` | BT.709 color primaries (Standard SDR). |
+| `--transfer-characteristics`| `1` | BT.709 transfer characteristics (Standard SDR). |
+| `--matrix-coefficients` | `1` | BT.709 matrix coefficients (Standard SDR). |
+| `--scd` | `0` | Scene change detection OFF (av1an handles scene cuts). |
+| `--keyint` | `0` | Keyframe interval OFF (av1an inserts keyframes). |
+| `--lp` | `2` | Logical Processors to use per av1an worker. |
+| `--auto-tiling` | `1` | Automatically determine the number of tiles based on resolution. |
+| `--tune` | `0` | 0 = VQ, 1 = PSNR, 2 = SSIM (SVT-AV1-Essential default recommended). |
+| `--progress` | `2` | Detailed progress output. |
+
 *(Note: Parameters such as `--preset`, `--crf`, and `--film-grain` can be overridden when executing the script).*
 
 ## av1an Initiation Commands
