@@ -73,7 +73,7 @@ Parameters parsed to the `aom` encoder:
 | `--deltaq-mode` | `2` | Enable perceptual quantizer (AQ mode based on variance) |
 | `--enable-keyframe-filtering` | `0` | We disable internal KF filtering as av1an handles chunking |
 | `--disable-kf` | *(flag)* | Disable internal keyframes (av1an inserts them at scene cuts) |
-| `--enable-fwd-kf` | `0` | Disable forward keyframes |
+| `--enable-fwd-kf` | `1` | Enable forward keyframes |
 | `--kf-max-dist` | `9999` | Set max keyframe distance arbitrarily high |
 | `--sb-size` | `64` | Allow the encoder to choose 64x64 or 128x128 superblocks dynamically |
 | `--enable-chroma-deltaq` | `1` | Enable chroma quantization adjustment |
