@@ -59,25 +59,26 @@ Parameters parsed to the `aom` encoder:
 | `--cpu-used` | `2` | Speed preset. Lower is slower/better quality. 4 is default, 2 is slow/high quality |
 | `--end-usage` | `q` | Constant Quality mode |
 | `--cq-level` | `25` | The target quality level (0-63). Lower is better quality/larger file |
-| `--min-q` | `12` | Minimum allowable quantizer to prevent bitrate spikes on flat frames |
+| `--min-q` | `8` | Minimum allowable quantizer to prevent bitrate spikes on flat frames |
 | `--threads` | `2` | Threads per av1an worker |
 | `--tune-content` | `psy` | Specialized tuning for psychovisual quality (needs aom-psy101) |
 | `--tune` | `ssim` | Protects structural edges universally |
-| `--sharpness` | `1` | Edge protection that won't cause halos in live-action |
-| `--arnr-maxframes` | `5` | Middle-ground temporal filtering (default is 7) |
-| `--arnr-strength` | `3` | Middle-ground filtering strength (default is 5) |
+| `--sharpness` | `2` | Edge protection that won't cause halos in live-action |
+| `--arnr-maxframes` | `7` | Middle-ground temporal filtering (default is 7) |
+| `--arnr-strength` | `1` | Middle-ground filtering strength (default is 5) |
 | `--quant-b-adapt` | `1` | Universal B-frame efficiency |
 | `--frame-parallel` | `1` | Enable frame parallel decoding |
 | `--tile-columns` | `1` | Use 2 tile columns (2^1) for faster decoding |
-| `--gf-max-pyr-height` | `4` | Golden Frame pyramid height (max is 5) |
+| `--gf-max-pyr-height` | `5` | Golden Frame pyramid height (max is 5) |
 | `--deltaq-mode` | `2` | Enable perceptual quantizer (AQ mode based on variance) |
 | `--enable-keyframe-filtering` | `0` | We disable internal KF filtering as av1an handles chunking |
 | `--disable-kf` | *(flag)* | Disable internal keyframes (av1an inserts them at scene cuts) |
 | `--enable-fwd-kf` | `0` | Disable forward keyframes |
 | `--kf-max-dist` | `9999` | Set max keyframe distance arbitrarily high |
-| `--sb-size` | `dynamic` | Allow the encoder to choose 64x64 or 128x128 superblocks dynamically |
+| `--sb-size` | `64` | Allow the encoder to choose 64x64 or 128x128 superblocks dynamically |
 | `--enable-chroma-deltaq` | `1` | Enable chroma quantization adjustment |
 | `--enable-qm` | `1` | Enable quantization matrices for better high-frequency detail retention |
+| `--lag-in-frames` | `64` | Max lookahead buffer (default is 19, max is 64) for improved temporal filtering and rate control |
 | `--color-primaries` | `bt709` | Standard SDR color space |
 | `--transfer-characteristics`| `bt709` | Standard SDR transfer characteristics |
 | `--matrix-coefficients` | `bt709` | Standard SDR matrix coefficients |
