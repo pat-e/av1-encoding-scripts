@@ -26,7 +26,6 @@ REMUX_CODECS = {"aac", "opus"}  # Using a set for efficient lookups
 SVT_AV1_PARAMS = {
     "preset": 2,                       # Speed preset. Lower is slower and yields better compression efficiency.
     "crf": 30,                         # Constant Rate Factor (CRF). Lower is better quality.
-    "film-grain": 6,                   # Film grain synthesis level. Adds artificial grain to preserve detail and prevent banding.
     "color-primaries": 1,              # BT.709 color primaries (Standard SDR).
     "transfer-characteristics": 1,     # BT.709 transfer characteristics (Standard SDR).
     "matrix-coefficients": 1,          # BT.709 matrix coefficients (Standard SDR).
@@ -772,6 +771,6 @@ if __name__ == "__main__":
     parser.add_argument("--autocrop", action="store_true", help="Automatically detect and crop black bars from video using cropdetect.")
     parser.add_argument("--preset", type=int, help=f"Set the encoding preset. Lower is slower/better compression. (default: {SVT_AV1_PARAMS['preset']})")
     parser.add_argument("--crf", type=int, help=f"Set the Constant Rate Factor (CRF). Lower is better quality. (default: {SVT_AV1_PARAMS['crf']})")
-    parser.add_argument("--grain", type=int, help=f"Set the film-grain value (number). Adjusts the film grain synthesis level. (default: {SVT_AV1_PARAMS['film-grain']})")
+    parser.add_argument("--grain", type=int, help="Set the film-grain value (number). Adjusts the film grain synthesis level. (If omitted, grain synthesis is disabled.)")
     args = parser.parse_args()
     main(no_downmix=args.no_downmix, autocrop=args.autocrop, preset=args.preset, crf=args.crf, grain=args.grain)

@@ -26,7 +26,6 @@ REMUX_CODECS = {"aac", "opus"}
 SVT_AV1_PARAMS = {
     "preset": 2,                       # Speed preset. Lower is slower and yields better compression efficiency.
     "crf": 30,                         # Constant Rate Factor (CRF). Lower is better quality.
-    "film-grain": 12,                  # Film grain synthesis level. HDR content often benefits from a slightly higher grain (12).
     "color-primaries": 9,              # BT.2020 color primaries for HDR.
     "transfer-characteristics": 16,    # SMPTE 2084 (PQ) transfer characteristics for HDR10.
     "matrix-coefficients": 9,          # BT.2020 non-constant luminance matrix coefficients for HDR.
@@ -350,6 +349,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Batch-process HDR MKV files.")
     parser.add_argument("--preset", type=int, help=f"Set the encoding preset for SVT-AV1. Lower is slower/better compression. (default: {SVT_AV1_PARAMS['preset']})")
     parser.add_argument("--crf", type=int, help=f"Set the Constant Rate Factor (CRF) for SVT-AV1. Lower is better quality. (default: {SVT_AV1_PARAMS['crf']})")
-    parser.add_argument("--grain", type=int, help=f"Set the film-grain value for SVT-AV1. (default: {SVT_AV1_PARAMS['film-grain']})")
+    parser.add_argument("--grain", type=int, help="Set the film-grain value for SVT-AV1. (If omitted, grain synthesis is disabled.)")
     args = parser.parse_args()
     main(preset=args.preset, crf=args.crf, grain=args.grain)

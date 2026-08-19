@@ -8,10 +8,11 @@ This repository contains Python scripts for batch-processing MKV files to encode
 *   **`aom_opus_encoder.py`**: Uses the `aom` encoder (specifically designed for the `aom-psy101` fork) via `av1an`. It is tuned for high perceptual quality with specific psychovisual parameters and film grain synthesis.
 *   **`svt_opus_encoder.py`**: Uses the `svt-av1` encoder (specifically designed for the `SVT-AV1-Essential` fork) via `av1an`. It provides a good balance between encoding speed and quality, and allows customization of preset, crf, and film-grain from the command line.
 *   **`hdr_svt_opus_encoder.py`**: A specialized script for 4K HDR movies using the `SVT-AV1-Essential` encoder. It is designed for pre-processed CFR inputs, preserves original surround sound audio without downmixing, and retains HDR metadata.
+*   **`xav_opus_encoder.py`**: Uses the `xav` chunking encoder and `svt-av1` (SVT-AV1-Essential) instead of `av1an`. Features native autocrop, scene-detect, and chunking.
 
 ## Encoding Parameters Documentation
 
-For detailed information on the specific FFmpeg arguments, audio downmixing logic, VFR-to-CFR conversion processes, and the special SVT-AV1/AomEnc parameters used by the standard scripts, please refer to the [`parameters.md`](parameters.md) file.
+For detailed information on the specific FFmpeg arguments, audio downmixing logic, VFR-to-CFR conversion processes, and the special SVT-AV1, AomEnc, and xav parameters used by the standard scripts, please refer to the [`parameters.md`](parameters.md) file.
 
 For the HDR-specific encoder parameters and settings used in `hdr_svt_opus_encoder.py`, please see [`parameters_hdr.md`](parameters_hdr.md).
 
@@ -29,6 +30,7 @@ Both scripts require several external tools to be installed and available in you
 *   **Vapoursynth**: Required by `av1an` as the frame server via the generated `.vpy` scripts.
 *   *(Specific to `aom_opus_encoder.py`)*: **aom-psy101** encoder. You must download the correct version from [Damian101's aom-psy101 GitLab](https://gitlab.com/damian101/aom-psy101).
 *   *(Specific to `svt_opus_encoder.py`)*: **SVT-AV1-Essential** encoder. You must download the correct version from [nekotrix's SVT-AV1-Essential GitHub](https://github.com/nekotrix/SVT-AV1-Essential/).
+*   *(Specific to `xav_opus_encoder.py`)*: **xav** chunking encoder. You must download the source from [emrakyz's xav GitHub](https://github.com/emrakyz/xav) and build it specifically with the SVT-AV1-Essential encoder.
 
 ## Features
 
@@ -45,7 +47,7 @@ Both scripts require several external tools to be installed and available in you
 *   **Automatic Cropping**: Optional `--autocrop` flag detects black bars and determines the optimal cropping parameters before encoding.
 *   **Organized Output**: 
     *   Completed files are moved to a `completed/` directory.
-    *   Original files are moved to an `original/` directory.
+    *   Original files are moved to an `original/` directory (or `failed/` if an error occurs).
     *   Per-file processing logs are saved in a `conv_logs/` directory.
     *   Temporary files are automatically cleaned up upon success.
 
@@ -64,7 +66,7 @@ aom_opus_encoder.py [options]
 **Options:**
 *   `--no-downmix`: Preserve original audio channel layout (do not downmix 5.1/7.1 to stereo).
 *   `--autocrop`: Automatically detect and crop black bars from the video.
-*   `--grain <int>`: Set the `photon-noise` value for grain synthesis (default: 8).
+*   `--grain <int>`: Set the `photon-noise` value for grain synthesis. Disabled by default.
 *   `--crf <int>`: Set the constant quality level (`cq-level`) for video encoding (default: 25).
 
 ### `svt_opus_encoder.py`
@@ -78,7 +80,7 @@ svt_opus_encoder.py [options]
 *   `--autocrop`: Automatically detect and crop black bars from the video.
 *   `--preset <int>`: Set the SVT-AV1 encoding speed preset (e.g., 0-13). Lower is slower and yields better compression. Defaults to 1.
 *   `--crf <int>`: Set the SVT-AV1 Constant Rate Factor (CRF) for video quality (e.g., 0-63). Lower is better quality. Defaults to 30.
-*   `--grain <int>`: Set the `film-grain` value. Adjusts the film grain synthesis level. Defaults to 6.
+*   `--grain <int>`: Set the `film-grain` value. Adjusts the film grain synthesis level. Disabled by default.
 
 ### `hdr_svt_opus_encoder.py`
 
@@ -89,7 +91,25 @@ hdr_svt_opus_encoder.py [options]
 **Options:**
 *   `--preset <int>`: Set the SVT-AV1 encoding speed preset (e.g., 0-13). Lower is slower and yields better compression. Defaults to 1.
 *   `--crf <int>`: Set the SVT-AV1 Constant Rate Factor (CRF) for video quality (e.g., 0-63). Lower is better quality. Defaults to 30.
-*   `--grain <int>`: Set the `film-grain` value. Adjusts the film grain synthesis level. Defaults to 12.
+*   `--grain <int>`: Set the `film-grain` value. Adjusts the film grain synthesis level. Disabled by default.
+
+### `xav_opus_encoder.py`
+
+```bash
+xav_opus_encoder.py [options]
+```
+
+**Options:**
+*   `--preset <int>`: Set the SVT-AV1 encoding speed preset. Defaults to 1.
+*   `--crf <int>`: Set the SVT-AV1 Constant Rate Factor (CRF).
+*   `--workers <int>`: Set the number of workers for xav.
+*   `--no-downmix`: Preserve original audio channel layout (do not downmix 5.1/7.1 to stereo).
+
+**Workflow specific to `xav_opus_encoder.py`:**
+1. **Video Preparation**: VFR sources undergo a HandBrakeCLI pass (CFR + all-intra x264, `keyint=1`). CFR sources undergo one ffmpeg pass (`libx264 -crf 0 -preset superfast -tune fastdecode -g 1`).
+2. **Video Encode**: `xav` handles autocrop, scene-detect, and chunking natively (`xav -e svt-av1 -p "--preset 1 --lp 1" -w <cpu_count - 2>`). No `av1an` or `.vpy` required.
+3. **Audio Processing**: Audio is extracted, normalized with a two-pass `loudnorm`, downmixed, and encoded to Opus (handled outside `xav`).
+4. **Remuxing**: Combines using `mkvmerge`. Failed files move the source MKV to `failed/` while keeping video intermediates (`.x264.mkv`, `temp-*.mkv`) for easy retry resuming.
 
 ## Process Workflow
 

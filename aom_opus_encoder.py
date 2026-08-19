@@ -34,7 +34,7 @@ AOM_AV1_PARAMS = {
     "tune": "ssim",                  # Protects structural edges universally
     "sharpness": 2,                  # Edge protection that won't cause halos in live-action
     "arnr-maxframes": 7,             # Middle-ground temporal filtering (default is 7)
-    "arnr-strength": 1,              # Middle-ground filtering strength (default is 5)
+    "arnr-strength": 2,              # Middle-ground filtering strength (default is 5)
     "quant-b-adapt": 1,              # Universal B-frame efficiency
     "frame-parallel": 1,             # Enable frame parallel decoding
     "tile-columns": 1,               # Use 2 tile columns (2^1) for faster decoding
@@ -152,7 +152,7 @@ def convert_audio_track(index, ch, lang, audio_temp_dir, source_file, should_dow
     ])
     return final_opus
 
-def convert_video(source_file_base, source_file_full, is_vfr, target_cfr_fps_for_handbrake, autocrop_filter=None, photon_noise=8):
+def convert_video(source_file_base, source_file_full, is_vfr, target_cfr_fps_for_handbrake, autocrop_filter=None, photon_noise=None):
     print("  --- Starting Video Processing ---")
     # source_file_base is file_path.stem (e.g., "my.anime.episode.01")
     vpy_file = Path(f"{source_file_base}.vpy")
@@ -243,9 +243,11 @@ clip.set_output()
         "av1an", "-i", str(vpy_file), "-o", str(encoded_video_file), "-n",
         "-e", "aom", "--resume", "--sc-pix-format", "yuv420p", "-c", "mkvmerge",
         "--set-thread-affinity", "2", "--pix-format", "yuv420p10le", "--force", "--no-defaults",
-        "-w", str(workers), "--passes", "2", "--photon-noise", str(photon_noise),
-        "-v", aom_video_params_str
+        "-w", str(workers), "--passes", "2"
     ]
+    if photon_noise is not None:
+        av1an_enc_args.extend(["--photon-noise", str(photon_noise)])
+    av1an_enc_args.extend(["-v", aom_video_params_str])
     print(f"    - Using aom-psy101 parameters: {aom_video_params_str}")
     run_cmd(av1an_enc_args)
     print("  --- Finished Video Processing ---")
@@ -492,7 +494,7 @@ def detect_autocrop_filter(input_file, significant_crop_threshold=5.0, min_crop=
 def main(no_downmix=False, autocrop=False, grain=None, crf=None):
     check_tools()
 
-    photon_noise_val = 8 if grain is None else grain
+    photon_noise_val = grain
 
     if crf is not None:
         AOM_AV1_PARAMS["cq-level"] = crf
@@ -782,7 +784,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Batch-process MKV files with resumable video encoding, audio downmixing, per-file logging, and optional autocrop.")
     parser.add_argument("--no-downmix", action="store_true", help="Preserve original audio channel layout.")
     parser.add_argument("--autocrop", action="store_true", help="Automatically detect and crop black bars from video using cropdetect.")
-    parser.add_argument("--grain", type=int, help="Set the photon-noise value for grain synthesis (default: 8).")
+    parser.add_argument("--grain", type=int, help="Set the photon-noise value for grain synthesis (if omitted, grain synthesis is disabled).")
     parser.add_argument("--crf", type=int, help=f"Set the constant quality level (cq-level) for video encoding (default: {AOM_AV1_PARAMS['cq-level']}).")
     args = parser.parse_args()
     main(no_downmix=args.no_downmix, autocrop=args.autocrop, grain=args.grain, crf=args.crf)

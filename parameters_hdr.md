@@ -30,7 +30,6 @@ Default parameters initialized for the `svt-av1` encoder for HDR content:
 ```text
 --preset 2
 --crf 30
---film-grain 12
 --color-primaries 9
 --transfer-characteristics 16
 --matrix-coefficients 9
@@ -41,7 +40,7 @@ Default parameters initialized for the `svt-av1` encoder for HDR content:
 --tune 1
 --progress 2
 ```
-*(Note: Parameters such as `--preset`, `--crf`, and `--film-grain` can be overridden with command-line arguments when executing the script).*\
+*(Note: Parameters such as `--preset` and `--crf` can be overridden with command-line arguments when executing the script. Grain synthesis is omitted by default unless `--grain` is provided).*\
 \
 ## av1an Initiation Command
 

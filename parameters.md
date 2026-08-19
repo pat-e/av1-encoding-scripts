@@ -1,6 +1,6 @@
 # Encoding Configuration Parameters
 
-This document details the configuration parameters used across the AomEnc and SVT-AV1 encoding scripts.
+This document details the configuration parameters used across the AomEnc, SVT-AV1, and xav encoding scripts.
 
 ## Audio Demuxing & Downmixing
 
@@ -65,7 +65,7 @@ Parameters parsed to the `aom` encoder:
 | `--tune` | `ssim` | Protects structural edges universally |
 | `--sharpness` | `2` | Edge protection that won't cause halos in live-action |
 | `--arnr-maxframes` | `7` | Middle-ground temporal filtering (default is 7) |
-| `--arnr-strength` | `1` | Middle-ground filtering strength (default is 5) |
+| `--arnr-strength` | `2` | Middle-ground filtering strength (default is 5) |
 | `--quant-b-adapt` | `1` | Universal B-frame efficiency |
 | `--frame-parallel` | `1` | Enable frame parallel decoding |
 | `--tile-columns` | `1` | Use 2 tile columns (2^1) for faster decoding |
@@ -94,7 +94,6 @@ Parameters initialized for the `svt-av1` encoder:
 | :--- | :--- | :--- |
 | `--preset` | `2` | Speed preset. Lower is slower and yields better compression efficiency. |
 | `--crf` | `30` | Constant Rate Factor (CRF). Lower is better quality. |
-| `--film-grain` | `6` | Film grain synthesis level. Adds artificial grain to preserve detail and prevent banding. |
 | `--color-primaries` | `1` | BT.709 color primaries (Standard SDR). |
 | `--transfer-characteristics`| `1` | BT.709 transfer characteristics (Standard SDR). |
 | `--matrix-coefficients` | `1` | BT.709 matrix coefficients (Standard SDR). |
@@ -105,16 +104,15 @@ Parameters initialized for the `svt-av1` encoder:
 | `--tune` | `0` | 0 = VQ, 1 = PSNR, 2 = SSIM (SVT-AV1-Essential default recommended). |
 | `--progress` | `2` | Detailed progress output. |
 
-*(Note: Parameters such as `--preset`, `--crf`, and `--film-grain` can be overridden when executing the script).*
+*(Note: Parameters such as `--preset` and `--crf` can be overridden when executing the script. Grain synthesis is omitted by default unless `--grain` is provided).*
 
-## av1an Initiation Commands
+## Chunking Encoder Initiation Commands
 
-### AomEnc
+### av1an (AomEnc)
 Arguments used to start `av1an` using the AomEnc encoder:
 ```text
 av1an -i <vpy_script> -o <encoded_mkv> -n \
   -e aom \
-  --photon-noise <grain> \
   --resume \
   --sc-pix-format yuv420p \
   -c mkvmerge \
@@ -127,7 +125,7 @@ av1an -i <vpy_script> -o <encoded_mkv> -n \
   -v "<aom_encoder_parameters_above>"
 ```
 
-### SVT-AV1
+### av1an (SVT-AV1)
 Arguments used to start `av1an` using the SVT-AV1 encoder:
 ```text
 av1an -i <vpy_script> -o <encoded_mkv> -n \
@@ -142,3 +140,14 @@ av1an -i <vpy_script> -o <encoded_mkv> -n \
   -w <calculated_workers> \
   -v "<svt_av1_encoder_parameters_above>"
 ```
+
+### xav (SVT-AV1)
+Arguments used to start `xav` using the SVT-AV1 encoder (as used in `xav_opus_encoder.py`):
+```text
+xav -e svt-av1 \
+  -p "--preset 1 --lp 1" \
+  -w <calculated_workers> \
+  <intermediate_file> \
+  <encoded_video_file>
+```
+*(Note: Parameters such as `--preset` and `--crf` can be overridden when executing the script, which modifies the arguments passed to `-p`).*
