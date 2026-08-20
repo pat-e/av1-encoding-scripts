@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 
 # Batch encoder: all-intra x264 intermediate + xav (SVT-AV1-Essential) + existing audio path.
-# xav can be found here: https://github.com/emrakyz/xav
 # Video: VFR -> HandBrake all-intra x264 (CFR + seekable) -> xav
 #        CFR -> ffmpeg all-intra x264 (-g 1) -> xav
 #        Never both. xav cannot decode UTVideo.
-#        xav -e svt-av1 -p "--preset 1 --lp 1" -w (cpu_count - 2)
+#        xav -e svt-av1 -p "--preset 1 --lp 2" -w ((cpu_count - 2) // 2)
 # Audio: original aom_opus_encoder.py loudnorm (I=-23 LRA=7 tp=-1), outside xav. No -a is passed to xav.
 # Crop / scene-detect / chunking: owned by xav. No cropdetect, no .vpy, no av1an.
 
@@ -34,7 +33,7 @@ REMUX_CODECS = {"aac", "opus"}
 # Locked xav / SVT-AV1-Essential video params. CRF is left to xav/SVT unless --crf is set.
 XAV_ENCODER = "svt-av1"
 XAV_PRESET = 1
-XAV_LP = 1
+XAV_LP = 2
 WORKER_CORES_RESERVED = 2
 
 # All-intra x264 intermediate so xav workers can seek. UTVideo is not decodable by xav.
@@ -145,7 +144,8 @@ def xav_worker_count(override=None):
     if override is not None:
         return max(1, int(override))
     total_cores = os.cpu_count() or 4
-    return max(1, total_cores - WORKER_CORES_RESERVED)
+    usable = max(1, total_cores - WORKER_CORES_RESERVED)
+    return max(1, usable // 2)
 
 
 def file_is_usable(path):
@@ -233,7 +233,7 @@ def convert_video(source_file_base, source_file_full, is_vfr, target_cfr_fps_for
 
     worker_count = xav_worker_count(workers)
     total_cores = os.cpu_count() or 4
-    print(f"    - Using {worker_count} xav workers (Total Cores: {total_cores}, Logic: cores - {WORKER_CORES_RESERVED}).")
+    print(f"    - Using {worker_count} xav workers (Total Cores: {total_cores}, Logic: (cores - {WORKER_CORES_RESERVED}) / 2).")
 
     param_parts = [f"--preset {preset}", f"--lp {XAV_LP}"]
     if crf is not None:
@@ -586,7 +586,7 @@ if __name__ == "__main__":
     parser.add_argument("--no-downmix", action="store_true", help="Preserve original audio channel layout.")
     parser.add_argument("--preset", type=int, default=None, help=f"SVT-AV1 preset passed to xav -p (default: {XAV_PRESET}).")
     parser.add_argument("--crf", type=float, default=None, help="Optional SVT-AV1 CRF passed to xav -p. Omitted = xav/SVT default.")
-    parser.add_argument("--workers", type=int, default=None, help=f"Override xav -w. Default is cpu_count - {WORKER_CORES_RESERVED}.")
+    parser.add_argument("--workers", type=int, default=None, help=f"Override xav -w. Default is (cpu_count - {WORKER_CORES_RESERVED}) // 2.")
     args = parser.parse_args()
     main(
         no_downmix=args.no_downmix,

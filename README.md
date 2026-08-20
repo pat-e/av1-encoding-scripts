@@ -107,7 +107,7 @@ xav_opus_encoder.py [options]
 
 **Workflow specific to `xav_opus_encoder.py`:**
 1. **Video Preparation**: VFR sources undergo a HandBrakeCLI pass (CFR + all-intra x264, `keyint=1`). CFR sources undergo one ffmpeg pass (`libx264 -crf 0 -preset superfast -tune fastdecode -g 1`).
-2. **Video Encode**: `xav` handles autocrop, scene-detect, and chunking natively (`xav -e svt-av1 -p "--preset 1 --lp 1" -w <cpu_count - 2>`). No `av1an` or `.vpy` required.
+2. **Video Encode**: `xav` handles autocrop, scene-detect, and chunking natively (`xav -e svt-av1 -p "--preset 1 --lp 2" -w <(cpu_count - 2) // 2>`). No `av1an` or `.vpy` required.
 3. **Audio Processing**: Audio is extracted, normalized with a two-pass `loudnorm`, downmixed, and encoded to Opus (handled outside `xav`).
 4. **Remuxing**: Combines using `mkvmerge`. Failed files move the source MKV to `failed/` while keeping video intermediates (`.x264.mkv`, `temp-*.mkv`) for easy retry resuming.
 

@@ -145,7 +145,7 @@ av1an -i <vpy_script> -o <encoded_mkv> -n \
 Arguments used to start `xav` using the SVT-AV1 encoder (as used in `xav_opus_encoder.py`):
 ```text
 xav -e svt-av1 \
-  -p "--preset 1 --lp 1" \
+  -p "--preset 1 --lp 2" \
   -w <calculated_workers> \
   <intermediate_file> \
   <encoded_video_file>
