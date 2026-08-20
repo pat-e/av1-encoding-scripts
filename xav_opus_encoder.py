@@ -4,10 +4,12 @@
 # Video: VFR -> HandBrake all-intra x264 (CFR + seekable) -> xav
 #        CFR -> ffmpeg all-intra x264 (-g 1) -> xav
 #        Never both. xav cannot decode UTVideo.
-#        xav -e svt-av1 -p "--preset 1 --lp 2" -w ((cpu_count - 2) // 2)
-# Audio: original aom_opus_encoder.py loudnorm (I=-23 LRA=7 tp=-1), outside xav. No -a is passed to xav.
+#        xav -e svt-av1 -p "--preset 1 --lp 2" -w ((cpu_count - 2) // 2) -b 1
+# Audio: outside xav. AAC/Opus remuxed. Else: pan (optional) → constant-gain LUFS → Opus.
+#        Measure I, apply one gain to hit LOUDNESS_I, brickwall to LOUDNESS_TP. No LRA compressor.
 # Crop / scene-detect / chunking: owned by xav. No cropdetect, no .vpy, no av1an.
 
+import math
 import os
 import sys
 import subprocess
@@ -34,10 +36,39 @@ REMUX_CODECS = {"aac", "opus"}
 XAV_ENCODER = "svt-av1"
 XAV_PRESET = 1
 XAV_LP = 2
+XAV_BUFF = 1
 WORKER_CORES_RESERVED = 2
 
 # All-intra x264 intermediate so xav workers can seek. UTVideo is not decodable by xav.
 INTERMEDIATE_SUFFIX = ".x264.mkv"
+
+# Constant-gain loudness (XAV-style, no LRA pull-down).
+LOUDNESS_I = -16.0
+LOUDNESS_TP = -1.5
+
+
+class Tee:
+    """Write to the log file and the real console at the same time (ffmpeg -stats, prints)."""
+
+    def __init__(self, *files):
+        self.files = files
+
+    def write(self, data):
+        for f in self.files:
+            try:
+                f.write(data)
+            except Exception:
+                pass
+
+    def flush(self):
+        for f in self.files:
+            try:
+                f.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        return any(getattr(f, "isatty", lambda: False)() for f in self.files)
 
 
 def check_tools():
@@ -73,6 +104,85 @@ def _parse_loudnorm_json(stderr_output):
     return json.loads(stderr_output[json_start_index:json_end_index])
 
 
+def _finite_float(value, fallback):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    return number if math.isfinite(number) else fallback
+
+
+def apply_constant_gain_loudness(input_path, output_path, track_index):
+    """Measure integrated LUFS, apply one gain, brickwall-clamp true peak. No LRA compressor."""
+    print(f"    - Normalizing Audio Track #{track_index} (constant-gain LUFS, 2-pass)...")
+    print(f"      - Targets: I={LOUDNESS_I} LUFS, TP={LOUDNESS_TP} dBTP (no LRA processing)")
+    print("      - Pass 1: Measuring integrated loudness...")
+    result = subprocess.run(
+        [
+            "ffmpeg", "-v", "info", "-i", str(input_path),
+            "-af", f"loudnorm=I={LOUDNESS_I}:LRA=20:tp={LOUDNESS_TP}:print_format=json",
+            "-f", "null", "-",
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    stats = _parse_loudnorm_json(result.stderr)
+    measured_i = _finite_float(stats.get("input_i"), None)
+    if measured_i is None:
+        print("      - Could not measure integrated loudness; copying without gain.")
+        run_cmd(["ffmpeg", "-v", "quiet", "-y", "-i", str(input_path), "-c:a", "flac", str(output_path)])
+        return
+
+    gain_db = LOUDNESS_I - measured_i
+    gain = 10 ** (gain_db / 20.0)
+    tp_linear = 10 ** (LOUDNESS_TP / 20.0)
+    print(f"      - Measured I={measured_i:.2f} LUFS → constant gain {gain_db:+.2f} dB")
+    print(f"      - Pass 2: Apply gain, brickwall clamp {LOUDNESS_TP} dBTP...")
+    run_ffmpeg_logged([
+        "ffmpeg", "-hide_banner", "-v", "error", "-stats", "-y",
+        "-i", str(input_path),
+        "-af", (
+            f"volume={gain:.10f},"
+            f"asoftclip=type=hard:threshold={tp_linear:.10f},"
+            f"aformat=sample_fmts=s32"
+        ),
+        "-c:a", "flac", "-sample_fmt", "s32",
+        str(output_path),
+    ])
+
+
+def run_ffmpeg_logged(args):
+    """Run ffmpeg so -stats is teed to console and log as it happens."""
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
+    try:
+        while True:
+            chunk = proc.stdout.read(256)
+            if not chunk:
+                break
+            sys.stdout.write(chunk.decode("utf-8", errors="replace"))
+            sys.stdout.flush()
+    finally:
+        ret = proc.wait()
+    if ret != 0:
+        raise subprocess.CalledProcessError(ret, args)
+
+
+def downmix_filters(ch):
+    """Same 0.30 center-forward mix. ffmpeg 9 renamed ocl → ochl; named pan avoids that."""
+    if ch == 6:
+        return [
+            "pan=stereo|FL=FC+0.30*FL+0.30*SL|FR=FC+0.30*FR+0.30*SR",
+            "pan=stereo|FL=FC+0.30*FL+0.30*BL|FR=FC+0.30*FR+0.30*BR",
+            "aformat=ch_layouts=5.1,pan=stereo|FL=FC+0.30*FL+0.30*BL|FR=FC+0.30*FR+0.30*BR",
+            "pan=stereo|c0=c2+0.30*c0+0.30*c4|c1=c2+0.30*c1+0.30*c5",
+        ]
+    if ch == 8:
+        return [
+            "pan=stereo|FL=FC+0.30*FL+0.30*SL+0.30*BL|FR=FC+0.30*FR+0.30*SR+0.30*BR",
+            "pan=stereo|c0=c2+0.30*c0+0.30*c4+0.30*c6|c1=c2+0.30*c1+0.30*c5+0.30*c7",
+        ]
+    return []
+
+
 def convert_audio_track(index, ch, lang, audio_temp_dir, source_file, should_downmix):
     audio_temp_path = Path(audio_temp_dir)
     temp_extracted = audio_temp_path / f"track_{index}_extracted.flac"
@@ -80,44 +190,44 @@ def convert_audio_track(index, ch, lang, audio_temp_dir, source_file, should_dow
     final_opus = audio_temp_path / f"track_{index}_final.opus"
 
     print(f"    - Extracting Audio Track #{index} to FLAC...")
-    ffmpeg_args = [
-        "ffmpeg", "-v", "quiet", "-stats", "-y", "-i", str(source_file), "-map", f"0:{index}", "-map_metadata", "-1"
+    base_args = [
+        "ffmpeg", "-hide_banner", "-v", "error", "-stats", "-y",
+        "-drc_scale", "0",
+        "-i", str(source_file),
+        "-map", f"0:{index}",
+        "-map_metadata", "-1",
     ]
+    downmix_attempts = []
     if should_downmix and ch >= 6:
-        if ch == 6:
-            ffmpeg_args += ["-af", "pan=stereo|c0=c2+0.30*c0+0.30*c4|c1=c2+0.30*c1+0.30*c5"]
-        elif ch == 8:
-            ffmpeg_args += ["-af", "pan=stereo|c0=c2+0.30*c0+0.30*c4+0.30*c6|c1=c2+0.30*c1+0.30*c5+0.30*c7"]
-        else:
+        downmix_attempts.extend(downmix_filters(ch))
+        downmix_attempts.append(None)  # last resort: -ac 2
+    else:
+        downmix_attempts.append("keep")
+
+    last_error = None
+    extracted = False
+    for attempt, filt in enumerate(downmix_attempts, start=1):
+        ffmpeg_args = list(base_args)
+        if filt == "keep":
+            pass
+        elif filt is None:
             ffmpeg_args += ["-ac", "2"]
-    ffmpeg_args += ["-c:a", "flac", str(temp_extracted)]
-    run_cmd(ffmpeg_args)
+            print("      - Downmix fallback: -ac 2")
+        else:
+            ffmpeg_args += ["-af", filt]
+            print(f"      - Downmix filter (try {attempt}): {filt}")
+        ffmpeg_args += ["-c:a", "flac", str(temp_extracted)]
+        try:
+            run_ffmpeg_logged(ffmpeg_args)
+            extracted = True
+            break
+        except subprocess.CalledProcessError as e:
+            last_error = e
+            print(f"      - Downmix try {attempt} failed, trying next option...")
+    if not extracted:
+        raise last_error
 
-    print(f"    - Normalizing Audio Track #{index} with ffmpeg (loudnorm 2-pass)...")
-    print("      - Pass 1: Analyzing...")
-    result = subprocess.run(
-        [
-            "ffmpeg", "-v", "info", "-i", str(temp_extracted),
-            "-af", "loudnorm=I=-23:LRA=7:tp=-1:print_format=json",
-            "-f", "null", "-",
-        ],
-        capture_output=True, text=True, check=True,
-    )
-    stats = _parse_loudnorm_json(result.stderr)
-
-    print("      - Pass 2: Applying normalization...")
-    run_cmd([
-        "ffmpeg", "-v", "quiet", "-stats", "-y", "-i", str(temp_extracted),
-        "-af", (
-            "loudnorm=I=-23:LRA=7:tp=-1:"
-            f"measured_i={stats['input_i']}:"
-            f"measured_lra={stats['input_lra']}:"
-            f"measured_tp={stats['input_tp']}:"
-            f"measured_thresh={stats['input_thresh']}:"
-            f"offset={stats['target_offset']}"
-        ),
-        "-c:a", "flac", str(temp_normalized),
-    ])
+    apply_constant_gain_loudness(temp_extracted, temp_normalized, index)
 
     is_being_downmixed = should_downmix and ch >= 6
     if is_being_downmixed:
@@ -219,7 +329,7 @@ def create_xav_intermediate(source_file_base, source_file_full, is_vfr, target_c
     return create_ffmpeg_x264_intermediate(source_file_full, intermediate_file)
 
 
-def convert_video(source_file_base, source_file_full, is_vfr, target_cfr_fps_for_handbrake, preset=XAV_PRESET, crf=None, workers=None):
+def convert_video(source_file_base, source_file_full, is_vfr, target_cfr_fps_for_handbrake, preset=XAV_PRESET, crf=None, workers=None, buff=None):
     print("  --- Starting Video Processing ---")
     encoded_video_file = Path(f"temp-{source_file_base}.mkv")
     intermediate_file = create_xav_intermediate(
@@ -232,8 +342,10 @@ def convert_video(source_file_base, source_file_full, is_vfr, target_cfr_fps_for
         return encoded_video_file, intermediate_file
 
     worker_count = xav_worker_count(workers)
+    buff_count = XAV_BUFF if buff is None else max(0, int(buff))
     total_cores = os.cpu_count() or 4
     print(f"    - Using {worker_count} xav workers (Total Cores: {total_cores}, Logic: (cores - {WORKER_CORES_RESERVED}) / 2).")
+    print(f"    - xav decode buffer: -b {buff_count} (one extra pre-decoded chunk when 1).")
 
     param_parts = [f"--preset {preset}", f"--lp {XAV_LP}"]
     if crf is not None:
@@ -245,6 +357,7 @@ def convert_video(source_file_base, source_file_full, is_vfr, target_cfr_fps_for
         "-e", XAV_ENCODER,
         "-p", xav_params,
         "-w", str(worker_count),
+        "-b", str(buff_count),
         str(intermediate_file),
         str(encoded_video_file),
     ]
@@ -345,8 +458,13 @@ def video_temp_files(current_dir, file_path, handbrake_intermediate):
     return files
 
 
-def main(no_downmix=False, preset=None, crf=None, workers=None):
+def main(no_downmix=False, preset=None, crf=None, workers=None, buff=None, norm_i=None, norm_tp=None):
     check_tools()
+    global LOUDNESS_I, LOUDNESS_TP
+    if norm_i is not None:
+        LOUDNESS_I = norm_i
+    if norm_tp is not None:
+        LOUDNESS_TP = norm_tp
     encode_preset = XAV_PRESET if preset is None else preset
     current_dir = Path(".")
     if not list_source_mkvs(current_dir):
@@ -383,8 +501,8 @@ def main(no_downmix=False, preset=None, crf=None, workers=None):
         date_for_runtime_calc = datetime.now()
         try:
             log_file_handle = open(log_file_path, "w", encoding="utf-8", buffering=1)
-            sys.stdout = log_file_handle
-            sys.stderr = log_file_handle
+            sys.stdout = Tee(log_file_handle, original_stdout_console)
+            sys.stderr = Tee(log_file_handle, original_stderr_console)
             print(f"STARTING LOG FOR: {file_path.name}")
             print(f"Processing started at: {date_for_runtime_calc}")
             print(f"Full input file path: {file_path.resolve()}")
@@ -416,6 +534,7 @@ def main(no_downmix=False, preset=None, crf=None, workers=None):
                     preset=encode_preset,
                     crf=crf,
                     workers=workers,
+                    buff=buff,
                 )
 
                 print("--- Starting Audio Processing ---")
@@ -587,10 +706,16 @@ if __name__ == "__main__":
     parser.add_argument("--preset", type=int, default=None, help=f"SVT-AV1 preset passed to xav -p (default: {XAV_PRESET}).")
     parser.add_argument("--crf", type=float, default=None, help="Optional SVT-AV1 CRF passed to xav -p. Omitted = xav/SVT default.")
     parser.add_argument("--workers", type=int, default=None, help=f"Override xav -w. Default is (cpu_count - {WORKER_CORES_RESERVED}) // 2.")
+    parser.add_argument("--buff", type=int, default=None, help=f"xav -b extra pre-decoded chunks (default: {XAV_BUFF}).")
+    parser.add_argument("--norm-i", type=float, default=None, help=f"Target integrated loudness in LUFS (default: {LOUDNESS_I}).")
+    parser.add_argument("--norm-tp", type=float, default=None, help=f"True-peak ceiling in dBTP (default: {LOUDNESS_TP}).")
     args = parser.parse_args()
     main(
         no_downmix=args.no_downmix,
         preset=args.preset,
         crf=args.crf,
         workers=args.workers,
+        buff=args.buff,
+        norm_i=args.norm_i,
+        norm_tp=args.norm_tp,
     )
