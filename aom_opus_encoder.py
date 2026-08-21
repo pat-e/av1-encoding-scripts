@@ -12,6 +12,10 @@ import json
 import re # Added for VFR frame rate parsing
 from datetime import datetime
 from pathlib import Path
+import math
+
+LOUDNESS_I = -16.0
+LOUDNESS_TP = -1.5
 
 REQUIRED_TOOLS = [
     "ffmpeg", "ffprobe", "mkvmerge", "mkvpropedit",
@@ -67,6 +71,74 @@ def run_cmd(cmd, capture_output=False, check=True):
     else:
         subprocess.run(cmd, check=check)
 
+def _parse_loudnorm_json(stderr_output):
+    json_start_index = stderr_output.find("{")
+    if json_start_index == -1:
+        raise ValueError("Could not find start of JSON block in ffmpeg output for loudness analysis.")
+    brace_level = 0
+    json_end_index = -1
+    for i, char in enumerate(stderr_output[json_start_index:]):
+        if char == "{":
+            brace_level += 1
+        elif char == "}":
+            brace_level -= 1
+            if brace_level == 0:
+                json_end_index = json_start_index + i + 1
+                break
+    if json_end_index == -1:
+        raise ValueError("Could not find end of JSON block in ffmpeg output for loudness analysis.")
+    return json.loads(stderr_output[json_start_index:json_end_index])
+
+def _finite_float(value, fallback):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    return number if math.isfinite(number) else fallback
+
+def apply_constant_gain_loudness(input_path, output_path, track_index):
+    """Measure integrated LUFS, apply one gain, brickwall-clamp true peak. No LRA compressor."""
+    print(f"    - Normalizing Audio Track #{track_index} (constant-gain LUFS, 2-pass)...")
+    print(f"      - Targets: I={LOUDNESS_I} LUFS, TP={LOUDNESS_TP} dBTP (no LRA processing)")
+    print("      - Pass 1: Measuring integrated loudness...")
+    result = subprocess.run(
+        [
+            "ffmpeg", "-v", "info", "-i", str(input_path),
+            "-af", f"loudnorm=I={LOUDNESS_I}:LRA=20:tp={LOUDNESS_TP}:print_format=json",
+            "-f", "null", "-",
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    stats = _parse_loudnorm_json(result.stderr)
+    measured_i = _finite_float(stats.get("input_i"), None)
+    if measured_i is None:
+        print("      - Could not measure integrated loudness; copying without gain.")
+        subprocess.run(
+            ["ffmpeg", "-v", "quiet", "-y", "-i", str(input_path), "-c:a", "flac", str(output_path)],
+            check=True,
+        )
+        return
+
+    gain_db = LOUDNESS_I - measured_i
+    gain = 10 ** (gain_db / 20.0)
+    tp_linear = 10 ** (LOUDNESS_TP / 20.0)
+    print(f"      - Measured I={measured_i:.2f} LUFS → constant gain {gain_db:+.2f} dB")
+    print(f"      - Pass 2: Apply gain, brickwall clamp {LOUDNESS_TP} dBTP...")
+    run_cmd(
+        [
+            "ffmpeg", "-hide_banner", "-v", "error", "-stats", "-y",
+            "-i", str(input_path),
+            "-af", (
+                f"volume={gain:.10f},"
+                f"asoftclip=type=hard:threshold={tp_linear:.10f},"
+                f"aformat=sample_fmts=s32"
+            ),
+            "-c:a", "flac", "-sample_fmt", "s32",
+            str(output_path),
+        ],
+        check=True,
+    )
+
 def convert_audio_track(index, ch, lang, audio_temp_dir, source_file, should_downmix):
     audio_temp_path = Path(audio_temp_dir)
     temp_extracted = audio_temp_path / f"track_{index}_extracted.flac"
@@ -87,42 +159,7 @@ def convert_audio_track(index, ch, lang, audio_temp_dir, source_file, should_dow
     ffmpeg_args += ["-c:a", "flac", str(temp_extracted)]
     run_cmd(ffmpeg_args)
 
-    print(f"    - Normalizing Audio Track #{index} with ffmpeg (loudnorm 2-pass)...")
-    # First pass: Analyze the audio to get loudnorm stats
-    # The stats are printed to stderr, so we must use subprocess.run directly to capture it.
-    print("      - Pass 1: Analyzing...")
-    result = subprocess.run(
-        ["ffmpeg", "-v", "info", "-i", str(temp_extracted), "-af", "loudnorm=I=-23:LRA=7:tp=-1:print_format=json", "-f", "null", "-"],
-        capture_output=True, text=True, check=True)
-    
-    # Find the start of the JSON block in stderr and parse it.
-    # This is more robust than slicing the last N lines.
-    # We find the start and end of the JSON block to avoid parsing extra data.
-    stderr_output = result.stderr
-    json_start_index = stderr_output.find('{')
-    if json_start_index == -1:
-        raise ValueError("Could not find start of JSON block in ffmpeg output for loudnorm analysis.")
-
-    brace_level = 0
-    json_end_index = -1
-    for i, char in enumerate(stderr_output[json_start_index:]):
-        if char == '{':
-            brace_level += 1
-        elif char == '}':
-            brace_level -= 1
-            if brace_level == 0:
-                json_end_index = json_start_index + i + 1
-                break
-    
-    stats = json.loads(stderr_output[json_start_index:json_end_index])
-
-    # Second pass: Apply the normalization using the stats from the first pass
-    print("      - Pass 2: Applying normalization...")
-    run_cmd([
-        "ffmpeg", "-v", "quiet", "-stats", "-y", "-i", str(temp_extracted), "-af",
-        f"loudnorm=I=-23:LRA=7:tp=-1:measured_i={stats['input_i']}:measured_lra={stats['input_lra']}:measured_tp={stats['input_tp']}:measured_thresh={stats['input_thresh']}:offset={stats['target_offset']}",
-        "-c:a", "flac", str(temp_normalized)
-    ])
+    apply_constant_gain_loudness(temp_extracted, temp_normalized, index)
 
     # Set bitrate based on the final channel count of the Opus file.
     # If we are downmixing, the result is stereo.
@@ -491,7 +528,12 @@ def detect_autocrop_filter(input_file, significant_crop_threshold=5.0, min_crop=
         return None
     return _analyze_video_cropdetect(input_file, duration, width, height, max(1, os.cpu_count() // 2), significant_crop_threshold, min_crop, debug)
 
-def main(no_downmix=False, autocrop=False, grain=None, crf=None):
+def main(no_downmix=False, autocrop=False, grain=None, crf=None, norm_i=None, norm_tp=None):
+    global LOUDNESS_I, LOUDNESS_TP
+    if norm_i is not None:
+        LOUDNESS_I = norm_i
+    if norm_tp is not None:
+        LOUDNESS_TP = norm_tp
     check_tools()
 
     photon_noise_val = grain
@@ -786,5 +828,7 @@ if __name__ == "__main__":
     parser.add_argument("--autocrop", action="store_true", help="Automatically detect and crop black bars from video using cropdetect.")
     parser.add_argument("--grain", type=int, help="Set the photon-noise value for grain synthesis (if omitted, grain synthesis is disabled).")
     parser.add_argument("--crf", type=int, help=f"Set the constant quality level (cq-level) for video encoding (default: {AOM_AV1_PARAMS['cq-level']}).")
+    parser.add_argument("--norm-i", type=float, help=f"Target integrated loudness in LUFS (default: {LOUDNESS_I})")
+    parser.add_argument("--norm-tp", type=float, help=f"True-peak ceiling in dBTP (default: {LOUDNESS_TP})")
     args = parser.parse_args()
-    main(no_downmix=args.no_downmix, autocrop=args.autocrop, grain=args.grain, crf=args.crf)
+    main(no_downmix=args.no_downmix, autocrop=args.autocrop, grain=args.grain, crf=args.crf, norm_i=args.norm_i, norm_tp=args.norm_tp)
