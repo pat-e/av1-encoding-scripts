@@ -268,6 +268,53 @@ def strip_titles(mkv_path):
         print(f"    - Warning: mkvpropedit could not clear titles ({e}). Continuing.")
 
 
+def collect_track_names(path):
+    """Audio and subtitle track names from the prepared source (mkvmerge track_name)."""
+    mkv = mkvmerge_identify(path)
+    audio, subs = [], []
+    for t in mkv.get("tracks", []):
+        name = t.get("properties", {}).get("track_name") or ""
+        kind = t.get("type")
+        if kind == "audio":
+            audio.append(name)
+        elif kind == "subtitles":
+            subs.append(name)
+    return audio, subs
+
+
+def restore_track_names(mkv_path, audio_names, sub_names):
+    """Re-apply source audio/subtitle titles. xav does not keep track names."""
+    if not audio_names and not sub_names:
+        return
+    print("    - Restoring audio and subtitle track titles from source...")
+    args = ["mkvpropedit", str(mkv_path)]
+    out = mkvmerge_identify(mkv_path)
+    out_audio = [t for t in out.get("tracks", []) if t.get("type") == "audio"]
+    out_subs = [t for t in out.get("tracks", []) if t.get("type") == "subtitles"]
+    for i, name in enumerate(audio_names[: len(out_audio)], start=1):
+        args += ["--edit", f"track:a{i}"]
+        if name:
+            args += ["--set", f"name={name}"]
+            print(f"      - audio a{i}: {name}")
+        else:
+            args += ["--delete", "name"]
+            print(f"      - audio a{i}: (no title)")
+    for i, name in enumerate(sub_names[: len(out_subs)], start=1):
+        args += ["--edit", f"track:s{i}"]
+        if name:
+            args += ["--set", f"name={name}"]
+            print(f"      - subtitle s{i}: {name}")
+        else:
+            args += ["--delete", "name"]
+            print(f"      - subtitle s{i}: (no title)")
+    if args == ["mkvpropedit", str(mkv_path)]:
+        return
+    try:
+        run_cmd(args)
+    except subprocess.CalledProcessError as e:
+        print(f"    - Warning: mkvpropedit could not restore track titles ({e}). Continuing.")
+
+
 def ffprobe_json(path):
     raw = run_cmd(
         ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", str(path)],
@@ -480,6 +527,7 @@ def main(no_downmix=False, preset=None, workers=None, buff=None):
             print(f"Analyzing file: {file_path.resolve()}")
             media_info = mediainfo_json(file_path)
             track = video_track(media_info)
+            audio_names, sub_names = collect_track_names(file_path)
             is_vfr, target_cfr_fps = detect_vfr(media_info)
             xav_input, extra_temps = prepare_xav_input(file_path, is_vfr, target_cfr_fps, track)
             encode_ids, remux_ids, plan = classify_audio_tracks(xav_input)
@@ -509,6 +557,7 @@ def main(no_downmix=False, preset=None, workers=None, buff=None):
                 print("    - All audio is AAC/Opus (or none to encode); xav copied audio, no extra remux.")
 
             strip_titles(final_file)
+            restore_track_names(final_file, audio_names, sub_names)
 
             print("Moving files to final destinations...")
             shutil.move(str(file_path), DIR_ORIGINAL / file_path.name)
