@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 
+# This script is centered around the "xav" batch AV1 encoder tool.
+# For more information and to install xav, visit: https://github.com/emrakyz/xav
+#
 # Batch encode: xav does video + audio. Intermediate only for VFR (HandBrake CFR).
 # 1080p or lower: -p "--preset 1"  -w 4  -b 1
 # Above 1080p:    -p "--preset 2"  -w 4  -b 1
@@ -268,51 +271,92 @@ def strip_titles(mkv_path):
         print(f"    - Warning: mkvpropedit could not clear titles ({e}). Continuing.")
 
 
-def collect_track_names(path):
-    """Audio and subtitle track names from the prepared source (mkvmerge track_name)."""
+# mkvmerge -J property → mkvpropedit --set name. Missing JSON keys use these defaults.
+TRACK_FLAG_MAP = (
+    ("default_track", "flag-default", 0),
+    ("forced_track", "flag-forced", 0),
+    ("enabled_track", "flag-enabled", 1),
+    ("flag_hearing_impaired", "flag-hearing-impaired", 0),
+    ("flag_visual_impaired", "flag-visual-impaired", 0),
+    ("flag_text_descriptions", "flag-text-descriptions", 0),
+    ("flag_original", "flag-original", 0),
+    ("flag_commentary", "flag-commentary", 0),
+)
+
+
+def collect_track_meta(path):
+    """Audio/subtitle names and Matroska flags from the prepared source."""
     mkv = mkvmerge_identify(path)
     audio, subs = [], []
     for t in mkv.get("tracks", []):
-        name = t.get("properties", {}).get("track_name") or ""
         kind = t.get("type")
+        if kind not in ("audio", "subtitles"):
+            continue
+        props = t.get("properties") or {}
+        flags = {}
+        for json_key, prop_name, default in TRACK_FLAG_MAP:
+            if json_key in props:
+                flags[prop_name] = 1 if props[json_key] else 0
+            else:
+                flags[prop_name] = default
+        meta = {
+            "name": props.get("track_name") or "",
+            "language": props.get("language") or "und",
+            "language_ietf": props.get("language_ietf") or "",
+            "flags": flags,
+        }
         if kind == "audio":
-            audio.append(name)
-        elif kind == "subtitles":
-            subs.append(name)
+            audio.append(meta)
+        else:
+            subs.append(meta)
     return audio, subs
 
 
-def restore_track_names(mkv_path, audio_names, sub_names):
-    """Re-apply source audio/subtitle titles. xav does not keep track names."""
-    if not audio_names and not sub_names:
+def _append_track_restore(args, selector, meta, label):
+    name = meta.get("name") or ""
+    flags = meta.get("flags") or {}
+    language = meta.get("language") or "und"
+    language_ietf = meta.get("language_ietf") or ""
+    args += ["--edit", selector]
+    if name:
+        args += ["--set", f"name={name}"]
+        shown = name
+    else:
+        args += ["--delete", "name"]
+        shown = "(no title)"
+    args += ["--set", f"language={language}"]
+    if language_ietf:
+        args += ["--set", f"language-ietf={language_ietf}"]
+    bits = []
+    for _json_key, prop_name, _default in TRACK_FLAG_MAP:
+        value = flags.get(prop_name, 0)
+        args += ["--set", f"{prop_name}={value}"]
+        if value:
+            bits.append(prop_name.replace("flag-", ""))
+    extra = f" [{', '.join(bits)}]" if bits else ""
+    ietf = f"/{language_ietf}" if language_ietf else ""
+    print(f"      - {label}: {language}{ietf}  {shown}{extra}")
+
+
+def restore_track_meta(mkv_path, audio_meta, sub_meta):
+    """Re-apply source audio/subtitle titles and flags. xav does not keep them."""
+    if not audio_meta and not sub_meta:
         return
-    print("    - Restoring audio and subtitle track titles from source...")
+    print("    - Restoring audio and subtitle language, titles, and flags from source...")
     args = ["mkvpropedit", str(mkv_path)]
     out = mkvmerge_identify(mkv_path)
     out_audio = [t for t in out.get("tracks", []) if t.get("type") == "audio"]
     out_subs = [t for t in out.get("tracks", []) if t.get("type") == "subtitles"]
-    for i, name in enumerate(audio_names[: len(out_audio)], start=1):
-        args += ["--edit", f"track:a{i}"]
-        if name:
-            args += ["--set", f"name={name}"]
-            print(f"      - audio a{i}: {name}")
-        else:
-            args += ["--delete", "name"]
-            print(f"      - audio a{i}: (no title)")
-    for i, name in enumerate(sub_names[: len(out_subs)], start=1):
-        args += ["--edit", f"track:s{i}"]
-        if name:
-            args += ["--set", f"name={name}"]
-            print(f"      - subtitle s{i}: {name}")
-        else:
-            args += ["--delete", "name"]
-            print(f"      - subtitle s{i}: (no title)")
+    for i, meta in enumerate(audio_meta[: len(out_audio)], start=1):
+        _append_track_restore(args, f"track:a{i}", meta, f"audio a{i}")
+    for i, meta in enumerate(sub_meta[: len(out_subs)], start=1):
+        _append_track_restore(args, f"track:s{i}", meta, f"subtitle s{i}")
     if args == ["mkvpropedit", str(mkv_path)]:
         return
     try:
         run_cmd(args)
     except subprocess.CalledProcessError as e:
-        print(f"    - Warning: mkvpropedit could not restore track titles ({e}). Continuing.")
+        print(f"    - Warning: mkvpropedit could not restore track titles/flags ({e}). Continuing.")
 
 
 def ffprobe_json(path):
@@ -527,7 +571,7 @@ def main(no_downmix=False, preset=None, workers=None, buff=None):
             print(f"Analyzing file: {file_path.resolve()}")
             media_info = mediainfo_json(file_path)
             track = video_track(media_info)
-            audio_names, sub_names = collect_track_names(file_path)
+            audio_meta, sub_meta = collect_track_meta(file_path)
             is_vfr, target_cfr_fps = detect_vfr(media_info)
             xav_input, extra_temps = prepare_xav_input(file_path, is_vfr, target_cfr_fps, track)
             encode_ids, remux_ids, plan = classify_audio_tracks(xav_input)
@@ -557,7 +601,7 @@ def main(no_downmix=False, preset=None, workers=None, buff=None):
                 print("    - All audio is AAC/Opus (or none to encode); xav copied audio, no extra remux.")
 
             strip_titles(final_file)
-            restore_track_names(final_file, audio_names, sub_names)
+            restore_track_meta(final_file, audio_meta, sub_meta)
 
             print("Moving files to final destinations...")
             shutil.move(str(file_path), DIR_ORIGINAL / file_path.name)
