@@ -3,26 +3,27 @@
 # This script is centered around the "xav" batch AV1 encoder tool.
 # For more information and to install xav, visit: https://github.com/emrakyz/xav
 #
-# Batch encode: xav does video + audio. Intermediate only for VFR (HandBrake CFR).
+# Batch encode: xav is VIDEO ONLY (no -a). Audio, subs, attachments, mux: this script.
+# VFR: HandBrakeCLI CFR, video only. CFR: xav reads the source MKV.
 # 1080p or lower: -p "--preset 1"  -w 4  -b 1
 # Above 1080p:    -p "--preset 2"  -w 4  -b 1
-# Default audio:  -a "norm <ids>"  (xav downmix+norm on non-AAC/Opus)
-# --no-downmix:   -a "auto <ids>"  (keep layout on those tracks)
-# AAC/Opus: never passed to xav; remuxed from the xav input after encode.
-# CFR: xav reads the source MKV directly. No x264/HEVC remux.
+# Audio: AAC/Opus remuxed. Else: optional 0.30 pan → constant-gain LUFS (xav-style) → opusenc.
+# Final mkvmerge: xav video + processed/remuxed audio + source subs/attachments/chapters.
 
 import json
+import math
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import argparse
 from datetime import datetime
 from pathlib import Path
 
 REQUIRED_TOOLS = [
     "ffmpeg", "ffprobe", "mkvmerge", "mkvpropedit",
-    "mediainfo", "xav", "HandBrakeCLI",
+    "opusenc", "mediainfo", "xav", "HandBrakeCLI",
 ]
 DIR_COMPLETED = Path("completed")
 DIR_ORIGINAL = Path("original")
@@ -36,6 +37,10 @@ XAV_WORKERS = 4
 PRESET_1080 = 1
 PRESET_4K = 2
 HEIGHT_4K = 1080
+
+# Constant-gain loudness (xav-style, no LRA compressor).
+LOUDNESS_I = -16.0
+LOUDNESS_TP = -1.5
 
 CFR_SUFFIX = ".cfr.mkv"
 CFR_FULL_SUFFIX = ".cfr_full.mkv"
@@ -77,6 +82,22 @@ def run_cmd(cmd, capture_output=False, check=True):
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check, text=True)
         return result.stdout
     subprocess.run(cmd, check=check)
+
+
+def run_ffmpeg_logged(args):
+    """Run ffmpeg so -stats is teed to console and log as it happens."""
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
+    try:
+        while True:
+            chunk = proc.stdout.read(256)
+            if not chunk:
+                break
+            sys.stdout.write(chunk.decode("utf-8", errors="replace"))
+            sys.stdout.flush()
+    finally:
+        ret = proc.wait()
+    if ret != 0:
+        raise subprocess.CalledProcessError(ret, args)
 
 
 def file_is_usable(path):
@@ -178,18 +199,10 @@ def detect_vfr(media_info):
     return is_vfr, target_cfr_fps
 
 
-def source_has_attachments(path):
-    try:
-        data = json.loads(run_cmd(["mkvmerge", "-J", str(path)], capture_output=True))
-    except (subprocess.CalledProcessError, json.JSONDecodeError, TypeError):
-        return False
-    return bool(data.get("attachments"))
-
-
 def run_handbrake_cfr(source_file, output_file, target_cfr_fps, use_10bit):
-    """VFR → CFR. Copy all audio + subtitles. Video re-encode (required to make CFR)."""
+    """VFR → CFR video only. Audio/subs stay on the original for the Python mux."""
     encoder = "x265_10bit" if use_10bit else "x264"
-    print(f"    - Source is VFR. HandBrakeCLI CFR ({target_cfr_fps}) encoder={encoder}, copy audio/subs...")
+    print(f"    - Source is VFR. HandBrakeCLI CFR ({target_cfr_fps}) encoder={encoder}, video only...")
     handbrake_args = [
         "HandBrakeCLI",
         "--input", str(source_file),
@@ -199,12 +212,8 @@ def run_handbrake_cfr(source_file, output_file, target_cfr_fps, use_10bit):
         "--encoder", encoder,
         "--quality", "0",
         "--encoder-preset", "superfast",
-        "--all-audio",
-        "--aencoder", "copy",
-        "--audio-copy-mask", "aac,ac3,eac3,truehd,dts,dtshd,mp2,mp3,flac,opus,vorbis",
-        "--all-subtitles",
-        "--subtitle-burned", "none",
-        "--markers",
+        "--audio", "none",
+        "--subtitle", "none",
         "--crop-mode", "none",
     ]
     print(f"    - Running HandBrakeCLI: {' '.join(handbrake_args)}")
@@ -212,50 +221,22 @@ def run_handbrake_cfr(source_file, output_file, target_cfr_fps, use_10bit):
     return file_is_usable(output_file)
 
 
-def attach_fonts_from_source(cfr_file, source_file, output_file):
-    """HandBrake does not copy MKV font attachments. Pull them from the source."""
-    print("    - Merging font/attachments from source into CFR file...")
-    run_cmd([
-        "mkvmerge", "-o", str(output_file),
-        str(cfr_file),
-        "--no-video", "--no-audio", "--no-subtitles", "--no-chapters", "--no-global-tags",
-        str(source_file),
-    ])
-    return file_is_usable(output_file)
-
-
 def prepare_xav_input(file_path, is_vfr, target_cfr_fps, track):
-    """CFR: original file. VFR: HandBrake CFR MKV with audio/subs + source attachments."""
+    """CFR: original file. VFR: HandBrake video-only CFR. xav never sees audio."""
     if not (is_vfr and target_cfr_fps):
-        print("    - CFR (or VFR skipped): xav will read the source file directly.")
+        print("    - CFR (or VFR skipped): xav will read the source file (video only used).")
         return file_path, []
 
     cfr_file = Path(f"{file_path.stem}{CFR_SUFFIX}")
     temps = [cfr_file]
     if file_is_usable(cfr_file):
         print(f"    - Reusing existing CFR intermediate (resume): {cfr_file}")
-    else:
-        use_10bit = video_bit_depth(track) >= 10 or is_4k_path(track)
-        if not run_handbrake_cfr(file_path, cfr_file, target_cfr_fps, use_10bit):
-            print("    - Warning: HandBrakeCLI produced an empty file. Sending source to xav as-is.")
-            return file_path, temps
-
-    if not source_has_attachments(file_path):
-        print("    - No MKV attachments on source; using HandBrake output as xav input.")
         return cfr_file, temps
-
-    full_file = Path(f"{file_path.stem}{CFR_FULL_SUFFIX}")
-    temps.append(full_file)
-    if file_is_usable(full_file):
-        print(f"    - Reusing CFR+attachments (resume): {full_file}")
-        return full_file, temps
-    try:
-        if attach_fonts_from_source(cfr_file, file_path, full_file):
-            return full_file, temps
-        print("    - Warning: attachment merge failed. Using HandBrake output without extra fonts.")
-    except subprocess.CalledProcessError as e:
-        print(f"    - Warning: attachment merge failed ({e}). Using HandBrake output without extra fonts.")
-    return cfr_file, temps
+    use_10bit = video_bit_depth(track) >= 10 or is_4k_path(track)
+    if run_handbrake_cfr(file_path, cfr_file, target_cfr_fps, use_10bit):
+        return cfr_file, temps
+    print("    - Warning: HandBrakeCLI produced an empty file. Sending source to xav as-is.")
+    return file_path, temps
 
 
 def strip_titles(mkv_path):
@@ -371,21 +352,173 @@ def mkvmerge_identify(path):
     return json.loads(run_cmd(["mkvmerge", "-J", str(path)], capture_output=True))
 
 
-def classify_audio_tracks(path):
-    """AAC/Opus → remux (mkvmerge track id). Everything else → xav (ffmpeg stream index)."""
-    probe = ffprobe_json(path)
-    mkv = mkvmerge_identify(path)
+def _parse_loudnorm_json(stderr_output):
+    json_start_index = stderr_output.find("{")
+    if json_start_index == -1:
+        raise ValueError("Could not find start of JSON block in ffmpeg output for loudness analysis.")
+    brace_level = 0
+    json_end_index = -1
+    for i, char in enumerate(stderr_output[json_start_index:]):
+        if char == "{":
+            brace_level += 1
+        elif char == "}":
+            brace_level -= 1
+            if brace_level == 0:
+                json_end_index = json_start_index + i + 1
+                break
+    if json_end_index == -1:
+        raise ValueError("Could not find end of JSON block in ffmpeg output for loudness analysis.")
+    return json.loads(stderr_output[json_start_index:json_end_index])
+
+
+def _finite_float(value, fallback):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    return number if math.isfinite(number) else fallback
+
+
+def apply_constant_gain_loudness(input_path, output_path, track_index):
+    """Measure integrated LUFS, apply one gain, brickwall-clamp true peak. Same as xav (no LRA)."""
+    print(f"    - Normalizing Audio Track #{track_index} (constant-gain LUFS, 2-pass)...")
+    print(f"      - Targets: I={LOUDNESS_I} LUFS, TP={LOUDNESS_TP} dBTP (no LRA processing)")
+    print("      - Pass 1: Measuring integrated loudness...")
+    result = subprocess.run(
+        [
+            "ffmpeg", "-v", "info", "-i", str(input_path),
+            "-af", f"loudnorm=I={LOUDNESS_I}:LRA=20:tp={LOUDNESS_TP}:print_format=json",
+            "-f", "null", "-",
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    stats = _parse_loudnorm_json(result.stderr)
+    measured_i = _finite_float(stats.get("input_i"), None)
+    if measured_i is None:
+        print("      - Could not measure integrated loudness; copying without gain.")
+        run_cmd(["ffmpeg", "-v", "quiet", "-y", "-i", str(input_path), "-c:a", "flac", str(output_path)])
+        return
+
+    gain_db = LOUDNESS_I - measured_i
+    gain = 10 ** (gain_db / 20.0)
+    tp_linear = 10 ** (LOUDNESS_TP / 20.0)
+    print(f"      - Measured I={measured_i:.2f} LUFS → constant gain {gain_db:+.2f} dB")
+    print(f"      - Pass 2: Apply gain, brickwall clamp {LOUDNESS_TP} dBTP...")
+    run_ffmpeg_logged([
+        "ffmpeg", "-hide_banner", "-v", "error", "-stats", "-y",
+        "-i", str(input_path),
+        "-af", (
+            f"volume={gain:.10f},"
+            f"asoftclip=type=hard:threshold={tp_linear:.10f},"
+            f"aformat=sample_fmts=s32"
+        ),
+        "-c:a", "flac", "-sample_fmt", "s32",
+        str(output_path),
+    ])
+
+
+def downmix_filters(ch):
+    """Same 0.30 center-forward mix as xav_opus_encoder.py."""
+    if ch == 6:
+        return [
+            "pan=stereo|FL=FC+0.30*FL+0.30*SL|FR=FC+0.30*FR+0.30*SR",
+            "pan=stereo|FL=FC+0.30*FL+0.30*BL|FR=FC+0.30*FR+0.30*BR",
+            "aformat=ch_layouts=5.1,pan=stereo|FL=FC+0.30*FL+0.30*BL|FR=FC+0.30*FR+0.30*BR",
+            "pan=stereo|c0=c2+0.30*c0+0.30*c4|c1=c2+0.30*c1+0.30*c5",
+        ]
+    if ch == 8:
+        return [
+            "pan=stereo|FL=FC+0.30*FL+0.30*SL+0.30*BL|FR=FC+0.30*FR+0.30*SR+0.30*BR",
+            "pan=stereo|c0=c2+0.30*c0+0.30*c4+0.30*c6|c1=c2+0.30*c1+0.30*c5+0.30*c7",
+        ]
+    return []
+
+
+def convert_audio_track(index, ch, audio_temp_dir, source_file, should_downmix):
+    audio_temp_path = Path(audio_temp_dir)
+    temp_extracted = audio_temp_path / f"track_{index}_extracted.flac"
+    temp_normalized = audio_temp_path / f"track_{index}_normalized.flac"
+    final_opus = audio_temp_path / f"track_{index}_final.opus"
+
+    print(f"    - Extracting Audio Track #{index} to FLAC...")
+    base_args = [
+        "ffmpeg", "-hide_banner", "-v", "error", "-stats", "-y",
+        "-drc_scale", "0",
+        "-i", str(source_file),
+        "-map", f"0:{index}",
+        "-map_metadata", "-1",
+    ]
+    downmix_attempts = []
+    if should_downmix and ch >= 6:
+        downmix_attempts.extend(downmix_filters(ch))
+        downmix_attempts.append(None)
+    else:
+        downmix_attempts.append("keep")
+
+    last_error = None
+    extracted = False
+    for attempt, filt in enumerate(downmix_attempts, start=1):
+        ffmpeg_args = list(base_args)
+        if filt == "keep":
+            pass
+        elif filt is None:
+            ffmpeg_args += ["-ac", "2"]
+            print("      - Downmix fallback: -ac 2")
+        else:
+            ffmpeg_args += ["-af", filt]
+            print(f"      - Downmix filter (try {attempt}): {filt}")
+        ffmpeg_args += ["-c:a", "flac", str(temp_extracted)]
+        try:
+            run_ffmpeg_logged(ffmpeg_args)
+            extracted = True
+            break
+        except subprocess.CalledProcessError as e:
+            last_error = e
+            print(f"      - Downmix try {attempt} failed, trying next option...")
+    if not extracted:
+        raise last_error
+
+    apply_constant_gain_loudness(temp_extracted, temp_normalized, index)
+
+    is_being_downmixed = should_downmix and ch >= 6
+    if is_being_downmixed:
+        bitrate = "128k"
+    elif ch == 1:
+        bitrate = "64k"
+    elif ch == 2:
+        bitrate = "128k"
+    elif ch == 6:
+        bitrate = "256k"
+    elif ch == 8:
+        bitrate = "384k"
+    else:
+        bitrate = "192k"
+
+    print(f"    - Encoding Audio Track #{index} to Opus at {bitrate}...")
+    run_cmd(["opusenc", "--vbr", "--bitrate", bitrate, str(temp_normalized), str(final_opus)])
+    return final_opus
+
+
+def process_audio_tracks(source_file, audio_temp_dir, no_downmix):
+    """AAC/Opus remux. Other codecs: pan (optional) → LUFS → opusenc. Original order."""
+    probe = ffprobe_json(source_file)
+    mkv = mkvmerge_identify(source_file)
+    media = mediainfo_json(source_file)
     mkv_audio = [t for t in mkv.get("tracks", []) if t.get("type") == "audio"]
-    encode_ids = []
-    remux_ids = []
+    media_audio = {
+        int(t.get("StreamOrder", -1)): t
+        for t in media.get("media", {}).get("track", [])
+        if t.get("@type") == "Audio"
+    }
     plan = []
     audio_i = 0
-    print("    - Audio tracks:")
+    print("--- Starting Audio Processing ---")
     for stream in probe.get("streams", []):
         if stream.get("codec_type") != "audio":
             continue
         idx = int(stream["index"])
         codec = (stream.get("codec_name") or "").lower()
+        channels = stream.get("channels", 2)
         mkv_track = None
         for t in mkv_audio:
             if t.get("properties", {}).get("stream_id") == idx:
@@ -394,36 +527,37 @@ def classify_audio_tracks(path):
         if mkv_track is None and audio_i < len(mkv_audio):
             mkv_track = mkv_audio[audio_i]
         audio_i += 1
-        mkv_id = mkv_track.get("id") if mkv_track else None
+        props = (mkv_track or {}).get("properties") or {}
+        mkv_id = (mkv_track or {}).get("id")
+        language = props.get("language") or stream.get("tags", {}).get("language") or "und"
+        title = props.get("track_name") or ""
+        delay = 0
+        delay_raw = (media_audio.get(idx) or {}).get("Video_Delay")
+        if delay_raw is not None:
+            try:
+                delay_val = float(delay_raw)
+                delay = int(round(delay_val * 1000 if delay_val < 1 else delay_val))
+            except Exception:
+                delay = 0
+        print(f"Processing Audio Stream #{idx} (TID: {mkv_id}, Codec: {codec}, Channels: {channels}, Lang: {language})")
         if codec in REMUX_CODECS and mkv_id is not None:
-            print(f"      - ffmpeg stream {idx} (TID {mkv_id}, {codec}): remux, skip xav")
-            remux_ids.append(str(mkv_id))
-            plan.append(("remux", str(mkv_id)))
+            print("    - Remux (AAC/Opus), skip re-encode")
+            plan.append({"kind": "remux", "mkv_id": str(mkv_id)})
         else:
-            print(f"      - ffmpeg stream {idx} (TID {mkv_id}, {codec}): encode with xav")
-            encode_ids.append(str(idx))
-            plan.append(("encode", str(idx)))
-    return encode_ids, remux_ids, plan
+            opus_path = convert_audio_track(idx, channels, audio_temp_dir, source_file, not no_downmix)
+            plan.append({
+                "kind": "encode",
+                "path": opus_path,
+                "language": language,
+                "title": title,
+                "delay": delay,
+            })
+    print("--- Finished Audio Processing ---")
+    return plan
 
 
-def build_xav_audio_arg(encode_ids, remux_ids, no_downmix):
-    if not encode_ids:
-        return None
-    mode = "auto" if no_downmix else "norm"
-    if not remux_ids:
-        return f"{mode} all"
-    return f"{mode} {','.join(encode_ids)}"
-
-
-def mkv_audio_ids(path):
-    mkv = mkvmerge_identify(path)
-    return [str(t["id"]) for t in mkv.get("tracks", []) if t.get("type") == "audio"]
-
-
-def mux_xav_with_remux(xav_output, remux_source, plan, dest):
-    """Keep original audio order: xav-encoded tracks + AAC/Opus copies from remux_source."""
-    xav_audio_ids = mkv_audio_ids(xav_output)
-    encode_iter = iter(xav_audio_ids)
+def mux_final(dest, xav_output, source_file, audio_plan):
+    """xav video only + audio in source order + source subs/attachments/chapters."""
     extra = [
         "--no-video", "--no-subtitles", "--no-attachments",
         "--no-chapters", "--no-global-tags",
@@ -432,25 +566,27 @@ def mux_xav_with_remux(xav_output, remux_source, plan, dest):
         "mkvmerge", "-o", str(dest),
         "--title", "",
         "--track-name", "0:",
-        "--no-audio",
+        "--no-audio", "--no-subtitles", "--no-attachments", "--no-chapters",
         str(xav_output),
     ]
-    for kind, ident in plan:
-        if kind == "remux":
-            args += extra + ["--audio-tracks", ident, str(remux_source)]
+    for item in audio_plan:
+        if item["kind"] == "remux":
+            args += extra + ["--audio-tracks", item["mkv_id"], str(source_file)]
         else:
-            xav_tid = next(encode_iter, None)
-            if xav_tid is None:
-                raise RuntimeError("xav output has fewer audio tracks than encoded stream IDs.")
-            args += extra + ["--audio-tracks", xav_tid, str(xav_output)]
-    print("    - Merging xav output with remuxed AAC/Opus in original track order...")
+            sync = ["--sync", f"0:{item['delay']}"] if item.get("delay") else []
+            args += [
+                "--language", f"0:{item['language']}",
+                "--track-name", f"0:{item.get('title') or ''}",
+            ] + sync + [str(item["path"])]
+    args += ["--no-video", "--no-audio", str(source_file)]
+    print("Assembling final file with mkvmerge...")
     print(f"    - mkvmerge: {' '.join(args)}")
     run_cmd(args)
     if not file_is_usable(dest):
         raise RuntimeError(f"mkvmerge produced an empty file: {dest}")
 
 
-def run_xav(xav_input, xav_output, track, audio_arg, preset_override=None, workers_override=None, buff_override=None):
+def run_xav(xav_input, xav_output, track, preset_override=None, workers_override=None, buff_override=None):
     if file_is_usable(xav_output):
         print(f"    - Reusing existing xav output (resume): {xav_output}")
         return
@@ -460,7 +596,7 @@ def run_xav(xav_input, xav_output, track, audio_arg, preset_override=None, worke
     buff = XAV_BUFF if buff_override is None else max(0, int(buff_override))
     path_label = "4K+" if is_4k_path(track) else "1080p or lower"
     print(f"    - Path: {path_label} (height={video_height(track)})")
-    print(f"    - Workers: {workers}  preset: {preset}  -b {buff}  audio: {audio_arg or '(copy, no -a)'}")
+    print(f"    - Workers: {workers}  preset: {preset}  -b {buff}  (no -a: audio is this script)")
 
     xav_args = [
         "xav",
@@ -468,10 +604,9 @@ def run_xav(xav_input, xav_output, track, audio_arg, preset_override=None, worke
         "-p", f"--preset {preset}",
         "-w", str(workers),
         "-b", str(buff),
+        str(xav_input),
+        str(xav_output),
     ]
-    if audio_arg:
-        xav_args += ["-a", audio_arg]
-    xav_args += [str(xav_input), str(xav_output)]
     print("    - Starting xav (this will take a long time)...")
     print(f"    - xav command: {' '.join(xav_args)}")
     run_cmd(xav_args)
@@ -523,8 +658,13 @@ def video_temp_files(current_dir, file_path, extra):
     return files
 
 
-def main(no_downmix=False, preset=None, workers=None, buff=None):
+def main(no_downmix=False, preset=None, workers=None, buff=None, norm_i=None, norm_tp=None):
     check_tools()
+    global LOUDNESS_I, LOUDNESS_TP
+    if norm_i is not None:
+        LOUDNESS_I = norm_i
+    if norm_tp is not None:
+        LOUDNESS_TP = norm_tp
     current_dir = Path(".")
     if not list_source_mkvs(current_dir):
         print("No MKV files found to process. Exiting.")
@@ -559,6 +699,7 @@ def main(no_downmix=False, preset=None, workers=None, buff=None):
         processing_error_occurred = False
         date_for_runtime_calc = datetime.now()
         extra_temps = []
+        audio_temp_dir = None
         try:
             log_file_handle = open(log_file_path, "w", encoding="utf-8", buffering=1)
             sys.stdout = Tee(log_file_handle, original_stdout_console)
@@ -574,38 +715,34 @@ def main(no_downmix=False, preset=None, workers=None, buff=None):
             audio_meta, sub_meta = collect_track_meta(file_path)
             is_vfr, target_cfr_fps = detect_vfr(media_info)
             xav_input, extra_temps = prepare_xav_input(file_path, is_vfr, target_cfr_fps, track)
-            encode_ids, remux_ids, plan = classify_audio_tracks(xav_input)
-            audio_arg = build_xav_audio_arg(encode_ids, remux_ids, no_downmix)
             xav_output = Path(f"temp-{file_path.stem}.mkv")
 
             run_xav(
                 xav_input,
                 xav_output,
                 track,
-                audio_arg,
                 preset_override=preset,
                 workers_override=workers,
                 buff_override=buff,
             )
 
-            final_file = xav_output
-            if encode_ids and remux_ids:
-                muxed = Path(f"output-{file_path.name}")
-                extra_temps.append(muxed)
-                if file_is_usable(muxed):
-                    print(f"    - Reusing remuxed output (resume): {muxed}")
-                else:
-                    mux_xav_with_remux(xav_output, xav_input, plan, muxed)
-                final_file = muxed
-            elif not encode_ids:
-                print("    - All audio is AAC/Opus (or none to encode); xav copied audio, no extra remux.")
+            audio_temp_dir = None
+            muxed = Path(f"output-{file_path.name}")
+            extra_temps.append(muxed)
+            if file_is_usable(muxed):
+                print(f"    - Reusing remuxed output (resume): {muxed}")
+            else:
+                audio_temp_dir = tempfile.mkdtemp(prefix="anime_audio_")
+                print(f"Audio temporary directory created at: {audio_temp_dir}")
+                audio_plan = process_audio_tracks(file_path, audio_temp_dir, no_downmix)
+                mux_final(muxed, xav_output, file_path, audio_plan)
 
-            strip_titles(final_file)
-            restore_track_meta(final_file, audio_meta, sub_meta)
+            strip_titles(muxed)
+            restore_track_meta(muxed, audio_meta, sub_meta)
 
             print("Moving files to final destinations...")
             shutil.move(str(file_path), DIR_ORIGINAL / file_path.name)
-            shutil.move(str(final_file), DIR_COMPLETED / file_path.name)
+            shutil.move(str(muxed), DIR_COMPLETED / file_path.name)
 
             print("Cleaning up temporary files (after successful processing)...")
             for temp_vid_file in video_temp_files(current_dir, file_path, extra_temps):
@@ -620,6 +757,8 @@ def main(no_downmix=False, preset=None, workers=None, buff=None):
             )
             processing_error_occurred = True
         finally:
+            if audio_temp_dir and Path(audio_temp_dir).exists():
+                shutil.rmtree(audio_temp_dir, ignore_errors=True)
             runtime = datetime.now() - date_for_runtime_calc
             runtime_str = str(runtime).split(".")[0]
             print(f"FINISHED LOG FOR: {file_path.name}")
@@ -655,12 +794,12 @@ def main(no_downmix=False, preset=None, workers=None, buff=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Batch-process prepared MKV files with xav only. VFR gets a HandBrake CFR pass; CFR goes straight to xav."
+        description="xav encodes video only. This script does audio (LUFS/Opus or AAC remux) and the final mkvmerge."
     )
     parser.add_argument(
         "--no-downmix",
         action="store_true",
-        help='Keep surround on tracks xav encodes (-a "auto IDs"). AAC/Opus are always remuxed. Default is -a "norm IDs".',
+        help="Keep surround on re-encoded tracks (no 0.30 pan). AAC/Opus are always remuxed.",
     )
     parser.add_argument(
         "--preset",
@@ -680,10 +819,24 @@ if __name__ == "__main__":
         default=None,
         help=f"xav -b extra pre-decoded chunks (default: {XAV_BUFF}).",
     )
+    parser.add_argument(
+        "--norm-i",
+        type=float,
+        default=None,
+        help=f"Target integrated loudness in LUFS (default: {LOUDNESS_I}).",
+    )
+    parser.add_argument(
+        "--norm-tp",
+        type=float,
+        default=None,
+        help=f"True-peak ceiling in dBTP (default: {LOUDNESS_TP}).",
+    )
     args = parser.parse_args()
     main(
         no_downmix=args.no_downmix,
         preset=args.preset,
         workers=args.workers,
         buff=args.buff,
+        norm_i=args.norm_i,
+        norm_tp=args.norm_tp,
     )
