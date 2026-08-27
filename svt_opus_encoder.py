@@ -28,16 +28,15 @@ DIR_CONV_LOGS = Path("conv_logs") # Directory for conversion logs
 REMUX_CODECS = {"aac", "opus"}  # Using a set for efficient lookups
 
 SVT_AV1_PARAMS = {
-    "preset": 2,                       # Speed preset. Lower is slower and yields better compression efficiency.
-    "crf": 30,                         # Constant Rate Factor (CRF). Lower is better quality.
+    "preset": 1,                       # Speed preset. Lower is slower and yields better compression efficiency.
     "color-primaries": 1,              # BT.709 color primaries (Standard SDR).
     "transfer-characteristics": 1,     # BT.709 transfer characteristics (Standard SDR).
     "matrix-coefficients": 1,          # BT.709 matrix coefficients (Standard SDR).
     "scd": 0,                          # Scene change detection OFF (av1an handles scene cuts).
+    "scm": 0,			               # Set screen content detection level, default is 2 (0: off, 1: on, 2: content adaptive)
     "keyint": 0,                       # Keyframe interval OFF (av1an inserts keyframes).
     "lp": 2,                           # Logical Processors to use per av1an worker.
     "auto-tiling": 1,                  # Automatically determine the number of tiles based on resolution.
-    "tune": 0,                         # 0 = VQ, 1 = PSNR, 2 = SSIM (SVT-AV1-Essential default recommended).
     "progress": 2,                     # Detailed progress output.
 }
 
@@ -510,7 +509,7 @@ def detect_autocrop_filter(input_file, significant_crop_threshold=5.0, min_crop=
         return None
     return _analyze_video_cropdetect(input_file, duration, width, height, max(1, os.cpu_count() // 2), significant_crop_threshold, min_crop, debug)
 
-def main(no_downmix=False, autocrop=False, preset=None, crf=None, grain=None, norm_i=None, norm_tp=None):
+def main(no_downmix=False, autocrop=False, preset=None, grain=None, norm_i=None, norm_tp=None):
     global LOUDNESS_I, LOUDNESS_TP
     if norm_i is not None:
         LOUDNESS_I = norm_i
@@ -521,8 +520,6 @@ def main(no_downmix=False, autocrop=False, preset=None, crf=None, grain=None, no
     # Override default SVT-AV1 params if provided via command line
     if preset is not None:
         SVT_AV1_PARAMS["preset"] = preset
-    if crf is not None:
-        SVT_AV1_PARAMS["crf"] = crf
     if grain is not None:
         SVT_AV1_PARAMS["film-grain"] = grain
 
@@ -812,9 +809,8 @@ if __name__ == "__main__":
     parser.add_argument("--no-downmix", action="store_true", help="Preserve original audio channel layout.")
     parser.add_argument("--autocrop", action="store_true", help="Automatically detect and crop black bars from video using cropdetect.")
     parser.add_argument("--preset", type=int, help=f"Set the encoding preset. Lower is slower/better compression. (default: {SVT_AV1_PARAMS['preset']})")
-    parser.add_argument("--crf", type=int, help=f"Set the Constant Rate Factor (CRF). Lower is better quality. (default: {SVT_AV1_PARAMS['crf']})")
     parser.add_argument("--grain", type=int, help="Set the film-grain value (number). Adjusts the film grain synthesis level. (If omitted, grain synthesis is disabled.)")
     parser.add_argument("--norm-i", type=float, help=f"Target integrated loudness in LUFS (default: {LOUDNESS_I})")
     parser.add_argument("--norm-tp", type=float, help=f"True-peak ceiling in dBTP (default: {LOUDNESS_TP})")
     args = parser.parse_args()
-    main(no_downmix=args.no_downmix, autocrop=args.autocrop, preset=args.preset, crf=args.crf, grain=args.grain, norm_i=args.norm_i, norm_tp=args.norm_tp)
+    main(no_downmix=args.no_downmix, autocrop=args.autocrop, preset=args.preset, grain=args.grain, norm_i=args.norm_i, norm_tp=args.norm_tp)
