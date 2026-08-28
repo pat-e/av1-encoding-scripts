@@ -5,8 +5,9 @@
 #
 # Batch encode: xav is VIDEO ONLY (no -a). Audio, subs, attachments, mux: this script.
 # Every file gets a video intermediate so xav has a clean, seekable input.
-# VFR: HandBrakeCLI CFR, video only. CFR: ffmpeg video only (no -g 1).
-# 1080p SDR: libx264 (keep 10-bit if source is 10-bit). HEVC only if height>1080 or real HDR.
+# HandBrakeCLI for ALL intermediates (CFR and VFR): --cfr, video only, keyint=1.
+# ffmpeg is only a fallback if HandBrake produces an empty file.
+# Forced CFR — xav crashes on VFR. 1080p SDR stays x264 (10-bit kept).
 # 1080p or lower: -p "--preset 1"  -w 4  -b 1
 # Above 1080p:    -p "--preset 2"  -w 4  -b 1
 # Audio: AAC/Opus remuxed. Else: optional 0.30 pan → constant-gain LUFS (xav-style) → opusenc.
@@ -143,6 +144,44 @@ def video_bit_depth(track):
         return 8
 
 
+def video_fps(track, source_file=None):
+    """MediaInfo original rate first. ffprobe r_frame_rate is often a fake 29.97 on MKV."""
+    if track:
+        orig_str = track.get("FrameRate_Original_String") or ""
+        match = re.search(r"\((\d+/\d+)\)", str(orig_str))
+        if match:
+            return match.group(1)
+        orig_num = track.get("FrameRate_Original_Num")
+        orig_den = track.get("FrameRate_Original_Den")
+        if orig_num and orig_den:
+            return f"{orig_num}/{orig_den}"
+        orig = track.get("FrameRate_Original")
+        if orig:
+            return str(orig).split()[0]
+        num, den = track.get("FrameRate_Num"), track.get("FrameRate_Den")
+        if num and den:
+            return f"{num}/{den}"
+        fr = track.get("FrameRate")
+        if fr:
+            return str(fr).split()[0]
+    if source_file:
+        try:
+            raw = run_cmd([
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=avg_frame_rate,r_frame_rate",
+                "-of", "json", str(source_file),
+            ], capture_output=True)
+            streams = (json.loads(raw).get("streams") or [])
+            if streams:
+                for key in ("avg_frame_rate", "r_frame_rate"):
+                    val = streams[0].get(key)
+                    if val and val not in ("0/0", "0"):
+                        return val
+        except (subprocess.CalledProcessError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+    return None
+
+
 def is_4k_path(track):
     return video_height(track) > HEIGHT_4K
 
@@ -179,7 +218,7 @@ def needs_hevc_intermediate(track):
 
 
 def intermediate_encoder(track):
-    """Return (ffmpeg codec args, handbrake encoder name, label)."""
+    """Return (ffmpeg codec args, handbrake encoder, label, handbrake --encopts or None)."""
     ten = video_bit_depth(track) >= 10 or needs_hevc_intermediate(track)
     if needs_hevc_intermediate(track):
         ffmpeg_args = [
@@ -188,8 +227,9 @@ def intermediate_encoder(track):
             "-preset", "superfast",
             "-tune", "fastdecode",
             "-pix_fmt", "yuv420p10le",
+            "-x265-params", "info=0",
         ]
-        return ffmpeg_args, "x265_10bit", "libx265 10-bit CRF 0 (4K or HDR)"
+        return ffmpeg_args, "x265_10bit", "libx265 10-bit CRF 0, normal GOP (4K or HDR)", None
     if ten:
         ffmpeg_args = [
             "-c:v", "libx264",
@@ -197,15 +237,19 @@ def intermediate_encoder(track):
             "-preset", "superfast",
             "-tune", "fastdecode",
             "-pix_fmt", "yuv420p10le",
+            "-g", "1",
+            "-bf", "0",
         ]
-        return ffmpeg_args, "x264_10bit", "libx264 10-bit CRF 0 (1080p SDR Hi10p, not 8-bit)"
+        return ffmpeg_args, "x264_10bit", "libx264 10-bit CRF 0 all-intra (1080p SDR Hi10p)", "keyint=1:bframes=0"
     ffmpeg_args = [
         "-c:v", "libx264",
         "-crf", "0",
         "-preset", "superfast",
         "-tune", "fastdecode",
+        "-g", "1",
+        "-bf", "0",
     ]
-    return ffmpeg_args, "x264", "libx264 8-bit CRF 0 (1080p SDR)"
+    return ffmpeg_args, "x264", "libx264 8-bit CRF 0 all-intra (1080p SDR)", "keyint=1:bframes=0"
 
 
 def xav_worker_count(override=None):
@@ -263,22 +307,68 @@ def detect_vfr(media_info):
     return is_vfr, target_cfr_fps
 
 
-def run_handbrake_cfr(source_file, output_file, target_cfr_fps, track):
-    """VFR → CFR video only. Same codec rules as the ffmpeg intermediate."""
-    _ffmpeg_args, encoder, label = intermediate_encoder(track)
-    print(f"    - Source is VFR. HandBrakeCLI CFR ({target_cfr_fps}) encoder={encoder} ({label})")
+def handbrake_rate(track, source_file, vfr_target=None):
+    """Always pass --rate. Prefer MediaInfo original FPS (never HandBrake's fake 29.97)."""
+    raw = vfr_target or video_fps(track, source_file)
+    if not raw:
+        return None
+    raw = str(raw).split()[0]
+    if "/" in raw:
+        try:
+            num, den = map(float, raw.split("/", 1))
+            if den:
+                return f"{num / den:.3f}"
+        except ValueError:
+            return raw
+    try:
+        return f"{float(raw):.3f}"
+    except ValueError:
+        return raw
+
+
+def strip_prep_tags(path):
+    """HandBrake/ffmpeg can copy a video title; xav would copy it again."""
+    try:
+        run_cmd([
+            "mkvpropedit", str(path),
+            "--delete", "title",
+            "--edit", "track:v1",
+            "--delete", "name",
+        ])
+    except subprocess.CalledProcessError as e:
+        print(f"    - Warning: could not strip intermediate titles ({e}).")
+
+
+def prep_is_vfr(path):
+    try:
+        mode = (video_track(mediainfo_json(path)) or {}).get("FrameRate_Mode") or ""
+    except Exception:
+        return False
+    return str(mode).upper() in ("VFR", "VARIABLE")
+
+
+def run_handbrake_intermediate(source_file, output_file, track, target_fps):
+    """Video-only CFR intermediate. All-intra only for 1080p SDR; 4K/HDR keeps a normal GOP."""
+    _ffmpeg_args, encoder, label, encopts = intermediate_encoder(track)
+    print(f"    - HandBrakeCLI intermediate: encoder={encoder} ({label}), CFR {target_fps}")
     handbrake_args = [
         "HandBrakeCLI",
         "--input", str(source_file),
         "--output", str(output_file),
         "--cfr",
-        "--rate", str(target_cfr_fps),
+        "--rate", str(target_fps),
         "--encoder", encoder,
         "--quality", "0",
         "--encoder-preset", "superfast",
+        "--encoder-tune", "fastdecode",
+    ]
+    if encopts:
+        handbrake_args += ["--encopts", encopts]
+    handbrake_args += [
         "--audio", "none",
         "--subtitle", "none",
         "--crop-mode", "none",
+        "--no-markers",
     ]
     print(f"    - Running HandBrakeCLI: {' '.join(handbrake_args)}")
     run_cmd(handbrake_args)
@@ -286,15 +376,27 @@ def run_handbrake_cfr(source_file, output_file, target_cfr_fps, track):
 
 
 def create_ffmpeg_intermediate(source_file, output_file, track):
-    """Video-only seekable input for xav. No -g 1. No audio/subs (muxed later from source)."""
-    video_args, _hb, label = intermediate_encoder(track)
-    print(f"    - Creating ffmpeg intermediate: {label} (no -g 1)")
+    """Video-only all-intra CFR for xav. Strip metadata/chapters/titles. Force constant timestamps."""
+    video_args, _hb, label, _encopts = intermediate_encoder(track)
+    fps = video_fps(track, source_file)
+    print(f"    - Creating ffmpeg intermediate: {label} (forced CFR)")
     ffmpeg_args = [
         "ffmpeg", "-hide_banner", "-v", "error", "-stats", "-y",
+        "-fflags", "+genpts",
         "-i", str(source_file),
         "-map", "0:v:0",
         *video_args,
+        "-fps_mode", "cfr",
+    ]
+    if fps:
+        ffmpeg_args += ["-r", str(fps)]
+        print(f"    - Forcing CFR at {fps}")
+    ffmpeg_args += [
         "-an", "-sn", "-dn",
+        "-map_metadata", "-1",
+        "-map_chapters", "-1",
+        "-metadata", "title=",
+        "-metadata:s:v:0", "title=",
         str(output_file),
     ]
     print(f"    - Running ffmpeg: {' '.join(ffmpeg_args)}")
@@ -303,23 +405,28 @@ def create_ffmpeg_intermediate(source_file, output_file, track):
 
 
 def prepare_xav_input(file_path, is_vfr, target_cfr_fps, track):
-    """Always give xav a remuxed video intermediate. VFR uses HandBrake; CFR uses ffmpeg."""
-    if is_vfr and target_cfr_fps:
-        cfr_file = Path(f"{file_path.stem}{CFR_SUFFIX}")
-        temps = [cfr_file]
-        if file_is_usable(cfr_file):
-            print(f"    - Reusing existing CFR intermediate (resume): {cfr_file}")
-            return cfr_file, temps
-        if run_handbrake_cfr(file_path, cfr_file, target_cfr_fps, track):
-            return cfr_file, temps
-        print("    - Warning: HandBrakeCLI produced an empty file. Falling back to ffmpeg.")
-
+    """Always HandBrake CFR video intermediate. ffmpeg only if HandBrake fails."""
     prep_file = Path(f"{file_path.stem}{PREP_SUFFIX}")
     temps = [prep_file]
     if file_is_usable(prep_file):
-        print(f"    - Reusing existing ffmpeg intermediate (resume): {prep_file}")
-        return prep_file, temps
+        if prep_is_vfr(prep_file):
+            print(f"    - Existing intermediate is VFR; deleting and remaking: {prep_file}")
+            prep_file.unlink(missing_ok=True)
+        else:
+            print(f"    - Reusing existing intermediate (resume): {prep_file}")
+            return prep_file, temps
+
+    fps = handbrake_rate(track, file_path, target_cfr_fps if is_vfr else None)
+    if fps:
+        if run_handbrake_intermediate(file_path, prep_file, track, fps):
+            strip_prep_tags(prep_file)
+            return prep_file, temps
+        print("    - Warning: HandBrakeCLI produced an empty file. Falling back to ffmpeg.")
+    else:
+        print("    - Warning: could not determine FPS for HandBrake. Falling back to ffmpeg.")
+
     if create_ffmpeg_intermediate(file_path, prep_file, track):
+        strip_prep_tags(prep_file)
         return prep_file, temps
     print("    - Warning: ffmpeg intermediate failed. Sending source to xav as-is.")
     return file_path, temps
