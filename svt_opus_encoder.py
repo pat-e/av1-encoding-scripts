@@ -35,7 +35,6 @@ SVT_AV1_PARAMS = {
     "scd": 0,                          # Scene change detection OFF (av1an handles scene cuts).
     "scm": 0,			               # Set screen content detection level, default is 2 (0: off, 1: on, 2: content adaptive)
     "keyint": 0,                       # Keyframe interval OFF (av1an inserts keyframes).
-    "lp": 2,                           # Logical Processors to use per av1an worker.
     "auto-tiling": 1,                  # Automatically determine the number of tiles based on resolution.
     "progress": 2,                     # Detailed progress output.
 }
