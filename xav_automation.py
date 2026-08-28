@@ -4,7 +4,9 @@
 # For more information and to install xav, visit: https://github.com/emrakyz/xav
 #
 # Batch encode: xav is VIDEO ONLY (no -a). Audio, subs, attachments, mux: this script.
-# VFR: HandBrakeCLI CFR, video only. CFR: xav reads the source MKV.
+# Every file gets a video intermediate so xav has a clean, seekable input.
+# VFR: HandBrakeCLI CFR, video only. CFR: ffmpeg video only (no -g 1).
+# 1080p SDR: libx264 (keep 10-bit if source is 10-bit). HEVC only if height>1080 or real HDR.
 # 1080p or lower: -p "--preset 1"  -w 4  -b 1
 # Above 1080p:    -p "--preset 2"  -w 4  -b 1
 # Audio: AAC/Opus remuxed. Else: optional 0.30 pan → constant-gain LUFS (xav-style) → opusenc.
@@ -44,6 +46,7 @@ LOUDNESS_TP = -1.5
 
 CFR_SUFFIX = ".cfr.mkv"
 CFR_FULL_SUFFIX = ".cfr_full.mkv"
+PREP_SUFFIX = ".prep.mkv"
 
 
 class Tee:
@@ -144,6 +147,67 @@ def is_4k_path(track):
     return video_height(track) > HEIGHT_4K
 
 
+HDR_TRANSFER_MARKERS = (
+    "smpte2084", "smpte st 2084", "pq", "bt.2100", "bt2100",
+    "arib-std-b67", "arib std-b67", "hlg", "hybrid log-gamma",
+)
+HDR_FORMAT_MARKERS = ("hdr10", "hdr10+", "dolby vision", "dolbyvision", "hlg")
+
+
+def is_hdr(track):
+    """True HDR (PQ/HLG/DoVi). 10-bit BT.709 Hi10p is SDR, not HDR."""
+    if not track:
+        return False
+    parts = []
+    for key in (
+        "HDR_Format", "HDR_Format_String", "HDR_Format_Compatibility",
+        "transfer_characteristics", "TransferCharacteristics",
+        "Transfer_characteristics", "colour_transfer", "color_transfer",
+    ):
+        val = track.get(key)
+        if val:
+            parts.append(str(val).lower())
+    text = " ".join(parts)
+    if any(m in text for m in HDR_FORMAT_MARKERS):
+        return True
+    return any(m in text for m in HDR_TRANSFER_MARKERS)
+
+
+def needs_hevc_intermediate(track):
+    """HEVC only for >1080p or real HDR. 1080p SDR (including 10-bit) stays AVC."""
+    return is_4k_path(track) or is_hdr(track)
+
+
+def intermediate_encoder(track):
+    """Return (ffmpeg codec args, handbrake encoder name, label)."""
+    ten = video_bit_depth(track) >= 10 or needs_hevc_intermediate(track)
+    if needs_hevc_intermediate(track):
+        ffmpeg_args = [
+            "-c:v", "libx265",
+            "-crf", "0",
+            "-preset", "superfast",
+            "-tune", "fastdecode",
+            "-pix_fmt", "yuv420p10le",
+        ]
+        return ffmpeg_args, "x265_10bit", "libx265 10-bit CRF 0 (4K or HDR)"
+    if ten:
+        ffmpeg_args = [
+            "-c:v", "libx264",
+            "-crf", "0",
+            "-preset", "superfast",
+            "-tune", "fastdecode",
+            "-pix_fmt", "yuv420p10le",
+        ]
+        return ffmpeg_args, "x264_10bit", "libx264 10-bit CRF 0 (1080p SDR Hi10p, not 8-bit)"
+    ffmpeg_args = [
+        "-c:v", "libx264",
+        "-crf", "0",
+        "-preset", "superfast",
+        "-tune", "fastdecode",
+    ]
+    return ffmpeg_args, "x264", "libx264 8-bit CRF 0 (1080p SDR)"
+
+
 def xav_worker_count(override=None):
     if override is not None:
         return max(1, int(override))
@@ -199,10 +263,10 @@ def detect_vfr(media_info):
     return is_vfr, target_cfr_fps
 
 
-def run_handbrake_cfr(source_file, output_file, target_cfr_fps, use_10bit):
-    """VFR → CFR video only. Audio/subs stay on the original for the Python mux."""
-    encoder = "x265_10bit" if use_10bit else "x264"
-    print(f"    - Source is VFR. HandBrakeCLI CFR ({target_cfr_fps}) encoder={encoder}, video only...")
+def run_handbrake_cfr(source_file, output_file, target_cfr_fps, track):
+    """VFR → CFR video only. Same codec rules as the ffmpeg intermediate."""
+    _ffmpeg_args, encoder, label = intermediate_encoder(track)
+    print(f"    - Source is VFR. HandBrakeCLI CFR ({target_cfr_fps}) encoder={encoder} ({label})")
     handbrake_args = [
         "HandBrakeCLI",
         "--input", str(source_file),
@@ -221,21 +285,43 @@ def run_handbrake_cfr(source_file, output_file, target_cfr_fps, use_10bit):
     return file_is_usable(output_file)
 
 
-def prepare_xav_input(file_path, is_vfr, target_cfr_fps, track):
-    """CFR: original file. VFR: HandBrake video-only CFR. xav never sees audio."""
-    if not (is_vfr and target_cfr_fps):
-        print("    - CFR (or VFR skipped): xav will read the source file (video only used).")
-        return file_path, []
+def create_ffmpeg_intermediate(source_file, output_file, track):
+    """Video-only seekable input for xav. No -g 1. No audio/subs (muxed later from source)."""
+    video_args, _hb, label = intermediate_encoder(track)
+    print(f"    - Creating ffmpeg intermediate: {label} (no -g 1)")
+    ffmpeg_args = [
+        "ffmpeg", "-hide_banner", "-v", "error", "-stats", "-y",
+        "-i", str(source_file),
+        "-map", "0:v:0",
+        *video_args,
+        "-an", "-sn", "-dn",
+        str(output_file),
+    ]
+    print(f"    - Running ffmpeg: {' '.join(ffmpeg_args)}")
+    run_ffmpeg_logged(ffmpeg_args)
+    return file_is_usable(output_file)
 
-    cfr_file = Path(f"{file_path.stem}{CFR_SUFFIX}")
-    temps = [cfr_file]
-    if file_is_usable(cfr_file):
-        print(f"    - Reusing existing CFR intermediate (resume): {cfr_file}")
-        return cfr_file, temps
-    use_10bit = video_bit_depth(track) >= 10 or is_4k_path(track)
-    if run_handbrake_cfr(file_path, cfr_file, target_cfr_fps, use_10bit):
-        return cfr_file, temps
-    print("    - Warning: HandBrakeCLI produced an empty file. Sending source to xav as-is.")
+
+def prepare_xav_input(file_path, is_vfr, target_cfr_fps, track):
+    """Always give xav a remuxed video intermediate. VFR uses HandBrake; CFR uses ffmpeg."""
+    if is_vfr and target_cfr_fps:
+        cfr_file = Path(f"{file_path.stem}{CFR_SUFFIX}")
+        temps = [cfr_file]
+        if file_is_usable(cfr_file):
+            print(f"    - Reusing existing CFR intermediate (resume): {cfr_file}")
+            return cfr_file, temps
+        if run_handbrake_cfr(file_path, cfr_file, target_cfr_fps, track):
+            return cfr_file, temps
+        print("    - Warning: HandBrakeCLI produced an empty file. Falling back to ffmpeg.")
+
+    prep_file = Path(f"{file_path.stem}{PREP_SUFFIX}")
+    temps = [prep_file]
+    if file_is_usable(prep_file):
+        print(f"    - Reusing existing ffmpeg intermediate (resume): {prep_file}")
+        return prep_file, temps
+    if create_ffmpeg_intermediate(file_path, prep_file, track):
+        return prep_file, temps
+    print("    - Warning: ffmpeg intermediate failed. Sending source to xav as-is.")
     return file_path, temps
 
 
@@ -631,6 +717,7 @@ def list_source_mkvs(current_dir):
         if not (
             f.name.endswith(CFR_SUFFIX)
             or f.name.endswith(CFR_FULL_SUFFIX)
+            or f.name.endswith(PREP_SUFFIX)
             or f.name.endswith(".x264.mkv")
             or f.name.endswith(".hevc.mkv")
             or f.name.endswith(".ut.mkv")
@@ -646,6 +733,7 @@ def video_temp_files(current_dir, file_path, extra):
     files = [
         current_dir / f"{file_path.stem}{CFR_SUFFIX}",
         current_dir / f"{file_path.stem}{CFR_FULL_SUFFIX}",
+        current_dir / f"{file_path.stem}{PREP_SUFFIX}",
         current_dir / f"temp-{file_path.stem}.mkv",
         current_dir / f"output-{file_path.name}",
         current_dir / f"{file_path.stem}_scd.txt",
