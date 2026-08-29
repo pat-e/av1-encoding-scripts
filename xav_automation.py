@@ -844,9 +844,13 @@ def video_temp_files(current_dir, file_path, extra):
         current_dir / f"temp-{file_path.stem}.mkv",
         current_dir / f"output-{file_path.name}",
         current_dir / f"{file_path.stem}_scd.txt",
+        current_dir / f"{file_path.stem}.prep_scd.txt",
         current_dir / f"{file_path.stem}.cfr_scd.txt",
         current_dir / f"{file_path.stem}.cfr_full_scd.txt",
     ]
+    for path in current_dir.glob(f"{file_path.stem}*_scd.txt"):
+        if path not in files:
+            files.append(path)
     for path in extra:
         if path and path not in files:
             files.append(path)
