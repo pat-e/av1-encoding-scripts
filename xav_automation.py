@@ -931,7 +931,7 @@ def main(no_downmix=False, preset=None, workers=None, buff=None, norm_i=None, no
             if file_is_usable(muxed):
                 print(f"    - Reusing remuxed output (resume): {muxed}")
             else:
-                audio_temp_dir = tempfile.mkdtemp(prefix="anime_audio_")
+                audio_temp_dir = tempfile.mkdtemp(prefix="audio_tmp_")
                 print(f"Audio temporary directory created at: {audio_temp_dir}")
                 audio_plan = process_audio_tracks(file_path, audio_temp_dir, no_downmix)
                 mux_final(muxed, xav_output, file_path, audio_plan)
