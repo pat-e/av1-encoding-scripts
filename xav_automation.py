@@ -8,8 +8,9 @@
 # HandBrakeCLI for ALL intermediates (CFR and VFR): --cfr, video only, keyint=1.
 # ffmpeg is only a fallback if HandBrake produces an empty file.
 # Forced CFR — xav crashes on VFR. 1080p SDR stays x264 (10-bit kept).
-# 1080p or lower: -p "--preset 1"  -w 4  -b 1
-# Above 1080p:    -p "--preset 2"  -w 4  -b 1
+# 1080p or lower: -p "--preset 1 --tune 1"  -w 4  -b 1
+# Above 1080p:    -p "--preset 2 --tune 1"  -w 4  -b 1
+# --tune is SVT-AV1-Essential (default 1 = PSNR). Workers/buff are fixed, not CLI.
 # Audio: AAC/Opus remuxed. Else: optional 0.30 pan → constant-gain LUFS (xav-style) → opusenc.
 # Final mkvmerge: xav video + processed/remuxed audio + source subs/attachments/chapters.
 
@@ -40,6 +41,16 @@ XAV_WORKERS = 4
 PRESET_1080 = 1
 PRESET_4K = 2
 HEIGHT_4K = 1080
+# SVT-AV1-Essential --tune (default 1 = PSNR).
+# https://github.com/nekotrix/SVT-AV1-Essential/blob/Essential-v4.0.1/Docs/Parameters.md
+XAV_TUNE = 1
+TUNE_NAMES = {
+    0: "VQ",
+    1: "PSNR",
+    2: "SSIM",
+    3: "IQ (Image Quality)",
+    4: "MS_SSIM",
+}
 
 # Constant-gain loudness (xav-style, no LRA compressor).
 LOUDNESS_I = -16.0
@@ -252,9 +263,7 @@ def intermediate_encoder(track):
     return ffmpeg_args, "x264", "libx264 8-bit CRF 0 all-intra (1080p SDR)", "keyint=1:bframes=0"
 
 
-def xav_worker_count(override=None):
-    if override is not None:
-        return max(1, int(override))
+def xav_worker_count():
     return max(1, XAV_WORKERS)
 
 
@@ -262,6 +271,12 @@ def xav_preset(track, override=None):
     if override is not None:
         return int(override)
     return PRESET_4K if is_4k_path(track) else PRESET_1080
+
+
+def xav_tune(override=None):
+    if override is not None:
+        return int(override)
+    return int(XAV_TUNE)
 
 
 def detect_vfr(media_info):
@@ -779,22 +794,27 @@ def mux_final(dest, xav_output, source_file, audio_plan):
         raise RuntimeError(f"mkvmerge produced an empty file: {dest}")
 
 
-def run_xav(xav_input, xav_output, track, preset_override=None, workers_override=None, buff_override=None):
+def run_xav(xav_input, xav_output, track, preset_override=None, tune_override=None):
     if file_is_usable(xav_output):
         print(f"    - Reusing existing xav output (resume): {xav_output}")
         return
 
     preset = xav_preset(track, preset_override)
-    workers = xav_worker_count(workers_override)
-    buff = XAV_BUFF if buff_override is None else max(0, int(buff_override))
+    tune = xav_tune(tune_override)
+    workers = xav_worker_count()
+    buff = XAV_BUFF
     path_label = "4K+" if is_4k_path(track) else "1080p or lower"
     print(f"    - Path: {path_label} (height={video_height(track)})")
-    print(f"    - Workers: {workers}  preset: {preset}  -b {buff}  (no -a: audio is this script)")
+    print(
+        f"    - Workers: {workers}  preset: {preset}  tune: {tune} ({TUNE_NAMES.get(tune, '?')})  "
+        f"-b {buff}  (no -a: audio is this script)"
+    )
 
+    encoder_params = f"--preset {preset} --tune {tune}"
     xav_args = [
         "xav",
         "-e", XAV_ENCODER,
-        "-p", f"--preset {preset}",
+        "-p", encoder_params,
         "-w", str(workers),
         "-b", str(buff),
         str(xav_input),
@@ -857,7 +877,7 @@ def video_temp_files(current_dir, file_path, extra):
     return files
 
 
-def main(no_downmix=False, preset=None, workers=None, buff=None, norm_i=None, norm_tp=None):
+def main(no_downmix=False, preset=None, tune=None, norm_i=None, norm_tp=None):
     check_tools()
     global LOUDNESS_I, LOUDNESS_TP
     if norm_i is not None:
@@ -921,8 +941,7 @@ def main(no_downmix=False, preset=None, workers=None, buff=None, norm_i=None, no
                 xav_output,
                 track,
                 preset_override=preset,
-                workers_override=workers,
-                buff_override=buff,
+                tune_override=tune,
             )
 
             audio_temp_dir = None
@@ -1007,16 +1026,15 @@ if __name__ == "__main__":
         help=f"Override SVT-AV1 preset. Default: {PRESET_1080} if height<={HEIGHT_4K}, else {PRESET_4K}.",
     )
     parser.add_argument(
-        "--workers",
+        "--tune",
         type=int,
+        choices=sorted(TUNE_NAMES),
         default=None,
-        help=f"Override xav -w. Default: {XAV_WORKERS}.",
-    )
-    parser.add_argument(
-        "--buff",
-        type=int,
-        default=None,
-        help=f"xav -b extra pre-decoded chunks (default: {XAV_BUFF}).",
+        help=(
+            "SVT-AV1-Essential --tune: optimize the encoding process for different desired outcomes "
+            "[0 = VQ, 1 = PSNR, 2 = SSIM, 3 = IQ (Image Quality), 4 = MS_SSIM] "
+            f"(default: {XAV_TUNE} = {TUNE_NAMES[XAV_TUNE]})."
+        ),
     )
     parser.add_argument(
         "--norm-i",
@@ -1034,8 +1052,7 @@ if __name__ == "__main__":
     main(
         no_downmix=args.no_downmix,
         preset=args.preset,
-        workers=args.workers,
-        buff=args.buff,
+        tune=args.tune,
         norm_i=args.norm_i,
         norm_tp=args.norm_tp,
     )
