@@ -2,6 +2,15 @@
 
 This document details the configuration parameters used across the AomEnc, SVT-AV1, and xav encoding scripts.
 
+## Audio Loudness Normalization
+
+All scripts use a constant-gain loudness normalization approach (no LRA compressor). The two-pass process measures integrated loudness, then applies a single gain with brickwall true-peak clamping.
+
+- **Target Integrated Loudness (I)**: `-16.0` LUFS
+- **True Peak Ceiling (TP)**: `-1.5` dBTP
+
+These defaults can be overridden at runtime with `--norm-i` and `--norm-tp`.
+
 ## Audio Demuxing & Downmixing
 
 The audio processing extracts streams using `ffmpeg` and automatically downmixes surround layouts to stereo if requested.
@@ -28,6 +37,8 @@ When preserving the original channel layout (no downmixing) or if the source is 
 
 ## VFR to CFR Conversion
 
+### `svt_opus_encoder.py`
+
 To handle Variable Frame Rate (VFR) sources reliably on UTVideo intermediate generation, `HandBrakeCLI` is used to convert them to Constant Frame Rate (CFR) before processing.
 
 The exact HandBrakeCLI arguments used:
@@ -45,6 +56,16 @@ HandBrakeCLI \
   --subtitle none \
   --crop-mode none
 ```
+
+### `xav_automation.py`
+
+`xav_automation.py` creates a HandBrakeCLI CFR intermediate for **all** sources (both VFR and CFR) because xav requires seekable, constant-frame-rate input. The intermediate encoder is selected automatically based on resolution and HDR status:
+
+- **≤1080p SDR (8-bit)**: `x264` CRF 0, all-intra (`keyint=1:bframes=0`)
+- **≤1080p SDR (10-bit / Hi10p)**: `x264_10bit` CRF 0, all-intra (`keyint=1:bframes=0`)
+- **>1080p or HDR**: `x265_10bit` CRF 0, normal GOP (not all-intra)
+
+If HandBrakeCLI fails or cannot determine the frame rate, ffmpeg is used as a fallback with equivalent settings.
 
 ## Encoder-Specific Parameters
 
@@ -88,23 +109,32 @@ Parameters parsed to the `aom` encoder:
 ### SVT-AV1 (SVT-AV1-Essential)
 > **Special Version Repository**: [https://github.com/nekotrix/SVT-AV1-Essential/](https://github.com/nekotrix/SVT-AV1-Essential/)
 
-Parameters initialized for the `svt-av1` encoder:
+Parameters initialized for the `svt-av1` encoder (as used in `svt_opus_encoder.py`):
 
 | Parameter | Value | Description |
 | :--- | :--- | :--- |
-| `--preset` | `2` | Speed preset. Lower is slower and yields better compression efficiency. |
-| `--crf` | `30` | Constant Rate Factor (CRF). Lower is better quality. |
+| `--preset` | `1` | Speed preset. Lower is slower and yields better compression efficiency. |
 | `--color-primaries` | `1` | BT.709 color primaries (Standard SDR). |
 | `--transfer-characteristics`| `1` | BT.709 transfer characteristics (Standard SDR). |
 | `--matrix-coefficients` | `1` | BT.709 matrix coefficients (Standard SDR). |
 | `--scd` | `0` | Scene change detection OFF (av1an handles scene cuts). |
+| `--scm` | `0` | Screen content detection OFF (0: off, 1: on, 2: content adaptive). |
 | `--keyint` | `0` | Keyframe interval OFF (av1an inserts keyframes). |
-| `--lp` | `2` | Logical Processors to use per av1an worker. |
 | `--auto-tiling` | `1` | Automatically determine the number of tiles based on resolution. |
-| `--tune` | `0` | 0 = VQ, 1 = PSNR, 2 = SSIM (SVT-AV1-Essential default recommended). |
 | `--progress` | `2` | Detailed progress output. |
 
-*(Note: Parameters such as `--preset` and `--crf` can be overridden when executing the script. Grain synthesis is omitted by default unless `--grain` is provided).*
+*(Note: `--preset` can be overridden when executing the script. Grain synthesis (`--film-grain`) is omitted by default unless `--grain` is provided. CRF is not set in the default params and must be provided via the chunking encoder.)*
+
+### SVT-AV1 via xav (SVT-AV1-Essential)
+
+Parameters used for the `svt-av1` encoder when invoked via `xav` (as used in `xav_automation.py`):
+
+| Parameter | Value | Description |
+| :--- | :--- | :--- |
+| `--preset` | `1` (≤1080p) / `2` (>1080p) | Speed preset. Automatically chosen based on video height. |
+| `--tune` | `1` | SVT-AV1-Essential tune mode: 0=VQ, 1=PSNR, 2=SSIM, 3=IQ, 4=MS_SSIM. |
+
+*(Note: `--preset` and `--tune` can be overridden when executing the script. CRF is not passed as a default parameter.)*
 
 ## Chunking Encoder Initiation Commands
 
@@ -142,12 +172,18 @@ av1an -i <vpy_script> -o <encoded_mkv> -n \
 ```
 
 ### xav (SVT-AV1)
-Arguments used to start `xav` using the SVT-AV1 encoder (as used in `xav_opus_encoder.py`):
+Arguments used to start `xav` using the SVT-AV1 encoder (as used in `xav_automation.py`):
 ```text
 xav -e svt-av1 \
-  -p "--preset 1 --lp 2" \
-  -w <calculated_workers> \
+  -p "--preset <preset> --tune <tune>" \
+  -w 4 \
+  -b 1 \
   <intermediate_file> \
   <encoded_video_file>
 ```
-*(Note: Parameters such as `--preset` and `--crf` can be overridden when executing the script, which modifies the arguments passed to `-p`).*
+- `-w 4`: Fixed at 4 workers.
+- `-b 1`: Buffer size of 1.
+- `--preset`: Defaults to `1` for ≤1080p, `2` for >1080p (overridable via `--preset`).
+- `--tune`: Defaults to `1` (PSNR) (overridable via `--tune`).
+
+*(Note: `--preset` and `--tune` can be overridden when executing the script, which modifies the arguments passed to `-p`. No `-a` flag is used — audio processing is handled entirely by the script.)*

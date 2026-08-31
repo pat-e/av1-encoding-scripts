@@ -8,7 +8,7 @@ This repository contains Python scripts for batch-processing MKV files to encode
 *   **`aom_opus_encoder.py`**: Uses the `aom` encoder (specifically designed for the `aom-psy101` fork) via `av1an`. It is tuned for high perceptual quality with specific psychovisual parameters and film grain synthesis.
 *   **`svt_opus_encoder.py`**: Uses the `svt-av1` encoder (specifically designed for the `SVT-AV1-Essential` fork) via `av1an`. It provides a good balance between encoding speed and quality, and allows customization of preset, crf, and film-grain from the command line.
 *   **`hdr_svt_opus_encoder.py`**: A specialized script for 4K HDR movies using the `SVT-AV1-Essential` encoder. It is designed for pre-processed CFR inputs, preserves original surround sound audio without downmixing, and retains HDR metadata.
-*   **`xav_opus_encoder.py`**: Uses the `xav` chunking encoder and `svt-av1` (SVT-AV1-Essential) instead of `av1an`. Features native autocrop, scene-detect, and chunking.
+*   **`xav_automation.py`**: Uses the `xav` chunking encoder and `svt-av1` (SVT-AV1-Essential) instead of `av1an`. Features native autocrop, scene-detect, and chunking. Automatically selects intermediate encoder based on resolution and HDR status.
 
 ## Encoding Parameters Documentation
 
@@ -30,7 +30,7 @@ Both scripts require several external tools to be installed and available in you
 *   **Vapoursynth**: Required by `av1an` as the frame server via the generated `.vpy` scripts.
 *   *(Specific to `aom_opus_encoder.py`)*: **aom-psy101** encoder. You must download the correct version from [Damian101's aom-psy101 GitLab](https://gitlab.com/damian101/aom-psy101).
 *   *(Specific to `svt_opus_encoder.py`)*: **SVT-AV1-Essential** encoder. You must download the correct version from [nekotrix's SVT-AV1-Essential GitHub](https://github.com/nekotrix/SVT-AV1-Essential/).
-*   *(Specific to `xav_opus_encoder.py`)*: **xav** chunking encoder. You must download the source from [emrakyz's xav GitHub](https://github.com/emrakyz/xav) and build it specifically with the SVT-AV1-Essential encoder.
+*   *(Specific to `xav_automation.py`)*: **xav** chunking encoder. You must download the source from [emrakyz's xav GitHub](https://github.com/emrakyz/xav) and build it specifically with the SVT-AV1-Essential encoder.
 
 ## Features
 
@@ -38,16 +38,17 @@ Both scripts require several external tools to be installed and available in you
 *   **Resumable Encoding**: Because it uses `av1an`, if an encode is interrupted, you can restart the script, and it will resume from where it left off.
 *   **Audio Normalization and Downmixing**: 
     *   Extracts audio tracks to FLAC.
-    *   Applies a 2-pass `loudnorm` normalization (Target: -23 LUFS, True Peak: -1 dB).
-    *   Downmixes 5.1/7.1 surround sound to stereo (unless `--no-downmix` is specified).
+    *   Applies a 2-pass constant-gain loudness normalization (Target: -16.0 LUFS, True Peak: -1.5 dBTP, no LRA compression). Configurable via `--norm-i` and `--norm-tp`.
+    *   Downmixes 5.1/7.1 surround sound to stereo (unless `--no-downmix` is specified). `xav_automation.py` uses multiple downmix filter fallback attempts.
     *   Encodes to Opus with bitrates automatically chosen based on the channel count (e.g., 128k for Stereo, 256k for 5.1).
     *   Directly remuxes existing `aac` or `opus` tracks without re-encoding.
-    *   Preserves track languages, titles, and delays.
-*   **VFR to CFR Conversion**: Detects Variable Frame Rate (VFR) media and automatically converts it to Constant Frame Rate (CFR) using HandBrakeCLI (virtually lossless `x264_10bit` CRF 0 intermediate) to prevent audio desync issues.
-*   **Automatic Cropping**: Optional `--autocrop` flag detects black bars and determines the optimal cropping parameters before encoding.
+    *   Preserves track languages, titles, flags, and delays.
+*   **VFR to CFR Conversion**: Detects Variable Frame Rate (VFR) media and automatically converts it to Constant Frame Rate (CFR) using HandBrakeCLI (virtually lossless CRF 0 intermediate) to prevent audio desync issues. `xav_automation.py` creates a HandBrakeCLI intermediate for all sources, with automatic encoder selection based on resolution/HDR (x264 for ≤1080p SDR, x265 for >1080p or HDR).
+*   **Automatic Cropping**: Optional `--autocrop` flag detects black bars and determines the optimal cropping parameters before encoding (in `svt_opus_encoder.py`). `xav_automation.py` relies on xav's native autocrop.
 *   **Organized Output**: 
     *   Completed files are moved to a `completed/` directory.
-    *   Original files are moved to an `original/` directory (or `failed/` if an error occurs).
+    *   Original files are moved to an `original/` directory.
+    *   Failed files are moved to a `failed/` directory (in `xav_automation.py`), preserving intermediates for retry.
     *   Per-file processing logs are saved in a `conv_logs/` directory.
     *   Temporary files are automatically cleaned up upon success.
 
@@ -79,8 +80,9 @@ svt_opus_encoder.py [options]
 *   `--no-downmix`: Preserve original audio channel layout (do not downmix 5.1/7.1 to stereo).
 *   `--autocrop`: Automatically detect and crop black bars from the video.
 *   `--preset <int>`: Set the SVT-AV1 encoding speed preset (e.g., 0-13). Lower is slower and yields better compression. Defaults to 1.
-*   `--crf <int>`: Set the SVT-AV1 Constant Rate Factor (CRF) for video quality (e.g., 0-63). Lower is better quality. Defaults to 30.
 *   `--grain <int>`: Set the `film-grain` value. Adjusts the film grain synthesis level. Disabled by default.
+*   `--norm-i <float>`: Target integrated loudness in LUFS (default: -16.0).
+*   `--norm-tp <float>`: True-peak ceiling in dBTP (default: -1.5).
 
 ### `hdr_svt_opus_encoder.py`
 
@@ -93,23 +95,24 @@ hdr_svt_opus_encoder.py [options]
 *   `--crf <int>`: Set the SVT-AV1 Constant Rate Factor (CRF) for video quality (e.g., 0-63). Lower is better quality. Defaults to 30.
 *   `--grain <int>`: Set the `film-grain` value. Adjusts the film grain synthesis level. Disabled by default.
 
-### `xav_opus_encoder.py`
+### `xav_automation.py`
 
 ```bash
-xav_opus_encoder.py [options]
+xav_automation.py [options]
 ```
 
 **Options:**
-*   `--preset <int>`: Set the SVT-AV1 encoding speed preset. Defaults to 1.
-*   `--crf <int>`: Set the SVT-AV1 Constant Rate Factor (CRF).
-*   `--workers <int>`: Set the number of workers for xav.
-*   `--no-downmix`: Preserve original audio channel layout (do not downmix 5.1/7.1 to stereo).
+*   `--no-downmix`: Keep surround on re-encoded tracks (no 0.30 pan). AAC/Opus are always remuxed.
+*   `--preset <int>`: Override SVT-AV1 preset. Default: 1 if height ≤1080, else 2.
+*   `--tune <int>`: SVT-AV1-Essential `--tune` mode: 0=VQ, 1=PSNR, 2=SSIM, 3=IQ, 4=MS_SSIM (default: 1 = PSNR).
+*   `--norm-i <float>`: Target integrated loudness in LUFS (default: -16.0).
+*   `--norm-tp <float>`: True-peak ceiling in dBTP (default: -1.5).
 
-**Workflow specific to `xav_opus_encoder.py`:**
-1. **Video Preparation**: VFR sources undergo a HandBrakeCLI pass (CFR + all-intra x264, `keyint=1`). CFR sources undergo one ffmpeg pass (`libx264 -crf 0 -preset superfast -tune fastdecode -g 1`).
-2. **Video Encode**: `xav` handles autocrop, scene-detect, and chunking natively (`xav -e svt-av1 -p "--preset 1 --lp 2" -w <(cpu_count - 2) // 2>`). No `av1an` or `.vpy` required.
-3. **Audio Processing**: Audio is extracted, normalized with a two-pass `loudnorm`, downmixed, and encoded to Opus (handled outside `xav`).
-4. **Remuxing**: Combines using `mkvmerge`. Failed files move the source MKV to `failed/` while keeping video intermediates (`.x264.mkv`, `temp-*.mkv`) for easy retry resuming.
+**Workflow specific to `xav_automation.py`:**
+1. **Video Preparation**: All sources get a HandBrakeCLI CFR intermediate. Encoder is auto-selected: x264 all-intra for ≤1080p SDR, x265 with normal GOP for >1080p or HDR. ffmpeg is a fallback if HandBrake fails.
+2. **Video Encode**: `xav` handles autocrop, scene-detect, and chunking natively (`xav -e svt-av1 -p "--preset <p> --tune <t>" -w 4 -b 1`). No `av1an` or `.vpy` required.
+3. **Audio Processing**: Audio is extracted, normalized with a two-pass constant-gain LUFS (no LRA), optionally downmixed (with multiple filter fallbacks), and encoded to Opus. AAC/Opus tracks are remuxed directly.
+4. **Remuxing**: Combines using `mkvmerge`. Track metadata (flags, titles, languages) is restored from the source. Failed files move the source MKV to `failed/` while keeping video intermediates for easy retry resuming.
 
 ## Process Workflow
 
