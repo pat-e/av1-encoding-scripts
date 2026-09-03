@@ -38,7 +38,7 @@ AOM_AV1_PARAMS = {
     "min-q": 8,                      # Minimum allowable quantizer to prevent bitrate spikes on flat frames
     "threads": 2,                    # Threads per av1an worker
     "tune-content": "psy",           # Specialized tuning for psychovisual quality (needs aom-psy101)
-    "tune": "psnr",                  # Protects structural edges universally
+    "tune": "psnr",                  # Tune distortion metric for PSNR
     "sharpness": 2,                  # Edge protection that won't cause halos in live-action
     "arnr-maxframes": 7,             # Middle-ground temporal filtering (default is 7)
     "arnr-strength": 2,              # Middle-ground filtering strength (default is 5)

@@ -87,12 +87,13 @@ Parameters parsed to the `aom` encoder:
 | :--- | :--- | :--- |
 | `--bit-depth` | `10` | Force 10-bit encoding for better color precision and less banding |
 | `--cpu-used` | `2` | Speed preset. Lower is slower/better quality. 4 is default, 2 is slow/high quality |
+| `--good` | *(flag)* | Good quality mode (deadline preset) |
 | `--end-usage` | `q` | Constant Quality mode |
 | `--cq-level` | `24` | The target quality level (0-63). Lower is better quality/larger file |
 | `--min-q` | `8` | Minimum allowable quantizer to prevent bitrate spikes on flat frames |
 | `--threads` | `2` | Threads per av1an worker |
 | `--tune-content` | `psy` | Specialized tuning for psychovisual quality (needs aom-psy101) |
-| `--tune` | `ssim` | Protects structural edges universally |
+| `--tune` | `psnr` | Tune distortion metric for PSNR |
 | `--sharpness` | `2` | Edge protection that won't cause halos in live-action |
 | `--arnr-maxframes` | `7` | Middle-ground temporal filtering (default is 7) |
 | `--arnr-strength` | `2` | Middle-ground filtering strength (default is 5) |
