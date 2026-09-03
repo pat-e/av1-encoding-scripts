@@ -164,6 +164,8 @@ av1an -i <vpy_script> -o <encoded_mkv> -n \
   -v "<aom_encoder_parameters_above>"
 ```
 
+*(Note: `--photon-noise <int>` is appended to the `av1an` arguments only when `--grain` is provided at runtime.)*
+
 ### av1an (SVT-AV1)
 Arguments used to start `av1an` using the SVT-AV1 encoder:
 ```text
