@@ -5,8 +5,8 @@ This repository contains Python scripts for batch-processing MKV files to encode
 
 ## Scripts Overview
 
-*   **`aom_opus_encoder.py`**: Uses the `aom` encoder (specifically designed for the `aom-psy101` fork) via `av1an`. It is tuned for high perceptual quality with specific psychovisual parameters and film grain synthesis.
-*   **`svt_opus_encoder.py`**: Uses the `svt-av1` encoder (specifically designed for the `SVT-AV1-Essential` fork) via `av1an`. It provides a good balance between encoding speed and quality, and allows customization of preset, crf, and film-grain from the command line.
+*   **`aom_opus_encoder.py`**: Uses the `aom` encoder (specifically designed for the `aom-psy101` fork) via `av1an`. It is tuned for high perceptual quality with specific psychovisual parameters and optional film grain synthesis. All sources now get a HandBrakeCLI CFR intermediate (with ffmpeg as fallback) instead of a UTVideo pass.
+*   **`svt_opus_encoder.py`**: Uses the `svt-av1` encoder (specifically designed for the `SVT-AV1-Essential` fork) via `av1an`. It provides a good balance between encoding speed and quality, and allows customization of preset and film-grain from the command line.
 *   **`hdr_svt_opus_encoder.py`**: A specialized script for 4K HDR movies using the `SVT-AV1-Essential` encoder. It is designed for pre-processed CFR inputs, preserves original surround sound audio without downmixing, and retains HDR metadata.
 *   **`xav_automation.py`**: Uses the `xav` chunking encoder and `svt-av1` (SVT-AV1-Essential) instead of `av1an`. Features native autocrop, scene-detect, and chunking. Automatically selects intermediate encoder based on resolution and HDR status.
 
@@ -18,15 +18,15 @@ For the HDR-specific encoder parameters and settings used in `hdr_svt_opus_encod
 
 ## Prerequisites
 
-Both scripts require several external tools to be installed and available in your system's `PATH`:
+The scripts require several external tools to be installed and available in your system's `PATH`:
 
 *   **ffmpeg** & **ffprobe**: For video/audio extraction, filtering (cropdetect), and loudnorm analysis.
 *   **mkvtoolnix** (`mkvmerge`, `mkvpropedit`): For remuxing the final MKV file.
 *   **opusenc** (opus-tools): For encoding audio tracks to the Opus codec.
 *   **mediainfo**: For extracting detailed media information (especially frame rate details).
 *   **av1an**: The core chunking encoder used to run multiple encode workers in parallel.
-*   **HandBrakeCLI**: Used as a fallback/pre-processor to convert VFR (Variable Frame Rate) video to CFR (Constant Frame Rate) before the main encode.
-*   **ffmsindex** (ffms2): For indexing the intermediate UTVideo file for Vapoursynth.
+*   **HandBrakeCLI**: Used as a CFR pre-processor to create a constant-frame-rate video intermediate before the main encode (all sources for `xav_automation.py` and `aom_opus_encoder.py`; VFR sources only for `svt_opus_encoder.py`).
+*   **ffmsindex** (ffms2): For indexing the video intermediate for Vapoursynth.
 *   **Vapoursynth**: Required by `av1an` as the frame server via the generated `.vpy` scripts.
 *   *(Specific to `aom_opus_encoder.py`)*: **aom-psy101** encoder. You must download the correct version from [Damian101's aom-psy101 GitLab](https://gitlab.com/damian101/aom-psy101).
 *   *(Specific to `svt_opus_encoder.py`)*: **SVT-AV1-Essential** encoder. You must download the correct version from [nekotrix's SVT-AV1-Essential GitHub](https://github.com/nekotrix/SVT-AV1-Essential/).
@@ -43,7 +43,7 @@ Both scripts require several external tools to be installed and available in you
     *   Encodes to Opus with bitrates automatically chosen based on the channel count (e.g., 128k for Stereo, 256k for 5.1).
     *   Directly remuxes existing `aac` or `opus` tracks without re-encoding.
     *   Preserves track languages, titles, flags, and delays.
-*   **VFR to CFR Conversion**: Detects Variable Frame Rate (VFR) media and automatically converts it to Constant Frame Rate (CFR) using HandBrakeCLI (virtually lossless CRF 0 intermediate) to prevent audio desync issues. `xav_automation.py` creates a HandBrakeCLI intermediate for all sources, with automatic encoder selection based on resolution/HDR (x264 for ≤1080p SDR, x265 for >1080p or HDR).
+*   **VFR to CFR Conversion**: Detects Variable Frame Rate (VFR) media and automatically converts it to Constant Frame Rate (CFR) using HandBrakeCLI (virtually lossless CRF 0 intermediate) to prevent audio desync issues. `xav_automation.py` and `aom_opus_encoder.py` create a HandBrakeCLI intermediate for all sources (with ffmpeg as fallback); `svt_opus_encoder.py` converts only detected VFR sources. `xav_automation.py` selects the intermediate encoder automatically based on resolution/HDR (x264 for ≤1080p SDR, x265 for >1080p or HDR).
 *   **Automatic Cropping**: Optional `--autocrop` flag detects black bars and determines the optimal cropping parameters before encoding (in `svt_opus_encoder.py`). `xav_automation.py` relies on xav's native autocrop.
 *   **Organized Output**: 
     *   Completed files are moved to a `completed/` directory.
@@ -68,7 +68,9 @@ aom_opus_encoder.py [options]
 *   `--no-downmix`: Preserve original audio channel layout (do not downmix 5.1/7.1 to stereo).
 *   `--autocrop`: Automatically detect and crop black bars from the video.
 *   `--grain <int>`: Set the `photon-noise` value for grain synthesis. Disabled by default.
-*   `--crf <int>`: Set the constant quality level (`cq-level`) for video encoding (default: 25).
+*   `--crf <int>`: Set the constant quality level (`cq-level`) for video encoding (default: 24).
+*   `--norm-i <float>`: Target integrated loudness in LUFS (default: -16.0).
+*   `--norm-tp <float>`: True-peak ceiling in dBTP (default: -1.5).
 
 ### `svt_opus_encoder.py`
 
@@ -91,9 +93,11 @@ hdr_svt_opus_encoder.py [options]
 ```
 
 **Options:**
-*   `--preset <int>`: Set the SVT-AV1 encoding speed preset (e.g., 0-13). Lower is slower and yields better compression. Defaults to 1.
+*   `--preset <int>`: Set the SVT-AV1 encoding speed preset (e.g., 0-13). Lower is slower and yields better compression. Defaults to 2.
 *   `--crf <int>`: Set the SVT-AV1 Constant Rate Factor (CRF) for video quality (e.g., 0-63). Lower is better quality. Defaults to 30.
 *   `--grain <int>`: Set the `film-grain` value. Adjusts the film grain synthesis level. Disabled by default.
+*   `--norm-i <float>`: Target integrated loudness in LUFS (default: -16.0).
+*   `--norm-tp <float>`: True-peak ceiling in dBTP (default: -1.5).
 
 ### `xav_automation.py`
 
@@ -104,7 +108,7 @@ xav_automation.py [options]
 **Options:**
 *   `--no-downmix`: Keep surround on re-encoded tracks (no 0.30 pan). AAC/Opus are always remuxed.
 *   `--preset <int>`: Override SVT-AV1 preset. Default: 1 if height ≤1080, else 2.
-*   `--tune <int>`: SVT-AV1-Essential `--tune` mode: 0=VQ, 1=PSNR, 2=SSIM, 3=IQ, 4=MS_SSIM (default: 1 = PSNR).
+*   `--tune <int>`: SVT-AV1-Essential `--tune` mode: 0=VQ, 1=PSNR, 2=SSIM, 3=IQ, 4=MS_SSIM (default: 2 = SSIM).
 *   `--norm-i <float>`: Target integrated loudness in LUFS (default: -16.0).
 *   `--norm-tp <float>`: True-peak ceiling in dBTP (default: -1.5).
 
@@ -120,9 +124,8 @@ xav_automation.py [options]
 2.  **Analysis**: Examines video and audio tracks using `ffprobe` and `mediainfo`.
 3.  **Video Processing**:
     *   Runs crop detection (if `--autocrop` is enabled).
-    *   Converts VFR to CFR (if VFR is detected).
-    *   Extracts an intermediate lossless video (`utvideo`).
-    *   Encodes the video using `av1an`.
+    *   Creates a CFR video intermediate via HandBrakeCLI (all sources for `xav_automation.py` and `aom_opus_encoder.py`; VFR sources only for `svt_opus_encoder.py`), with ffmpeg as a fallback. The intermediate encoder is auto-selected based on resolution/HDR where applicable.
+    *   Encodes the video using `av1an` (or `xav` for `xav_automation.py`).
 4.  **Audio Processing**:
     *   Remuxes AAC/Opus.
     *   Normalizes, downmixes (if applicable), and encodes other formats to Opus.
@@ -132,7 +135,7 @@ xav_automation.py [options]
 ## Notes
 
 - Encoding AV1 takes a significant amount of time and CPU resources. 
-- Ensure you have sufficient disk space, as the scripts generate intermediate lossless `utvideo` files which can be very large depending on the length and resolution of the source media.
+- Ensure you have sufficient disk space, as the scripts generate intermediate CRF 0 video files which can be very large depending on the length and resolution of the source media.
 
 ## License
 

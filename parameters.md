@@ -39,7 +39,7 @@ When preserving the original channel layout (no downmixing) or if the source is 
 
 ### `svt_opus_encoder.py`
 
-To handle Variable Frame Rate (VFR) sources reliably on UTVideo intermediate generation, `HandBrakeCLI` is used to convert them to Constant Frame Rate (CFR) before processing.
+To handle Variable Frame Rate (VFR) sources reliably before UTVideo intermediate generation, `HandBrakeCLI` is used to convert them to Constant Frame Rate (CFR). Only detected VFR sources are converted; CFR sources skip this step.
 
 The exact HandBrakeCLI arguments used:
 ```text
@@ -56,6 +56,15 @@ HandBrakeCLI \
   --subtitle none \
   --crop-mode none
 ```
+
+### `aom_opus_encoder.py`
+
+`aom_opus_encoder.py` creates a HandBrakeCLI CFR intermediate for **all** sources (both VFR and CFR), replacing the previous UTVideo pass. The intermediate is indexed with `ffmsindex` and fed directly to VapourSynth. The intermediate encoder is selected based on bit depth (1080p SDR only — no HEVC/HDR path):
+
+- **8-bit SDR**: `x264` CRF 0, all-intra (`keyint=1:bframes=0`)
+- **10-bit SDR (Hi10p)**: `x264_10bit` CRF 0, all-intra (`keyint=1:bframes=0`)
+
+If HandBrakeCLI fails or cannot determine the frame rate, ffmpeg is used as a fallback with equivalent settings (forced CFR via `-fps_mode cfr`).
 
 ### `xav_automation.py`
 
@@ -79,7 +88,7 @@ Parameters parsed to the `aom` encoder:
 | `--bit-depth` | `10` | Force 10-bit encoding for better color precision and less banding |
 | `--cpu-used` | `2` | Speed preset. Lower is slower/better quality. 4 is default, 2 is slow/high quality |
 | `--end-usage` | `q` | Constant Quality mode |
-| `--cq-level` | `25` | The target quality level (0-63). Lower is better quality/larger file |
+| `--cq-level` | `24` | The target quality level (0-63). Lower is better quality/larger file |
 | `--min-q` | `8` | Minimum allowable quantizer to prevent bitrate spikes on flat frames |
 | `--threads` | `2` | Threads per av1an worker |
 | `--tune-content` | `psy` | Specialized tuning for psychovisual quality (needs aom-psy101) |
@@ -104,7 +113,7 @@ Parameters parsed to the `aom` encoder:
 | `--transfer-characteristics`| `bt709` | Standard SDR transfer characteristics |
 | `--matrix-coefficients` | `bt709` | Standard SDR matrix coefficients |
 
-*(Note: `--cq-level` dynamically defaults to `25` but can be overwritten when executing the script via the `--crf` argument).*
+*(Note: `--cq-level` dynamically defaults to `24` but can be overwritten when executing the script via the `--crf` argument. `--photon-noise` is omitted by default unless `--grain` is provided.)*
 
 ### SVT-AV1 (SVT-AV1-Essential)
 > **Special Version Repository**: [https://github.com/nekotrix/SVT-AV1-Essential/](https://github.com/nekotrix/SVT-AV1-Essential/)
@@ -132,7 +141,7 @@ Parameters used for the `svt-av1` encoder when invoked via `xav` (as used in `xa
 | Parameter | Value | Description |
 | :--- | :--- | :--- |
 | `--preset` | `1` (≤1080p) / `2` (>1080p) | Speed preset. Automatically chosen based on video height. |
-| `--tune` | `1` | SVT-AV1-Essential tune mode: 0=VQ, 1=PSNR, 2=SSIM, 3=IQ, 4=MS_SSIM. |
+| `--tune` | `2` | SVT-AV1-Essential tune mode: 0=VQ, 1=PSNR, 2=SSIM, 3=IQ, 4=MS_SSIM. |
 
 *(Note: `--preset` and `--tune` can be overridden when executing the script. CRF is not passed as a default parameter.)*
 
@@ -184,6 +193,6 @@ xav -e svt-av1 \
 - `-w 4`: Fixed at 4 workers.
 - `-b 1`: Buffer size of 1.
 - `--preset`: Defaults to `1` for ≤1080p, `2` for >1080p (overridable via `--preset`).
-- `--tune`: Defaults to `1` (PSNR) (overridable via `--tune`).
+- `--tune`: Defaults to `2` (SSIM) (overridable via `--tune`).
 
 *(Note: `--preset` and `--tune` can be overridden when executing the script, which modifies the arguments passed to `-p`. No `-a` flag is used — audio processing is handled entirely by the script.)*
