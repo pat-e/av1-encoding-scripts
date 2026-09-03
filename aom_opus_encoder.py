@@ -27,6 +27,8 @@ DIR_CONV_LOGS = Path("conv_logs") # Directory for conversion logs
 
 REMUX_CODECS = {"aac", "opus"}  # Using a set for efficient lookups
 
+PREP_SUFFIX = ".prep.mkv"
+
 AOM_AV1_PARAMS = {
     "bit-depth": 10,                 # Force 10-bit encoding for better color precision and less banding
     "cpu-used": 2,                   # Speed preset. Lower is slower/better quality. 4 is default, 2 is slow/high quality
@@ -70,6 +72,238 @@ def run_cmd(cmd, capture_output=False, check=True):
         return result.stdout
     else:
         subprocess.run(cmd, check=check)
+
+
+def file_is_usable(path):
+    try:
+        return path.exists() and path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def mediainfo_json_data(path):
+    raw = run_cmd(["mediainfo", "--Output=JSON", "-f", str(path)], capture_output=True)
+    return json.loads(raw)
+
+
+def video_track_from_mediainfo(media_info):
+    if not (media_info.get("media") and media_info["media"].get("track")):
+        return None
+    for track in media_info["media"]["track"]:
+        if track.get("@type") == "Video":
+            return track
+    return None
+
+
+def video_height(track):
+    if not track:
+        return 0
+    try:
+        return int(float(str(track.get("Height", "0")).split()[0]))
+    except (TypeError, ValueError):
+        return 0
+
+
+def video_bit_depth(track):
+    if not track:
+        return 8
+    raw = track.get("BitDepth") or track.get("Bit_depth") or "8"
+    try:
+        return int(float(str(raw).split()[0]))
+    except (TypeError, ValueError):
+        return 8
+
+
+def video_fps(track, source_file=None):
+    """MediaInfo original rate first. ffprobe r_frame_rate is often a fake 29.97 on MKV."""
+    if track:
+        orig_str = track.get("FrameRate_Original_String") or ""
+        match = re.search(r"\((\d+/\d+)\)", str(orig_str))
+        if match:
+            return match.group(1)
+        orig_num = track.get("FrameRate_Original_Num")
+        orig_den = track.get("FrameRate_Original_Den")
+        if orig_num and orig_den:
+            return f"{orig_num}/{orig_den}"
+        orig = track.get("FrameRate_Original")
+        if orig:
+            return str(orig).split()[0]
+        num, den = track.get("FrameRate_Num"), track.get("FrameRate_Den")
+        if num and den:
+            return f"{num}/{den}"
+        fr = track.get("FrameRate")
+        if fr:
+            return str(fr).split()[0]
+    if source_file:
+        try:
+            raw = run_cmd([
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=avg_frame_rate,r_frame_rate",
+                "-of", "json", str(source_file),
+            ], capture_output=True)
+            streams = (json.loads(raw).get("streams") or [])
+            if streams:
+                for key in ("avg_frame_rate", "r_frame_rate"):
+                    val = streams[0].get(key)
+                    if val and val not in ("0/0", "0"):
+                        return val
+        except (subprocess.CalledProcessError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+    return None
+
+
+def intermediate_encoder(track):
+    """Return (ffmpeg codec args, handbrake encoder, label, handbrake --encopts or None).
+    1080p SDR only (no 4K HDR HEVC path).
+    """
+    ten = video_bit_depth(track) >= 10
+    if ten:
+        ffmpeg_args = [
+            "-c:v", "libx264",
+            "-crf", "0",
+            "-preset", "superfast",
+            "-tune", "fastdecode",
+            "-pix_fmt", "yuv420p10le",
+            "-g", "1",
+            "-bf", "0",
+        ]
+        return ffmpeg_args, "x264_10bit", "libx264 10-bit CRF 0 all-intra (SDR Hi10p)", "keyint=1:bframes=0"
+    ffmpeg_args = [
+        "-c:v", "libx264",
+        "-crf", "0",
+        "-preset", "superfast",
+        "-tune", "fastdecode",
+        "-g", "1",
+        "-bf", "0",
+    ]
+    return ffmpeg_args, "x264", "libx264 8-bit CRF 0 all-intra (SDR)", "keyint=1:bframes=0"
+
+
+def handbrake_rate(track, source_file, vfr_target=None):
+    """Always pass --rate. Prefer MediaInfo original FPS (never HandBrake's fake 29.97)."""
+    raw = vfr_target or video_fps(track, source_file)
+    if not raw:
+        return None
+    raw = str(raw).split()[0]
+    if "/" in raw:
+        try:
+            num, den = map(float, raw.split("/", 1))
+            if den:
+                return f"{num / den:.3f}"
+        except ValueError:
+            return raw
+    try:
+        return f"{float(raw):.3f}"
+    except ValueError:
+        return raw
+
+
+def strip_prep_tags(path):
+    """HandBrake can copy a video title; strip it from the intermediate."""
+    try:
+        run_cmd([
+            "mkvpropedit", str(path),
+            "--delete", "title",
+            "--edit", "track:v1",
+            "--delete", "name",
+        ])
+    except subprocess.CalledProcessError as e:
+        print(f"    - Warning: could not strip intermediate titles ({e}).")
+
+
+def prep_is_vfr(path):
+    try:
+        mi = mediainfo_json_data(path)
+        mode = (video_track_from_mediainfo(mi) or {}).get("FrameRate_Mode") or ""
+    except Exception:
+        return False
+    return str(mode).upper() in ("VFR", "VARIABLE")
+
+
+def run_handbrake_intermediate(source_file, output_file, track, target_fps):
+    """Video-only CFR intermediate. All-intra for 1080p SDR."""
+    _ffmpeg_args, encoder, label, encopts = intermediate_encoder(track)
+    print(f"    - HandBrakeCLI intermediate: encoder={encoder} ({label}), CFR {target_fps}")
+    handbrake_args = [
+        "HandBrakeCLI",
+        "--input", str(source_file),
+        "--output", str(output_file),
+        "--cfr",
+        "--rate", str(target_fps),
+        "--encoder", encoder,
+        "--quality", "0",
+        "--encoder-preset", "superfast",
+        "--encoder-tune", "fastdecode",
+    ]
+    if encopts:
+        handbrake_args += ["--encopts", encopts]
+    handbrake_args += [
+        "--audio", "none",
+        "--subtitle", "none",
+        "--crop-mode", "none",
+        "--no-markers",
+    ]
+    print(f"    - Running HandBrakeCLI: {' '.join(handbrake_args)}")
+    run_cmd(handbrake_args)
+    return file_is_usable(output_file)
+
+
+def create_ffmpeg_intermediate(source_file, output_file, track):
+    """Video-only all-intra CFR fallback. Strip metadata/chapters/titles."""
+    video_args, _hb, label, _encopts = intermediate_encoder(track)
+    fps = video_fps(track, source_file)
+    print(f"    - Creating ffmpeg intermediate: {label} (forced CFR)")
+    ffmpeg_args = [
+        "ffmpeg", "-hide_banner", "-v", "error", "-stats", "-y",
+        "-fflags", "+genpts",
+        "-i", str(source_file),
+        "-map", "0:v:0",
+        *video_args,
+        "-fps_mode", "cfr",
+    ]
+    if fps:
+        ffmpeg_args += ["-r", str(fps)]
+        print(f"    - Forcing CFR at {fps}")
+    ffmpeg_args += [
+        "-an", "-sn", "-dn",
+        "-map_metadata", "-1",
+        "-map_chapters", "-1",
+        "-metadata", "title=",
+        "-metadata:s:v:0", "title=",
+        str(output_file),
+    ]
+    print(f"    - Running ffmpeg: {' '.join(ffmpeg_args)}")
+    run_cmd(ffmpeg_args)
+    return file_is_usable(output_file)
+
+
+def prepare_intermediate(file_path, is_vfr, target_cfr_fps, track):
+    """Always HandBrake CFR video intermediate. ffmpeg only if HandBrake fails."""
+    prep_file = Path(f"{file_path.stem}{PREP_SUFFIX}")
+    temps = [prep_file]
+    if file_is_usable(prep_file):
+        if prep_is_vfr(prep_file):
+            print(f"    - Existing intermediate is VFR; deleting and remaking: {prep_file}")
+            prep_file.unlink(missing_ok=True)
+        else:
+            print(f"    - Reusing existing intermediate (resume): {prep_file}")
+            return prep_file, temps
+
+    fps = handbrake_rate(track, file_path, target_cfr_fps if is_vfr else None)
+    if fps:
+        if run_handbrake_intermediate(file_path, prep_file, track, fps):
+            strip_prep_tags(prep_file)
+            return prep_file, temps
+        print("    - Warning: HandBrakeCLI produced an empty file. Falling back to ffmpeg.")
+    else:
+        print("    - Warning: could not determine FPS for HandBrake. Falling back to ffmpeg.")
+
+    if create_ffmpeg_intermediate(file_path, prep_file, track):
+        strip_prep_tags(prep_file)
+        return prep_file, temps
+    print("    - Warning: ffmpeg intermediate failed. Using source as-is.")
+    return file_path, temps
+
 
 def _parse_loudnorm_json(stderr_output):
     json_start_index = stderr_output.find("{")
@@ -189,89 +423,51 @@ def convert_audio_track(index, ch, lang, audio_temp_dir, source_file, should_dow
     ])
     return final_opus
 
-def convert_video(source_file_base, source_file_full, is_vfr, target_cfr_fps_for_handbrake, autocrop_filter=None, photon_noise=None):
+def convert_video(source_file_base, source_file_full, is_vfr, target_cfr_fps, video_track_info, autocrop_filter=None, photon_noise=None):
     print("  --- Starting Video Processing ---")
-    # source_file_base is file_path.stem (e.g., "my.anime.episode.01")
     vpy_file = Path(f"{source_file_base}.vpy")
-    ut_video_file = Path(f"{source_file_base}.ut.mkv")
     encoded_video_file = Path(f"temp-{source_file_base}.mkv")
-    handbrake_cfr_intermediate_file = None # To store path of HandBrake output if created
 
-    current_input_for_utvideo = Path(source_file_full)
+    # Create HandBrake-based intermediate (or ffmpeg fallback)
+    source_path = Path(source_file_full)
+    prep_file, temp_files = prepare_intermediate(source_path, is_vfr, target_cfr_fps, video_track_info)
 
-    if is_vfr and target_cfr_fps_for_handbrake:
-        print(f"    - Source is VFR. Converting to CFR ({target_cfr_fps_for_handbrake}) with HandBrakeCLI...")
-        handbrake_cfr_intermediate_file = Path(f"{source_file_base}.cfr_temp.mkv")
-        handbrake_args = [
-            "HandBrakeCLI", 
-            "--input", str(source_file_full), 
-            "--output", str(handbrake_cfr_intermediate_file),
-            "--cfr", 
-            "--rate", str(target_cfr_fps_for_handbrake),
-            "--encoder", "x264_10bit", # Changed to x264_10bit for 10-bit CFR intermediate
-            "--quality", "0", # CRF 0 for x264 is often considered visually lossless, or near-lossless
-            "--encoder-preset", "superfast", # Use a fast preset for quicker processing
-            "--encoder-tune", "fastdecode", # Added tune for faster decoding
-            "--audio", "none", 
-            "--subtitle", "none",
-            "--crop-mode", "none" # Disable auto-cropping
-        ]
-        print(f"    - Running HandBrakeCLI: {' '.join(handbrake_args)}")
-        try:
-            run_cmd(handbrake_args)
-            if handbrake_cfr_intermediate_file.exists() and handbrake_cfr_intermediate_file.stat().st_size > 0:
-                print(f"    - HandBrake VFR to CFR conversion successful: {handbrake_cfr_intermediate_file}")
-                current_input_for_utvideo = handbrake_cfr_intermediate_file
-            else:
-                print(f"    - Warning: HandBrakeCLI VFR-to-CFR conversion failed or produced an empty file. Proceeding with original source for UTVideo.")
-                handbrake_cfr_intermediate_file = None # Ensure it's None if failed
-        except subprocess.CalledProcessError as e:
-            print(f"    - Error during HandBrakeCLI execution: {e}")
-            print(f"    - Proceeding with original source for UTVideo.")
-            handbrake_cfr_intermediate_file = None # Ensure it's None if failed
+    # Add index and script files to temp cleanup list
+    temp_files.append(Path(f"{prep_file}.ffindex"))
+    temp_files.append(Path(f"{prep_file}.lwi"))
+    temp_files.append(vpy_file)
 
-
-    print("    - Creating UTVideo intermediate file (overwriting if exists)...")
-    # Check if source is already UTVideo
-    ffprobe_cmd = [
-        "ffprobe", "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1",
-        str(current_input_for_utvideo) # Use current input, which might be HandBrake output
-    ]
-    source_codec = run_cmd(ffprobe_cmd, capture_output=True, check=True).strip()
-
-    video_codec_args = ["-c:v", "utvideo"]
-    if source_codec == "utvideo" and current_input_for_utvideo == Path(source_file_full): # Only copy if original was UTVideo
-        print("    - Source is already UTVideo. Copying video stream...")
-        video_codec_args = ["-c:v", "copy"]
-
-    ffmpeg_args = [
-        "ffmpeg", "-hide_banner", "-v", "quiet", "-stats", "-y", "-i", str(current_input_for_utvideo),
-        "-map", "0:v:0", "-map_metadata", "-1", "-map_chapters", "-1", "-an", "-sn", "-dn",
-    ]
-    if autocrop_filter:
-        ffmpeg_args += ["-vf", autocrop_filter]
-    ffmpeg_args += video_codec_args + [str(ut_video_file)]
-    run_cmd(ffmpeg_args)
-
-    print("    - Indexing UTVideo file with ffmsindex for VapourSynth...")
-    ffmsindex_args = ["ffmsindex", "-f", str(ut_video_file)]
+    print("    - Indexing intermediate file with ffmsindex for VapourSynth...")
+    ffmsindex_args = ["ffmsindex", "-f", str(prep_file)]
     run_cmd(ffmsindex_args)
 
-    ut_video_full_path = os.path.abspath(ut_video_file)
-    vpy_script_content = f"""import vapoursynth as vs
-core = vs.core
-core.num_threads = 4
-clip = core.ffms2.Source(source=r'''{ut_video_full_path}''')
-clip = core.resize.Point(clip, format=vs.YUV420P10, matrix_in_s="709") # type: ignore
-clip.set_output()
-"""
+    intermediate_full_path = os.path.abspath(prep_file)
+
+    # Build VapourSynth script
+    vpy_lines = [
+        "import vapoursynth as vs",
+        "core = vs.core",
+        "core.num_threads = 4",
+        f"clip = core.ffms2.Source(source=r'''{intermediate_full_path}''')",
+    ]
+    if autocrop_filter:
+        crop_match = re.match(r'crop=(\d+):(\d+):(\d+):(\d+)', autocrop_filter)
+        if crop_match:
+            cw, ch, cx, cy = crop_match.groups()
+            vpy_lines.append(f"clip = core.std.CropAbs(clip, width={cw}, height={ch}, left={cx}, top={cy})")
+            print(f"    - Applying autocrop in VapourSynth: CropAbs(width={cw}, height={ch}, left={cx}, top={cy})")
+    vpy_lines.extend([
+        'clip = core.resize.Point(clip, format=vs.YUV420P10, matrix_in_s="709") # type: ignore',
+        "clip.set_output()",
+    ])
+    vpy_script_content = "\n".join(vpy_lines) + "\n"
+
     with vpy_file.open("w", encoding="utf-8") as f:
         f.write(vpy_script_content)
 
     print("    - Starting AV1 encode with av1an (this will take a long time)...")
-    total_cores = os.cpu_count() or 4 # Fallback if cpu_count is None
-    workers = max(1, (total_cores // 2) - 1) # Half the cores minus one, with a minimum of 1 worker.
+    total_cores = os.cpu_count() or 4
+    workers = max(1, (total_cores // 2) - 1)
     print(f"    - Using {workers} workers for av1an (Total Cores: {total_cores}, Logic: (Cores/2)-1).")
 
     aom_video_params_str = " ".join([f"--{key}={value}" if value != "" else f"--{key}" for key, value in AOM_AV1_PARAMS.items()])
@@ -288,7 +484,7 @@ clip.set_output()
     print(f"    - Using aom-psy101 parameters: {aom_video_params_str}")
     run_cmd(av1an_enc_args)
     print("  --- Finished Video Processing ---")
-    return encoded_video_file, handbrake_cfr_intermediate_file
+    return encoded_video_file, temp_files
 
 def is_ffmpeg_decodable(file_path):
     """Quickly check if ffmpeg can decode the input file."""
@@ -544,7 +740,7 @@ def main(no_downmix=False, autocrop=False, grain=None, crf=None, norm_i=None, no
     current_dir = Path(".")
     files_to_process = sorted(
         f for f in current_dir.glob("*.mkv")
-        if not (f.name.endswith(".ut.mkv") or f.name.startswith("temp-") or f.name.startswith("output-") or f.name.endswith(".cfr_temp.mkv"))
+        if not (f.name.endswith(".ut.mkv") or f.name.endswith(PREP_SUFFIX) or f.name.startswith("temp-") or f.name.startswith("output-") or f.name.endswith(".cfr_temp.mkv"))
     )
     if not files_to_process:
         print("No MKV files found to process. Exiting.")
@@ -586,7 +782,7 @@ def main(no_downmix=False, autocrop=False, grain=None, crf=None, norm_i=None, no
             input_file_abs = file_path.resolve()
             intermediate_output_file = current_dir / f"output-{file_path.name}"
             audio_temp_dir = None
-            handbrake_intermediate_for_cleanup = None
+            video_temp_files = []
             try:
                 audio_temp_dir = tempfile.mkdtemp(prefix="anime_audio_")
                 print(f"Audio temporary directory created at: {audio_temp_dir}")
@@ -640,7 +836,7 @@ def main(no_downmix=False, autocrop=False, grain=None, crf=None, norm_i=None, no
                                     print(f"    - Warning: Could not parse fractional FPS '{target_cfr_fps_for_handbrake}'. HandBrakeCLI might fail.")
                                     is_vfr = False
                         else:
-                            print("    - Warning: VFR detected, but could not determine target CFR from MediaInfo. Will attempt standard UTVideo conversion without HandBrake.")
+                            print("    - Warning: VFR detected, but could not determine target CFR from MediaInfo. Will attempt intermediate conversion without HandBrake CFR override.")
                             is_vfr = False
                     else:
                         print(f"    - Video appears to be CFR or FrameRate_Mode not specified as VFR/Variable by MediaInfo.")
@@ -652,8 +848,8 @@ def main(no_downmix=False, autocrop=False, grain=None, crf=None, norm_i=None, no
                         print(f"    - Autocrop filter detected: {autocrop_filter}")
                     else:
                         print("    - No crop needed or detected.")
-                encoded_video_file, handbrake_intermediate_for_cleanup = convert_video(
-                    file_path.stem, str(input_file_abs), is_vfr, target_cfr_fps_for_handbrake, autocrop_filter=autocrop_filter, photon_noise=photon_noise_val
+                encoded_video_file, video_temp_files = convert_video(
+                    file_path.stem, str(input_file_abs), is_vfr, target_cfr_fps_for_handbrake, video_track_info, autocrop_filter=autocrop_filter, photon_noise=photon_noise_val
                 )
 
                 print("--- Starting Audio Processing ---")
@@ -744,15 +940,9 @@ def main(no_downmix=False, autocrop=False, grain=None, crf=None, norm_i=None, no
 
                 print("Cleaning up persistent video temporary files (after successful processing)...")
                 video_temp_files_on_success = [
-                    current_dir / f"{file_path.stem}.vpy",
-                    current_dir / f"{file_path.stem}.ut.mkv",
-                    current_dir / f"temp-{file_path.stem}.mkv", # This is encoded_video_file
-                    current_dir / f"{file_path.stem}.ut.mkv.lwi", 
-                    current_dir / f"{file_path.stem}.ut.mkv.ffindex",
-                ]
-                if handbrake_intermediate_for_cleanup and handbrake_intermediate_for_cleanup.exists():
-                    video_temp_files_on_success.append(handbrake_intermediate_for_cleanup)
-                
+                    current_dir / f"temp-{file_path.stem}.mkv",  # encoded_video_file
+                ] + video_temp_files
+
                 for temp_vid_file in video_temp_files_on_success:
                     if temp_vid_file.exists():
                         print(f"    Deleting: {temp_vid_file}")
