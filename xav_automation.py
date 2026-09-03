@@ -43,7 +43,7 @@ PRESET_4K = 2
 HEIGHT_4K = 1080
 # SVT-AV1-Essential --tune (default 1 = PSNR).
 # https://github.com/nekotrix/SVT-AV1-Essential/blob/Essential-v4.0.1/Docs/Parameters.md
-XAV_TUNE = 1
+XAV_TUNE = 2
 TUNE_NAMES = {
     0: "VQ",
     1: "PSNR",
