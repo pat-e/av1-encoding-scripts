@@ -16,6 +16,7 @@ import math
 
 LOUDNESS_I = -16.0
 LOUDNESS_TP = -1.5
+LOUDNESS_LRA = 20.0
 
 REQUIRED_TOOLS = [
     "ffmpeg", "ffprobe", "mkvmerge", "mkvpropedit",
@@ -34,10 +35,11 @@ SVT_AV1_PARAMS = {
     "transfer-characteristics": 16,    # SMPTE 2084 (PQ) transfer characteristics for HDR10.
     "matrix-coefficients": 9,          # BT.2020 non-constant luminance matrix coefficients for HDR.
     "scd": 0,                          # Scene change detection OFF (av1an handles scene cuts).
+    "scm": 0,			               # Set screen content detection level, default is 2 (0: off, 1: on, 2: content adaptive)
     "keyint": 0,                       # Keyframe interval OFF (av1an inserts keyframes).
     "lp": 2,                           # Logical Processors to use per av1an worker (perfect for leaving cores free).
     "auto-tiling": 1,                  # Automatically determine the number of tiles based on resolution.
-    "tune": 1,                         # 0 = VQ, 1 = PSNR, 2 = SSIM (SVT-AV1-Essential default recommended).
+    "tune": 2,                         # 0 = VQ, 1 = PSNR, 2 = SSIM (SVT-AV1-Essential default recommended).
     "progress": 2,                     # Detailed progress output.
 }
 
@@ -75,6 +77,21 @@ def is_hdr(file_path):
     except (subprocess.CalledProcessError, json.JSONDecodeError, IndexError):
         return False
 
+def run_ffmpeg_logged(args):
+    """Run ffmpeg so -stats is teed to console and log as it happens."""
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
+    try:
+        while True:
+            chunk = proc.stdout.read(256)
+            if not chunk:
+                break
+            sys.stdout.write(chunk.decode("utf-8", errors="replace"))
+            sys.stdout.flush()
+    finally:
+        ret = proc.wait()
+    if ret != 0:
+        raise subprocess.CalledProcessError(ret, args)
+
 def _parse_loudnorm_json(stderr_output):
     json_start_index = stderr_output.find("{")
     if json_start_index == -1:
@@ -101,14 +118,20 @@ def _finite_float(value, fallback):
     return number if math.isfinite(number) else fallback
 
 def apply_constant_gain_loudness(input_path, output_path, track_index):
-    """Measure integrated LUFS, apply one gain, brickwall-clamp true peak. No LRA compressor."""
-    print(f"    - Normalizing Audio Track #{track_index} (constant-gain LUFS, 2-pass)...")
-    print(f"      - Targets: I={LOUDNESS_I} LUFS, TP={LOUDNESS_TP} dBTP (no LRA processing)")
-    print("      - Pass 1: Measuring integrated loudness...")
+    """Two-pass ffmpeg loudnorm, linear (constant gain + true-peak). No asoftclip."""
+    print(f"    - Normalizing Audio Track #{track_index} (loudnorm 2-pass linear)...")
+    print(
+        f"      - Targets: I={LOUDNESS_I} LUFS, TP={LOUDNESS_TP} dBTP, "
+        f"LRA={LOUDNESS_LRA} LU (linear; not a compressor)"
+    )
+    print("      - Pass 1: Measuring integrated loudness and true peak...")
     result = subprocess.run(
         [
-            "ffmpeg", "-v", "info", "-i", str(input_path),
-            "-af", f"loudnorm=I={LOUDNESS_I}:LRA=20:tp={LOUDNESS_TP}:print_format=json",
+            "ffmpeg", "-hide_banner", "-v", "info", "-i", str(input_path),
+            "-af", (
+                f"loudnorm=I={LOUDNESS_I}:LRA={LOUDNESS_LRA}:tp={LOUDNESS_TP}"
+                f":print_format=json"
+            ),
             "-f", "null", "-",
         ],
         capture_output=True, text=True, check=True,
@@ -117,48 +140,108 @@ def apply_constant_gain_loudness(input_path, output_path, track_index):
     measured_i = _finite_float(stats.get("input_i"), None)
     if measured_i is None:
         print("      - Could not measure integrated loudness; copying without gain.")
-        subprocess.run(
-            ["ffmpeg", "-v", "quiet", "-y", "-i", str(input_path), "-c:a", "flac", str(output_path)],
-            check=True,
-        )
+        run_cmd(["ffmpeg", "-v", "quiet", "-y", "-i", str(input_path), "-c:a", "flac", str(output_path)])
         return
 
+    measured_tp = _finite_float(stats.get("input_tp"), -99.0)
+    measured_lra = _finite_float(stats.get("input_lra"), 0.0)
+    measured_thresh = _finite_float(stats.get("input_thresh"), -70.0)
+    offset = _finite_float(stats.get("target_offset"), 0.0)
     gain_db = LOUDNESS_I - measured_i
-    gain = 10 ** (gain_db / 20.0)
-    tp_linear = 10 ** (LOUDNESS_TP / 20.0)
-    print(f"      - Measured I={measured_i:.2f} LUFS → constant gain {gain_db:+.2f} dB")
-    print(f"      - Pass 2: Apply gain, brickwall clamp {LOUDNESS_TP} dBTP...")
-    run_cmd(
-        [
-            "ffmpeg", "-hide_banner", "-v", "error", "-stats", "-y",
-            "-i", str(input_path),
-            "-af", (
-                f"volume={gain:.10f},"
-                f"asoftclip=type=hard:threshold={tp_linear:.10f},"
-                f"aformat=sample_fmts=s32"
-            ),
-            "-c:a", "flac", "-sample_fmt", "s32",
-            str(output_path),
-        ],
-        check=True,
+    print(
+        f"      - Measured I={measured_i:.2f} LUFS, TP={measured_tp:.2f} dBTP, "
+        f"LRA={measured_lra:.2f} LU → {gain_db:+.2f} dB (offset {offset:+.2f})"
     )
+    if measured_lra > LOUDNESS_LRA:
+        print(
+            f"      - Warning: source LRA {measured_lra:.2f} > {LOUDNESS_LRA}; "
+            "loudnorm may use dynamic mode. Prefer LRA<=20 for constant gain."
+        )
+    print("      - Pass 2: loudnorm linear=true (true-peak aware, not hard clip)...")
+    loudnorm_apply = (
+        f"loudnorm=I={LOUDNESS_I}:LRA={LOUDNESS_LRA}:tp={LOUDNESS_TP}"
+        f":measured_I={measured_i:.2f}"
+        f":measured_LRA={measured_lra:.2f}"
+        f":measured_TP={measured_tp:.2f}"
+        f":measured_thresh={measured_thresh:.2f}"
+        f":offset={offset:.2f}"
+        f":linear=true"
+        f":print_format=summary"
+    )
+    run_ffmpeg_logged([
+        "ffmpeg", "-hide_banner", "-v", "error", "-stats", "-y",
+        "-i", str(input_path),
+        "-af", f"{loudnorm_apply},aformat=sample_fmts=s32",
+        "-c:a", "flac", "-sample_fmt", "s32",
+        str(output_path),
+    ])
 
-def convert_audio_track(index, ch, lang, audio_temp_dir, source_file):
+def downmix_filters(ch):
+    """Nightmode Dialogue (Collier / Harrelson). pan '<' renormalizes so the mix cannot clip."""
+    if ch == 6:
+        return [
+            "pan=stereo|FL<FC+0.30*FL+0.30*SL|FR<FC+0.30*FR+0.30*SR",
+            "pan=stereo|FL<FC+0.30*FL+0.30*BL|FR<FC+0.30*FR+0.30*BR",
+            "aformat=ch_layouts=5.1,pan=stereo|FL<FC+0.30*FL+0.30*BL|FR<FC+0.30*FR+0.30*BR",
+            "pan=stereo|c0<c2+0.30*c0+0.30*c4|c1<c2+0.30*c1+0.30*c5",
+        ]
+    if ch == 8:
+        return [
+            "pan=stereo|FL<FC+0.30*FL+0.30*SL+0.30*BL|FR<FC+0.30*FR+0.30*SR+0.30*BR",
+            "pan=stereo|c0<c2+0.30*c0+0.30*c4+0.30*c6|c1<c2+0.30*c1+0.30*c5+0.30*c7",
+        ]
+    return []
+
+def convert_audio_track(index, ch, audio_temp_dir, source_file, should_downmix):
     audio_temp_path = Path(audio_temp_dir)
     temp_extracted = audio_temp_path / f"track_{index}_extracted.flac"
     temp_normalized = audio_temp_path / f"track_{index}_normalized.flac"
     final_opus = audio_temp_path / f"track_{index}_final.opus"
 
     print(f"    - Extracting Audio Track #{index} to FLAC...")
-    ffmpeg_args = [
-        "ffmpeg", "-v", "quiet", "-stats", "-y", "-i", str(source_file),
-        "-map", f"0:{index}", "-map_metadata", "-1", "-c:a", "flac", str(temp_extracted)
+    base_args = [
+        "ffmpeg", "-hide_banner", "-v", "error", "-stats", "-y",
+        "-drc_scale", "0",
+        "-i", str(source_file),
+        "-map", f"0:{index}",
+        "-map_metadata", "-1",
     ]
-    run_cmd(ffmpeg_args)
+    downmix_attempts = []
+    if should_downmix and ch >= 6:
+        downmix_attempts.extend(downmix_filters(ch))
+        downmix_attempts.append(None)
+    else:
+        downmix_attempts.append("keep")
+
+    last_error = None
+    extracted = False
+    for attempt, filt in enumerate(downmix_attempts, start=1):
+        ffmpeg_args = list(base_args)
+        if filt == "keep":
+            pass
+        elif filt is None:
+            ffmpeg_args += ["-ac", "2"]
+            print("      - Downmix fallback: -ac 2")
+        else:
+            ffmpeg_args += ["-af", filt]
+            print(f"      - Downmix filter (try {attempt}): {filt}")
+        ffmpeg_args += ["-c:a", "flac", str(temp_extracted)]
+        try:
+            run_ffmpeg_logged(ffmpeg_args)
+            extracted = True
+            break
+        except subprocess.CalledProcessError as e:
+            last_error = e
+            print(f"      - Downmix try {attempt} failed, trying next option...")
+    if not extracted:
+        raise last_error
 
     apply_constant_gain_loudness(temp_extracted, temp_normalized, index)
 
-    if ch == 1:
+    is_being_downmixed = should_downmix and ch >= 6
+    if is_being_downmixed:
+        bitrate = "128k"
+    elif ch == 1:
         bitrate = "64k"
     elif ch == 2:
         bitrate = "128k"
@@ -170,10 +253,9 @@ def convert_audio_track(index, ch, lang, audio_temp_dir, source_file):
         bitrate = "192k"
 
     print(f"    - Encoding Audio Track #{index} to Opus at {bitrate}...")
-    run_cmd([
-        "opusenc", "--vbr", "--bitrate", bitrate, str(temp_normalized), str(final_opus)
-    ])
+    run_cmd(["opusenc", "--vbr", "--bitrate", bitrate, str(temp_normalized), str(final_opus)])
     return final_opus
+
 
 def convert_video(source_file_base, source_file_full):
     print("  --- Starting Video Processing ---")
@@ -210,7 +292,7 @@ clip.set_output()
     print("  --- Finished Video Processing ---")
     return encoded_video_file
 
-def main(preset=None, crf=None, grain=None, norm_i=None, norm_tp=None):
+def main(preset=None, crf=None, grain=None, norm_i=None, norm_tp=None, no_downmix=False):
     global LOUDNESS_I, LOUDNESS_TP
     if norm_i is not None:
         LOUDNESS_I = norm_i
@@ -318,7 +400,7 @@ def main(preset=None, crf=None, grain=None, norm_i=None, norm_tp=None):
                     if codec in REMUX_CODECS:
                         audio_tracks_to_remux.append(str(track_id))
                     else:
-                        opus_file = convert_audio_track(stream_index, channels, language, audio_temp_dir, str(input_file_abs))
+                        opus_file = convert_audio_track(stream_index, channels, audio_temp_dir, str(input_file_abs), not no_downmix)
                         processed_audio_files.append({
                             "Path": opus_file,
                             "Language": language,
@@ -400,5 +482,6 @@ if __name__ == "__main__":
     parser.add_argument("--grain", type=int, help="Set the film-grain value for SVT-AV1. (If omitted, grain synthesis is disabled.)")
     parser.add_argument("--norm-i", type=float, help=f"Target integrated loudness in LUFS (default: {LOUDNESS_I})")
     parser.add_argument("--norm-tp", type=float, help=f"True-peak ceiling in dBTP (default: {LOUDNESS_TP})")
+    parser.add_argument("--no-downmix", action="store_true", help="Preserve original audio channel layout.")
     args = parser.parse_args()
-    main(preset=args.preset, crf=args.crf, grain=args.grain, norm_i=args.norm_i, norm_tp=args.norm_tp)
+    main(preset=args.preset, crf=args.crf, grain=args.grain, norm_i=args.norm_i, norm_tp=args.norm_tp, no_downmix=args.no_downmix)
