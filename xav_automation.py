@@ -11,7 +11,8 @@
 # 1080p or lower: -p "--preset 1 --tune 1"  -w 4  -b 1
 # Above 1080p:    -p "--preset 2 --tune 1"  -w 4  -b 1
 # --tune is SVT-AV1-Essential (default 1 = PSNR). Workers/buff are fixed, not CLI.
-# Audio: AAC/Opus remuxed. Else: optional 0.30 pan → constant-gain LUFS (xav-style) → opusenc.
+# Audio: AAC/Opus remuxed. Else: Nightmode Dialogue pan (`<` so the mix cannot clip)
+# → ffmpeg loudnorm 2-pass linear (I=-16, TP=-1.5, LRA=20) → opusenc.
 # Final mkvmerge: xav video + processed/remuxed audio + source subs/attachments/chapters.
 
 import json
@@ -52,9 +53,11 @@ TUNE_NAMES = {
     4: "MS_SSIM",
 }
 
-# Constant-gain loudness (xav-style, no LRA compressor).
+# Constant-gain loudness: EBU R128 / ffmpeg loudnorm 2-pass linear (no LRA compressor).
 LOUDNESS_I = -16.0
 LOUDNESS_TP = -1.5
+# loudnorm max. If target LRA < measured LRA, it silently switches to dynamic (compresses).
+LOUDNESS_LRA = 20.0
 
 CFR_SUFFIX = ".cfr.mkv"
 CFR_FULL_SUFFIX = ".cfr_full.mkv"
@@ -588,14 +591,20 @@ def _finite_float(value, fallback):
 
 
 def apply_constant_gain_loudness(input_path, output_path, track_index):
-    """Measure integrated LUFS, apply one gain, brickwall-clamp true peak. Same as xav (no LRA)."""
-    print(f"    - Normalizing Audio Track #{track_index} (constant-gain LUFS, 2-pass)...")
-    print(f"      - Targets: I={LOUDNESS_I} LUFS, TP={LOUDNESS_TP} dBTP (no LRA processing)")
-    print("      - Pass 1: Measuring integrated loudness...")
+    """Two-pass ffmpeg loudnorm, linear (constant gain + true-peak). No asoftclip."""
+    print(f"    - Normalizing Audio Track #{track_index} (loudnorm 2-pass linear)...")
+    print(
+        f"      - Targets: I={LOUDNESS_I} LUFS, TP={LOUDNESS_TP} dBTP, "
+        f"LRA={LOUDNESS_LRA} LU (linear; not a compressor)"
+    )
+    print("      - Pass 1: Measuring integrated loudness and true peak...")
     result = subprocess.run(
         [
-            "ffmpeg", "-v", "info", "-i", str(input_path),
-            "-af", f"loudnorm=I={LOUDNESS_I}:LRA=20:tp={LOUDNESS_TP}:print_format=json",
+            "ffmpeg", "-hide_banner", "-v", "info", "-i", str(input_path),
+            "-af", (
+                f"loudnorm=I={LOUDNESS_I}:LRA={LOUDNESS_LRA}:tp={LOUDNESS_TP}"
+                f":print_format=json"
+            ),
             "-f", "null", "-",
         ],
         capture_output=True, text=True, check=True,
@@ -607,37 +616,53 @@ def apply_constant_gain_loudness(input_path, output_path, track_index):
         run_cmd(["ffmpeg", "-v", "quiet", "-y", "-i", str(input_path), "-c:a", "flac", str(output_path)])
         return
 
+    measured_tp = _finite_float(stats.get("input_tp"), -99.0)
+    measured_lra = _finite_float(stats.get("input_lra"), 0.0)
+    measured_thresh = _finite_float(stats.get("input_thresh"), -70.0)
+    offset = _finite_float(stats.get("target_offset"), 0.0)
     gain_db = LOUDNESS_I - measured_i
-    gain = 10 ** (gain_db / 20.0)
-    tp_linear = 10 ** (LOUDNESS_TP / 20.0)
-    print(f"      - Measured I={measured_i:.2f} LUFS → constant gain {gain_db:+.2f} dB")
-    print(f"      - Pass 2: Apply gain, brickwall clamp {LOUDNESS_TP} dBTP...")
+    print(
+        f"      - Measured I={measured_i:.2f} LUFS, TP={measured_tp:.2f} dBTP, "
+        f"LRA={measured_lra:.2f} LU → {gain_db:+.2f} dB (offset {offset:+.2f})"
+    )
+    if measured_lra > LOUDNESS_LRA:
+        print(
+            f"      - Warning: source LRA {measured_lra:.2f} > {LOUDNESS_LRA}; "
+            "loudnorm may use dynamic mode. Prefer LRA<=20 for constant gain."
+        )
+    print("      - Pass 2: loudnorm linear=true (true-peak aware, not hard clip)...")
+    loudnorm_apply = (
+        f"loudnorm=I={LOUDNESS_I}:LRA={LOUDNESS_LRA}:tp={LOUDNESS_TP}"
+        f":measured_I={measured_i:.2f}"
+        f":measured_LRA={measured_lra:.2f}"
+        f":measured_TP={measured_tp:.2f}"
+        f":measured_thresh={measured_thresh:.2f}"
+        f":offset={offset:.2f}"
+        f":linear=true"
+        f":print_format=summary"
+    )
     run_ffmpeg_logged([
         "ffmpeg", "-hide_banner", "-v", "error", "-stats", "-y",
         "-i", str(input_path),
-        "-af", (
-            f"volume={gain:.10f},"
-            f"asoftclip=type=hard:threshold={tp_linear:.10f},"
-            f"aformat=sample_fmts=s32"
-        ),
+        "-af", f"{loudnorm_apply},aformat=sample_fmts=s32",
         "-c:a", "flac", "-sample_fmt", "s32",
         str(output_path),
     ])
 
 
 def downmix_filters(ch):
-    """Same 0.30 center-forward mix as xav_opus_encoder.py."""
+    """Nightmode Dialogue (Collier / Harrelson). pan '<' renormalizes so the mix cannot clip."""
     if ch == 6:
         return [
-            "pan=stereo|FL=FC+0.30*FL+0.30*SL|FR=FC+0.30*FR+0.30*SR",
-            "pan=stereo|FL=FC+0.30*FL+0.30*BL|FR=FC+0.30*FR+0.30*BR",
-            "aformat=ch_layouts=5.1,pan=stereo|FL=FC+0.30*FL+0.30*BL|FR=FC+0.30*FR+0.30*BR",
-            "pan=stereo|c0=c2+0.30*c0+0.30*c4|c1=c2+0.30*c1+0.30*c5",
+            "pan=stereo|FL<FC+0.30*FL+0.30*SL|FR<FC+0.30*FR+0.30*SR",
+            "pan=stereo|FL<FC+0.30*FL+0.30*BL|FR<FC+0.30*FR+0.30*BR",
+            "aformat=ch_layouts=5.1,pan=stereo|FL<FC+0.30*FL+0.30*BL|FR<FC+0.30*FR+0.30*BR",
+            "pan=stereo|c0<c2+0.30*c0+0.30*c4|c1<c2+0.30*c1+0.30*c5",
         ]
     if ch == 8:
         return [
-            "pan=stereo|FL=FC+0.30*FL+0.30*SL+0.30*BL|FR=FC+0.30*FR+0.30*SR+0.30*BR",
-            "pan=stereo|c0=c2+0.30*c0+0.30*c4+0.30*c6|c1=c2+0.30*c1+0.30*c5+0.30*c7",
+            "pan=stereo|FL<FC+0.30*FL+0.30*SL+0.30*BL|FR<FC+0.30*FR+0.30*SR+0.30*BR",
+            "pan=stereo|c0<c2+0.30*c0+0.30*c4+0.30*c6|c1<c2+0.30*c1+0.30*c5+0.30*c7",
         ]
     return []
 
@@ -1017,7 +1042,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--no-downmix",
         action="store_true",
-        help="Keep surround on re-encoded tracks (no 0.30 pan). AAC/Opus are always remuxed.",
+        help="Keep surround on re-encoded tracks (no Nightmode Dialogue pan). AAC/Opus are always remuxed.",
     )
     parser.add_argument(
         "--preset",
