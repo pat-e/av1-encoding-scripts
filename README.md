@@ -38,8 +38,8 @@ The scripts require several external tools to be installed and available in your
 *   **Resumable Encoding**: Because it uses `av1an`, if an encode is interrupted, you can restart the script, and it will resume from where it left off.
 *   **Audio Normalization and Downmixing**: 
     *   Extracts audio tracks to FLAC.
-    *   Applies a 2-pass constant-gain loudness normalization (Target: -16.0 LUFS, True Peak: -1.5 dBTP, no LRA compression). Configurable via `--norm-i` and `--norm-tp`.
-    *   Downmixes 5.1/7.1 surround sound to stereo (unless `--no-downmix` is specified). `xav_automation.py` uses multiple downmix filter fallback attempts.
+    *   Applies a two-pass linear constant-gain loudness normalization (Target: -16.0 LUFS, True Peak: -1.5 dBTP, LRA: 20 LU). Configurable via `--norm-i` and `--norm-tp`.
+    *   Downmixes 5.1/7.1 surround sound to stereo (unless `--no-downmix` is specified). All scripts use a robust multi-pass downmix filter fallback system to prevent clipping.
     *   Encodes to Opus with bitrates automatically chosen based on the channel count (e.g., 128k for Stereo, 256k for 5.1).
     *   Directly remuxes existing `aac` or `opus` tracks without re-encoding.
     *   Preserves track languages, titles, flags, and delays.
@@ -93,6 +93,7 @@ hdr_svt_opus_encoder.py [options]
 ```
 
 **Options:**
+*   `--no-downmix`: Preserve original audio channel layout (do not downmix 5.1/7.1 to stereo).
 *   `--preset <int>`: Set the SVT-AV1 encoding speed preset (e.g., 0-13). Lower is slower and yields better compression. Defaults to 2.
 *   `--crf <int>`: Set the SVT-AV1 Constant Rate Factor (CRF) for video quality (e.g., 0-63). Lower is better quality. Defaults to 30.
 *   `--grain <int>`: Set the `film-grain` value. Adjusts the film grain synthesis level. Disabled by default.
@@ -115,7 +116,7 @@ xav_automation.py [options]
 **Workflow specific to `xav_automation.py`:**
 1. **Video Preparation**: All sources get a HandBrakeCLI CFR intermediate. Encoder is auto-selected: x264 all-intra for ≤1080p SDR, x265 with normal GOP for >1080p or HDR. ffmpeg is a fallback if HandBrake fails.
 2. **Video Encode**: `xav` handles autocrop, scene-detect, and chunking natively (`xav -e svt-av1 -p "--preset <p> --tune <t>" -w 4 -b 1`). No `av1an` or `.vpy` required.
-3. **Audio Processing**: Audio is extracted, normalized with a two-pass constant-gain LUFS (no LRA), optionally downmixed (with multiple filter fallbacks), and encoded to Opus. AAC/Opus tracks are remuxed directly.
+3. **Audio Processing**: Audio is extracted, normalized with a two-pass linear constant-gain loudnorm, optionally downmixed (with multiple filter fallbacks), and encoded to Opus. AAC/Opus tracks are remuxed directly.
 4. **Remuxing**: Combines using `mkvmerge`. Track metadata (flags, titles, languages) is restored from the source. Failed files move the source MKV to `failed/` while keeping video intermediates for easy retry resuming.
 
 ## Process Workflow

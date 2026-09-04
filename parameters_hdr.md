@@ -4,17 +4,20 @@ This document details the configuration parameters used in the `hdr_svt_opus_enc
 
 ## Audio Normalization & Encoding
 
-Audio tracks are normalized using `ffmpeg`'s `loudnorm` filter and then encoded to Opus.
+Audio tracks are normalized using a two-pass linear constant-gain approach (`loudnorm:linear=true`) and then encoded to Opus. 
 
 ### Loudness Normalization Parameters
-The script uses a two-pass loudness normalization with the following target values:
+The target values are unified across all scripts:
 
-- **Integrated Loudness (I)**: `-23` LUFS
-- **Loudness Range (LRA)**: `7` LU
+- **Integrated Loudness (I)**: `-16.0` LUFS
+- **Loudness Range (LRA)**: `20.0` LU
 - **True Peak (tp)**: `-1.5` dBTP
 
 ### Opus Encoding Bitrates
 Audio is encoded with the following bitrates based on the original channel count:
+
+### Downmixing & Fallbacks
+If downmixing is requested (it can be skipped with `--no-downmix`), the script uses the same multi-pass fallback system ("Nightmode Dialogue") as the other scripts to prevent clipping.
 
 - **Mono (1 channel)**: `64k`
 - **Stereo (2 channels)**: `128k`
@@ -34,10 +37,11 @@ Default parameters initialized for the `svt-av1` encoder for HDR content:
 --transfer-characteristics 16
 --matrix-coefficients 9
 --scd 0
+--scm 0
 --keyint 0
 --lp 2
 --auto-tiling 1
---tune 1
+--tune 2
 --progress 2
 ```
 *(Note: Parameters such as `--preset` and `--crf` can be overridden with command-line arguments when executing the script. Grain synthesis is omitted by default unless `--grain` is provided).*\

@@ -4,7 +4,7 @@ This document details the configuration parameters used across the AomEnc, SVT-A
 
 ## Audio Loudness Normalization
 
-All scripts use a constant-gain loudness normalization approach (no LRA compressor). The two-pass process measures integrated loudness, then applies a single gain with brickwall true-peak clamping.
+All scripts use a two-pass linear constant-gain loudness normalization approach (no dynamic LRA compression). The process measures integrated loudness and true peak, then applies a linear loudnorm pass (`linear=true`) to reach the target LUFS while respecting the true-peak limit.
 
 - **Target Integrated Loudness (I)**: `-16.0` LUFS
 - **True Peak Ceiling (TP)**: `-1.5` dBTP
@@ -15,16 +15,23 @@ These defaults can be overridden at runtime with `--norm-i` and `--norm-tp`.
 
 The audio processing extracts streams using `ffmpeg` and automatically downmixes surround layouts to stereo if requested.
 
-### Downmixing Parameters
+### Downmixing Parameters (Nightmode Dialogue)
+
+When downmixing, the scripts use a multi-pass fallback system ("Nightmode Dialogue" by Collier/Harrelson) that renormalizes via pan `<` to prevent clipping.
+
 - **5.1 Channel Layouts (6 channels)**
-  ```text
-  -af "pan=stereo|c0=c2+0.30*c0+0.30*c4|c1=c2+0.30*c1+0.30*c5"
-  ```
+  Attempts the following filters in order until one succeeds:
+  1. `-af "pan=stereo|FL<FC+0.30*FL+0.30*SL|FR<FC+0.30*FR+0.30*SR"`
+  2. `-af "pan=stereo|FL<FC+0.30*FL+0.30*BL|FR<FC+0.30*FR+0.30*BR"`
+  3. `-af "aformat=ch_layouts=5.1,pan=stereo|FL<FC+0.30*FL+0.30*BL|FR<FC+0.30*FR+0.30*BR"`
+  4. `-af "pan=stereo|c0<c2+0.30*c0+0.30*c4|c1<c2+0.30*c1+0.30*c5"`
+  5. Fallback: `-ac 2`
 
 - **7.1 Channel Layouts (8 channels)**
-  ```text
-  -af "pan=stereo|c0=c2+0.30*c0+0.30*c4+0.30*c6|c1=c2+0.30*c1+0.30*c5+0.30*c7"
-  ```
+  Attempts the following filters in order until one succeeds:
+  1. `-af "pan=stereo|FL<FC+0.30*FL+0.30*SL+0.30*BL|FR<FC+0.30*FR+0.30*SR+0.30*BR"`
+  2. `-af "pan=stereo|c0<c2+0.30*c0+0.30*c4+0.30*c6|c1<c2+0.30*c1+0.30*c5+0.30*c7"`
+  3. Fallback: `-ac 2`
 
 ### Non-Downmixed Encoding Bitrates (Opus)
 When preserving the original channel layout (no downmixing) or if the source is already stereo/mono, audio is encoded with the following bitrates based on channel count:
