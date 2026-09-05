@@ -7,7 +7,11 @@
 # Every file gets a video intermediate so xav has a clean, seekable input.
 # HandBrakeCLI for ALL intermediates (CFR and VFR): --cfr, video only, keyint=1.
 # ffmpeg is only a fallback if HandBrake produces an empty file.
-# Forced CFR — xav crashes on VFR. 1080p SDR stays x264 (10-bit kept).
+# Forced CFR — xav crashes on VFR.
+# GPU decode cannot handle AVC High 10, so:
+#   8-bit 1080p SDR → x264 8-bit High, all-intra
+#   10-bit 1080p SDR → x265_10bit, all-intra (GPU-decodable, seekable like the old x264 prep)
+#   4K or HDR → x265_10bit, normal GOP (all-intra 4K is huge)
 # 1080p or lower: -p "--preset 1 --tune 1"  -w 4  -b 1  --hwdec
 # Above 1080p:    -p "--preset 2 --tune 1"  -w 4  -b 1  --hwdec
 # --hwdec: GPU decode (AVC/HEVC/VC-1/VP9/AV1). No CPU fallback — if it fails, xav errors out.
@@ -230,14 +234,16 @@ def is_hdr(track):
 
 
 def needs_hevc_intermediate(track):
-    """HEVC only for >1080p or real HDR. 1080p SDR (including 10-bit) stays AVC."""
-    return is_4k_path(track) or is_hdr(track)
+    """HEVC 10-bit for 10-bit sources, 4K, or HDR. 8-bit 1080p SDR stays AVC High.
+
+    Raphael/VCN cannot hardware-decode AVC High 10. HEVC Main 10 is fine.
+    """
+    return is_4k_path(track) or is_hdr(track) or video_bit_depth(track) >= 10
 
 
 def intermediate_encoder(track):
     """Return (ffmpeg codec args, handbrake encoder, label, handbrake --encopts or None)."""
-    ten = video_bit_depth(track) >= 10 or needs_hevc_intermediate(track)
-    if needs_hevc_intermediate(track):
+    if is_4k_path(track) or is_hdr(track):
         ffmpeg_args = [
             "-c:v", "libx265",
             "-crf", "0",
@@ -247,26 +253,34 @@ def intermediate_encoder(track):
             "-x265-params", "info=0",
         ]
         return ffmpeg_args, "x265_10bit", "libx265 10-bit CRF 0, normal GOP (4K or HDR)", None
-    if ten:
+    if video_bit_depth(track) >= 10:
         ffmpeg_args = [
-            "-c:v", "libx264",
+            "-c:v", "libx265",
             "-crf", "0",
             "-preset", "superfast",
             "-tune", "fastdecode",
             "-pix_fmt", "yuv420p10le",
             "-g", "1",
             "-bf", "0",
+            "-x265-params", "info=0:keyint=1:bframes=0:open-gop=0",
         ]
-        return ffmpeg_args, "x264_10bit", "libx264 10-bit CRF 0 all-intra (1080p SDR Hi10p)", "keyint=1:bframes=0"
+        return (
+            ffmpeg_args,
+            "x265_10bit",
+            "libx265 10-bit CRF 0 all-intra (1080p SDR Hi10p, GPU-decodable)",
+            "keyint=1:bframes=0",
+        )
     ffmpeg_args = [
         "-c:v", "libx264",
         "-crf", "0",
         "-preset", "superfast",
         "-tune", "fastdecode",
+        "-pix_fmt", "yuv420p",
         "-g", "1",
         "-bf", "0",
+        "-profile:v", "high",
     ]
-    return ffmpeg_args, "x264", "libx264 8-bit CRF 0 all-intra (1080p SDR)", "keyint=1:bframes=0"
+    return ffmpeg_args, "x264", "libx264 8-bit High CRF 0 all-intra (GPU-decodable AVC)", "keyint=1:bframes=0"
 
 
 def xav_worker_count():
@@ -368,8 +382,23 @@ def prep_is_vfr(path):
     return str(mode).upper() in ("VFR", "VARIABLE")
 
 
+def prep_is_hwdec_hostile(path):
+    """True if prep is 10-bit AVC / High 10 — Raphael VCN cannot decode it."""
+    try:
+        track = video_track(mediainfo_json(path))
+    except Exception:
+        return False
+    if not track:
+        return False
+    profile = str(track.get("Format_Profile") or "").lower()
+    if "high 10" in profile:
+        return True
+    fmt = str(track.get("Format") or "").upper()
+    return video_bit_depth(track) >= 10 and fmt == "AVC"
+
+
 def run_handbrake_intermediate(source_file, output_file, track, target_fps):
-    """Video-only CFR intermediate. All-intra only for 1080p SDR; 4K/HDR keeps a normal GOP."""
+    """Video-only CFR intermediate. All-intra for 1080p; 4K/HDR HEVC keeps a normal GOP."""
     _ffmpeg_args, encoder, label, encopts = intermediate_encoder(track)
     print(f"    - HandBrakeCLI intermediate: encoder={encoder} ({label}), CFR {target_fps}")
     handbrake_args = [
@@ -432,6 +461,12 @@ def prepare_xav_input(file_path, is_vfr, target_cfr_fps, track):
     if file_is_usable(prep_file):
         if prep_is_vfr(prep_file):
             print(f"    - Existing intermediate is VFR; deleting and remaking: {prep_file}")
+            prep_file.unlink(missing_ok=True)
+        elif prep_is_hwdec_hostile(prep_file):
+            print(
+                f"    - Existing intermediate is 10-bit AVC (not GPU-decodable); "
+                f"deleting and remaking: {prep_file}"
+            )
             prep_file.unlink(missing_ok=True)
         else:
             print(f"    - Reusing existing intermediate (resume): {prep_file}")
