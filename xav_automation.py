@@ -4,10 +4,11 @@
 # For more information and to install xav, visit: https://github.com/emrakyz/xav
 #
 # Batch encode: xav is VIDEO ONLY (no -a). Audio, subs, attachments, mux: this script.
-# Every file gets a video intermediate so xav has a clean, seekable input.
-# HandBrakeCLI for ALL intermediates (CFR and VFR): --cfr, video only, keyint=1.
-# ffmpeg is only a fallback if HandBrake produces an empty file.
-# Forced CFR — xav crashes on VFR. 1080p SDR stays x264 (10-bit kept).
+# Every 1080p SDR file gets a video-only HandBrake x264 all-intra intermediate.
+# 4K or real HDR: mkvmerge video-only remux (no re-encode; keeps HDR/DoVi track metadata).
+# VFR 4K/HDR (rare): HandBrake x265_10bit CFR fallback.
+# ffmpeg is only a fallback if HandBrake produces an empty 1080p SDR file.
+# Forced CFR — xav crashes on VFR. 1080p SDR stays x264 (10-bit HEVC SDR still → x264_10bit).
 # 1080p or lower: -p "--preset 1 --tune 1"  -w 4  -b 1
 # Above 1080p:    -p "--preset 2 --tune 1"  -w 4  -b 1
 # --tune is SVT-AV1-Essential (default 1 = PSNR). Workers/buff are fixed, not CLI.
@@ -226,15 +227,14 @@ def is_hdr(track):
     return any(m in text for m in HDR_TRANSFER_MARKERS)
 
 
-def needs_hevc_intermediate(track):
-    """HEVC only for >1080p or real HDR. 1080p SDR (including 10-bit) stays AVC."""
+def is_4k_or_hdr(track):
     return is_4k_path(track) or is_hdr(track)
 
 
 def intermediate_encoder(track):
     """Return (ffmpeg codec args, handbrake encoder, label, handbrake --encopts or None)."""
-    ten = video_bit_depth(track) >= 10 or needs_hevc_intermediate(track)
-    if needs_hevc_intermediate(track):
+    ten = video_bit_depth(track) >= 10 or is_4k_or_hdr(track)
+    if is_4k_or_hdr(track):
         ffmpeg_args = [
             "-c:v", "libx265",
             "-crf", "0",
@@ -243,7 +243,7 @@ def intermediate_encoder(track):
             "-pix_fmt", "yuv420p10le",
             "-x265-params", "info=0",
         ]
-        return ffmpeg_args, "x265_10bit", "libx265 10-bit CRF 0, normal GOP (4K or HDR)", None
+        return ffmpeg_args, "x265_10bit", "libx265 10-bit CRF 0, normal GOP (VFR 4K/HDR fallback)", None
     if ten:
         ffmpeg_args = [
             "-c:v", "libx264",
@@ -365,8 +365,62 @@ def prep_is_vfr(path):
     return str(mode).upper() in ("VFR", "VARIABLE")
 
 
+def first_video_track_id(source_file):
+    """mkvmerge track id of the first video track (BL if dual-layer DoVi)."""
+    try:
+        for t in mkvmerge_identify(source_file).get("tracks") or []:
+            if t.get("type") == "video":
+                return t.get("id", 0)
+    except (subprocess.CalledProcessError, json.JSONDecodeError, TypeError):
+        pass
+    return 0
+
+
+def run_mkvmerge_video_only(source_file, output_file):
+    """Copy the video track only. No re-encode. Keeps HDR10/DoVi track properties."""
+    vid = first_video_track_id(source_file)
+    print(
+        f"    - mkvmerge video-only remux (no re-encode, keep HDR/DoVi metadata), "
+        f"video TID {vid}"
+    )
+    args = [
+        "mkvmerge", "-o", str(output_file),
+        "--title", "",
+        "--no-audio",
+        "--no-subtitles",
+        "--no-buttons",
+        "--no-attachments",
+        "--no-chapters",
+        "--no-global-tags",
+        "--video-tracks", str(vid),
+        "--track-name", f"{vid}:",
+        str(source_file),
+    ]
+    print(f"    - Running mkvmerge: {' '.join(args)}")
+    run_cmd(args)
+    return file_is_usable(output_file)
+
+
+def prep_is_handbrake_reencode(path):
+    """Old 4K/HDR preps were HandBrake HEVC CRF 0. Remux path should not reuse those."""
+    try:
+        media = mediainfo_json(path)
+        general = {}
+        for t in media.get("media", {}).get("track", []):
+            if t.get("@type") == "General":
+                general = t
+                break
+        writing = " ".join(
+            str(general.get(k) or "")
+            for k in ("WritingApplication", "Encoded_Application", "Writing_library")
+        )
+        return "handbrake" in writing.lower()
+    except Exception:
+        return False
+
+
 def run_handbrake_intermediate(source_file, output_file, track, target_fps):
-    """Video-only CFR intermediate. All-intra only for 1080p SDR; 4K/HDR keeps a normal GOP."""
+    """Video-only CFR intermediate. All-intra for 1080p SDR; VFR 4K/HDR uses HEVC."""
     _ffmpeg_args, encoder, label, encopts = intermediate_encoder(track)
     print(f"    - HandBrakeCLI intermediate: encoder={encoder} ({label}), CFR {target_fps}")
     handbrake_args = [
@@ -423,16 +477,29 @@ def create_ffmpeg_intermediate(source_file, output_file, track):
 
 
 def prepare_xav_input(file_path, is_vfr, target_cfr_fps, track):
-    """Always HandBrake CFR video intermediate. ffmpeg only if HandBrake fails."""
+    """1080p SDR: HandBrake x264 all-intra. 4K/HDR CFR: mkvmerge video-only remux."""
     prep_file = Path(f"{file_path.stem}{PREP_SUFFIX}")
     temps = [prep_file]
+    uhd_or_hdr = is_4k_or_hdr(track)
     if file_is_usable(prep_file):
         if prep_is_vfr(prep_file):
             print(f"    - Existing intermediate is VFR; deleting and remaking: {prep_file}")
             prep_file.unlink(missing_ok=True)
+        elif uhd_or_hdr and not is_vfr and prep_is_handbrake_reencode(prep_file):
+            print(
+                f"    - Existing intermediate is a HandBrake re-encode; "
+                f"deleting and remuxing video-only: {prep_file}"
+            )
+            prep_file.unlink(missing_ok=True)
         else:
             print(f"    - Reusing existing intermediate (resume): {prep_file}")
             return prep_file, temps
+
+    if uhd_or_hdr and not is_vfr:
+        if run_mkvmerge_video_only(file_path, prep_file):
+            strip_prep_tags(prep_file)
+            return prep_file, temps
+        print("    - Warning: mkvmerge video-only remux failed. Falling back to HandBrake.")
 
     fps = handbrake_rate(track, file_path, target_cfr_fps if is_vfr else None)
     if fps:
