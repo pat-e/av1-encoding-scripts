@@ -657,13 +657,32 @@ def _finite_float(value, fallback):
     return number if math.isfinite(number) else fallback
 
 
-def apply_constant_gain_loudness(input_path, output_path, track_index):
-    """Two-pass ffmpeg loudnorm, linear (constant gain + true-peak). No asoftclip."""
+def stream_sample_rate(source_file, stream_index):
+    """Source track sample rate in Hz. loudnorm leaks 192 kHz; we restore this for opusenc's header."""
+    try:
+        for stream in ffprobe_json(source_file).get("streams", []):
+            if int(stream.get("index", -1)) != int(stream_index):
+                continue
+            rate = int(str(stream.get("sample_rate") or "0").split()[0])
+            if rate > 0:
+                return rate
+    except (TypeError, ValueError, subprocess.CalledProcessError, json.JSONDecodeError):
+        pass
+    return 48000
+
+
+def apply_constant_gain_loudness(input_path, output_path, track_index, sample_rate=48000):
+    """Two-pass ffmpeg loudnorm, linear (constant gain + true-peak). No asoftclip.
+
+    loudnorm true-peak uses 4× oversampling (48 kHz → 192 kHz). Pin the FLAC back
+    to the source rate so opusenc tags Input Sample Rate correctly (still encodes at 48 kHz).
+    """
     print(f"    - Normalizing Audio Track #{track_index} (loudnorm 2-pass linear)...")
     print(
         f"      - Targets: I={LOUDNESS_I} LUFS, TP={LOUDNESS_TP} dBTP, "
         f"LRA={LOUDNESS_LRA} LU (linear; not a compressor)"
     )
+    print(f"      - Restore sample rate after loudnorm: {sample_rate} Hz (source; Opus encode stays 48 kHz)")
     print("      - Pass 1: Measuring integrated loudness and true peak...")
     result = subprocess.run(
         [
@@ -711,7 +730,8 @@ def apply_constant_gain_loudness(input_path, output_path, track_index):
     run_ffmpeg_logged([
         "ffmpeg", "-hide_banner", "-v", "error", "-stats", "-y",
         "-i", str(input_path),
-        "-af", f"{loudnorm_apply},aformat=sample_fmts=s32",
+        "-af", f"{loudnorm_apply},aformat=sample_fmts=s32:sample_rates={sample_rate}",
+        "-ar", str(sample_rate),
         "-c:a", "flac", "-sample_fmt", "s32",
         str(output_path),
     ])
@@ -778,7 +798,12 @@ def convert_audio_track(index, ch, audio_temp_dir, source_file, should_downmix):
     if not extracted:
         raise last_error
 
-    apply_constant_gain_loudness(temp_extracted, temp_normalized, index)
+    apply_constant_gain_loudness(
+        temp_extracted,
+        temp_normalized,
+        index,
+        sample_rate=stream_sample_rate(source_file, index),
+    )
 
     is_being_downmixed = should_downmix and ch >= 6
     if is_being_downmixed:
