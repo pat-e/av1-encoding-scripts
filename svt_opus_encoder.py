@@ -1,45 +1,118 @@
 #!/usr/bin/env python3
 
-# Note: This script is configured to use a custom version of SVT-AV1 
+# Note: This script is configured to use a custom version of SVT-AV1
 # called "SVT-AV1-Essential" from https://github.com/nekotrix/SVT-AV1-Essential
+#
+# Batch encode: av1an is VIDEO ONLY. Audio, subs, attachments, mux: this script.
+# Auto-detects SDR vs HDR and 1080p vs 4K.
+# 1080p SDR: HandBrake x264 all-intra intermediate, then VapourSynth BT.709.
+# 4K or HDR CFR: mkvmerge video-only remux (no re-encode; keeps HDR/DoVi track metadata).
+# VFR 4K/HDR (rare): HandBrake x265_10bit CFR fallback.
+# ffmpeg is only a fallback if HandBrake produces an empty 1080p SDR file.
+# ≤1080p SDR: --preset 1. Above 1080p or HDR: --preset 2.
+# --crf 30 always (overrides Essential --quality medium, which would be CRF 35 above 1080p).
+# Av1an workers: (cpu_count // 2) - 1, not a fixed count.
+# Audio: AAC/Opus remuxed. Else: Nightmode Dialogue pan (`<` so the mix cannot clip)
+# → ffmpeg loudnorm 2-pass linear (I=-16, TP=-1.5, LRA=20) → opusenc.
+# Final mkvmerge: av1an video + processed/remuxed audio + source subs/attachments/chapters.
 
-import os
-import sys
-import subprocess
-import shutil
-import tempfile
+import argparse
 import json
-import re # Added for VFR frame rate parsing
+import math
+import multiprocessing as _multiprocessing_cropdetect
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from collections import Counter as _Counter_cropdetect
 from datetime import datetime
 from pathlib import Path
-import math
+
+REQUIRED_TOOLS = [
+    "ffmpeg", "ffprobe", "mkvmerge", "mkvpropedit",
+    "opusenc", "mediainfo", "av1an", "HandBrakeCLI", "ffmsindex",
+]
+DIR_COMPLETED = Path("completed")
+DIR_ORIGINAL = Path("original")
+DIR_CONV_LOGS = Path("conv_logs")
+DIR_FAILED = Path("failed")
+REMUX_CODECS = {"aac", "opus"}
+
+PREP_SUFFIX = ".prep.mkv"
+CFR_SUFFIX = ".cfr.mkv"
+CFR_FULL_SUFFIX = ".cfr_full.mkv"
+
+HEIGHT_4K = 1080
+PRESET_1080 = 1
+PRESET_4K = 2
+DEFAULT_CRF = 30
+DEFAULT_TUNE = 2
+DEFAULT_LP = 2
+TUNE_NAMES = {
+    0: "VQ",
+    1: "PSNR",
+    2: "SSIM",
+    3: "IQ (Image Quality)",
+    4: "MS_SSIM",
+}
 
 LOUDNESS_I = -16.0
 LOUDNESS_TP = -1.5
 LOUDNESS_LRA = 20.0
 
-REQUIRED_TOOLS = [
-    "ffmpeg", "ffprobe", "mkvmerge", "mkvpropedit",
-    "opusenc", "mediainfo", "av1an", "HandBrakeCLI", "ffmsindex" # Added HandBrakeCLI and ffmsindex
-]
-DIR_COMPLETED = Path("completed")
-DIR_ORIGINAL = Path("original")
-DIR_CONV_LOGS = Path("conv_logs") # Directory for conversion logs
-
-REMUX_CODECS = {"aac", "opus"}  # Using a set for efficient lookups
-
-SVT_AV1_PARAMS = {
-    "preset": 1,                       # Speed preset. Lower is slower and yields better compression efficiency.
-    "color-primaries": 1,              # BT.709 color primaries (Standard SDR).
-    "transfer-characteristics": 1,     # BT.709 transfer characteristics (Standard SDR).
-    "matrix-coefficients": 1,          # BT.709 matrix coefficients (Standard SDR).
-    "scd": 0,                          # Scene change detection OFF (av1an handles scene cuts).
-    "scm": 0,			               # Set screen content detection level, default is 2 (0: off, 1: on, 2: content adaptive)
-    "keyint": 0,                       # Keyframe interval OFF (av1an inserts keyframes).
-    "auto-tiling": 1,                  # Automatically determine the number of tiles based on resolution.
-    "tune": 2,                         # 0 = VQ, 1 = PSNR, 2 = SSIM (SVT-AV1-Essential default recommended).
-    "progress": 2,                     # Detailed progress output.
+SVT_AV1_BASE = {
+    "preset": PRESET_1080,
+    "crf": DEFAULT_CRF,
+    "color-primaries": 1,
+    "transfer-characteristics": 1,
+    "matrix-coefficients": 1,
+    "scd": 0,
+    "scm": 0,
+    "keyint": 0,
+    "lp": DEFAULT_LP,
+    "auto-tiling": 1,
+    "tune": DEFAULT_TUNE,
+    "progress": 2,
 }
+
+HDR_TRANSFER_MARKERS = (
+    "smpte2084", "smpte st 2084", "pq", "bt.2100", "bt2100",
+    "arib-std-b67", "arib std-b67", "hlg", "hybrid log-gamma",
+)
+HDR_FORMAT_MARKERS = ("hdr10", "hdr10+", "dolby vision", "dolbyvision", "hlg")
+HLG_MARKERS = ("arib-std-b67", "arib std-b67", "hlg", "hybrid log-gamma")
+HDR_TRACK_KEYS = (
+    "HDR_Format", "HDR_Format_String", "HDR_Format_Compatibility",
+    "transfer_characteristics", "TransferCharacteristics",
+    "Transfer_characteristics", "colour_transfer", "color_transfer",
+)
+
+
+class Tee:
+    """Write to the log file and the real console at the same time."""
+
+    def __init__(self, *files):
+        self.files = files
+
+    def write(self, data):
+        for f in self.files:
+            try:
+                f.write(data)
+            except Exception:
+                pass
+
+    def flush(self):
+        for f in self.files:
+            try:
+                f.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        return any(getattr(f, "isatty", lambda: False)() for f in self.files)
+
 
 def check_tools():
     for tool in REQUIRED_TOOLS:
@@ -47,12 +120,13 @@ def check_tools():
             print(f"Required tool '{tool}' not found in PATH.")
             sys.exit(1)
 
+
 def run_cmd(cmd, capture_output=False, check=True):
     if capture_output:
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check, text=True)
         return result.stdout
-    else:
-        subprocess.run(cmd, check=check)
+    subprocess.run(cmd, check=check)
+
 
 def run_ffmpeg_logged(args):
     """Run ffmpeg so -stats is teed to console and log as it happens."""
@@ -68,6 +142,542 @@ def run_ffmpeg_logged(args):
         ret = proc.wait()
     if ret != 0:
         raise subprocess.CalledProcessError(ret, args)
+
+
+def file_is_usable(path):
+    try:
+        return path.exists() and path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def mediainfo_json(path):
+    raw = run_cmd(["mediainfo", "--Output=JSON", "-f", str(path)], capture_output=True)
+    return json.loads(raw)
+
+
+def video_track(media_info):
+    if not (media_info.get("media") and media_info["media"].get("track")):
+        return None
+    for track in media_info["media"]["track"]:
+        if track.get("@type") == "Video":
+            return track
+    return None
+
+
+def video_height(track):
+    if not track:
+        return 0
+    try:
+        return int(float(str(track.get("Height", "0")).split()[0]))
+    except (TypeError, ValueError):
+        return 0
+
+
+def video_bit_depth(track):
+    if not track:
+        return 8
+    raw = track.get("BitDepth") or track.get("Bit_depth") or "8"
+    try:
+        return int(float(str(raw).split()[0]))
+    except (TypeError, ValueError):
+        return 8
+
+
+def video_fps(track, source_file=None):
+    """MediaInfo original rate first. ffprobe r_frame_rate is often a fake 29.97 on MKV."""
+    if track:
+        orig_str = track.get("FrameRate_Original_String") or ""
+        match = re.search(r"\((\d+/\d+)\)", str(orig_str))
+        if match:
+            return match.group(1)
+        orig_num = track.get("FrameRate_Original_Num")
+        orig_den = track.get("FrameRate_Original_Den")
+        if orig_num and orig_den:
+            return f"{orig_num}/{orig_den}"
+        orig = track.get("FrameRate_Original")
+        if orig:
+            return str(orig).split()[0]
+        num, den = track.get("FrameRate_Num"), track.get("FrameRate_Den")
+        if num and den:
+            return f"{num}/{den}"
+        fr = track.get("FrameRate")
+        if fr:
+            return str(fr).split()[0]
+    if source_file:
+        try:
+            raw = run_cmd([
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=avg_frame_rate,r_frame_rate",
+                "-of", "json", str(source_file),
+            ], capture_output=True)
+            streams = (json.loads(raw).get("streams") or [])
+            if streams:
+                for key in ("avg_frame_rate", "r_frame_rate"):
+                    val = streams[0].get(key)
+                    if val and val not in ("0/0", "0"):
+                        return val
+        except (subprocess.CalledProcessError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+    return None
+
+
+def is_4k_path(track):
+    return video_height(track) > HEIGHT_4K
+
+
+def _hdr_text(track):
+    if not track:
+        return ""
+    parts = []
+    for key in HDR_TRACK_KEYS:
+        val = track.get(key)
+        if val:
+            parts.append(str(val).lower())
+    return " ".join(parts)
+
+
+def is_hdr(track):
+    """True HDR (PQ/HLG/DoVi). 10-bit BT.709 Hi10p is SDR, not HDR."""
+    text = _hdr_text(track)
+    if any(m in text for m in HDR_FORMAT_MARKERS):
+        return True
+    return any(m in text for m in HDR_TRANSFER_MARKERS)
+
+
+def is_hlg(track):
+    return any(m in _hdr_text(track) for m in HLG_MARKERS)
+
+
+def is_4k_or_hdr(track):
+    return is_4k_path(track) or is_hdr(track)
+
+
+def path_label(track):
+    height = video_height(track)
+    if is_hdr(track):
+        kind = "HLG" if is_hlg(track) else "PQ/HDR10"
+        return f"HDR {kind} (height={height})"
+    if is_4k_path(track):
+        return f"4K+ SDR (height={height})"
+    return f"1080p or lower SDR (height={height})"
+
+
+def svt_preset(track, override=None):
+    if override is not None:
+        return int(override)
+    return PRESET_4K if is_4k_path(track) or is_hdr(track) else PRESET_1080
+
+
+def svt_params_for_track(track, preset_override=None, crf_override=None, grain=None, tune_override=None):
+    params = dict(SVT_AV1_BASE)
+    params["preset"] = svt_preset(track, preset_override)
+    params["crf"] = int(crf_override) if crf_override is not None else DEFAULT_CRF
+    params["tune"] = int(tune_override) if tune_override is not None else DEFAULT_TUNE
+    if is_hdr(track):
+        params["color-primaries"] = 9
+        params["matrix-coefficients"] = 9
+        params["transfer-characteristics"] = 18 if is_hlg(track) else 16
+    if grain is not None:
+        params["film-grain"] = grain
+    return params
+
+
+def vs_matrix_in(track):
+    return "2020ncl" if is_hdr(track) else "709"
+
+
+def av1an_svt_param_string(params):
+    return " ".join(f"--{key} {value}" for key, value in params.items())
+
+
+def av1an_worker_count():
+    total_cores = os.cpu_count() or 4
+    workers = max(1, (total_cores // 2) - 1)
+    return workers, total_cores
+
+
+def intermediate_encoder(track):
+    """Return (ffmpeg codec args, handbrake encoder, label, handbrake --encopts or None)."""
+    ten = video_bit_depth(track) >= 10 or is_4k_or_hdr(track)
+    if is_4k_or_hdr(track):
+        ffmpeg_args = [
+            "-c:v", "libx265",
+            "-crf", "0",
+            "-preset", "superfast",
+            "-tune", "fastdecode",
+            "-pix_fmt", "yuv420p10le",
+            "-x265-params", "info=0",
+        ]
+        return ffmpeg_args, "x265_10bit", "libx265 10-bit CRF 0, normal GOP (VFR 4K/HDR fallback)", None
+    if ten:
+        ffmpeg_args = [
+            "-c:v", "libx264",
+            "-crf", "0",
+            "-preset", "superfast",
+            "-tune", "fastdecode",
+            "-pix_fmt", "yuv420p10le",
+            "-g", "1",
+            "-bf", "0",
+        ]
+        return ffmpeg_args, "x264_10bit", "libx264 10-bit CRF 0 all-intra (1080p SDR Hi10p)", "keyint=1:bframes=0"
+    ffmpeg_args = [
+        "-c:v", "libx264",
+        "-crf", "0",
+        "-preset", "superfast",
+        "-tune", "fastdecode",
+        "-g", "1",
+        "-bf", "0",
+    ]
+    return ffmpeg_args, "x264", "libx264 8-bit CRF 0 all-intra (1080p SDR)", "keyint=1:bframes=0"
+
+
+def detect_vfr(media_info):
+    is_vfr = False
+    target_cfr_fps = None
+    track = video_track(media_info)
+    if not track:
+        return is_vfr, target_cfr_fps
+
+    frame_rate_mode = track.get("FrameRate_Mode")
+    if not (frame_rate_mode and frame_rate_mode.upper() in ["VFR", "VARIABLE"]):
+        print("    - Video appears to be CFR or FrameRate_Mode not specified as VFR/Variable by MediaInfo.")
+        return is_vfr, target_cfr_fps
+
+    is_vfr = True
+    print(f"    - Detected VFR based on MediaInfo FrameRate_Mode: {frame_rate_mode}")
+    original_fps_str = track.get("FrameRate_Original_String")
+    if original_fps_str:
+        match = re.search(r"\((\d+/\d+)\)", original_fps_str)
+        if match:
+            target_cfr_fps = match.group(1)
+        else:
+            target_cfr_fps = track.get("FrameRate_Original")
+    if not target_cfr_fps:
+        target_cfr_fps = track.get("FrameRate_Original")
+    if not target_cfr_fps:
+        target_cfr_fps = track.get("FrameRate")
+        if target_cfr_fps:
+            print(f"    - Using MediaInfo FrameRate ({target_cfr_fps}) as fallback for HandBrake target FPS.")
+    if target_cfr_fps:
+        print(f"    - Target CFR for HandBrake: {target_cfr_fps}")
+        if isinstance(target_cfr_fps, str) and "/" in target_cfr_fps:
+            try:
+                num, den = map(float, target_cfr_fps.split("/"))
+                target_cfr_fps = f"{num / den:.3f}"
+                print(f"    - Converted fractional FPS to decimal for HandBrake: {target_cfr_fps}")
+            except ValueError:
+                print(f"    - Warning: Could not parse fractional FPS '{target_cfr_fps}'. Sending source as-is.")
+                is_vfr = False
+    else:
+        print("    - Warning: VFR detected, but could not determine target CFR. Sending source as-is.")
+        is_vfr = False
+    return is_vfr, target_cfr_fps
+
+
+def handbrake_rate(track, source_file, vfr_target=None):
+    """Always pass --rate. Prefer MediaInfo original FPS (never HandBrake's fake 29.97)."""
+    raw = vfr_target or video_fps(track, source_file)
+    if not raw:
+        return None
+    raw = str(raw).split()[0]
+    if "/" in raw:
+        try:
+            num, den = map(float, raw.split("/", 1))
+            if den:
+                return f"{num / den:.3f}"
+        except ValueError:
+            return raw
+    try:
+        return f"{float(raw):.3f}"
+    except ValueError:
+        return raw
+
+
+def strip_prep_tags(path):
+    """HandBrake/ffmpeg can copy a video title; av1an would copy it again."""
+    try:
+        run_cmd([
+            "mkvpropedit", str(path),
+            "--delete", "title",
+            "--edit", "track:v1",
+            "--delete", "name",
+        ])
+    except subprocess.CalledProcessError as e:
+        print(f"    - Warning: could not strip intermediate titles ({e}).")
+
+
+def prep_is_vfr(path):
+    try:
+        mode = (video_track(mediainfo_json(path)) or {}).get("FrameRate_Mode") or ""
+    except Exception:
+        return False
+    return str(mode).upper() in ("VFR", "VARIABLE")
+
+
+def first_video_track_id(source_file):
+    """mkvmerge track id of the first video track (BL if dual-layer DoVi)."""
+    try:
+        for t in mkvmerge_identify(source_file).get("tracks") or []:
+            if t.get("type") == "video":
+                return t.get("id", 0)
+    except (subprocess.CalledProcessError, json.JSONDecodeError, TypeError):
+        pass
+    return 0
+
+
+def run_mkvmerge_video_only(source_file, output_file):
+    """Copy the video track only. No re-encode. Keeps HDR10/DoVi track properties."""
+    vid = first_video_track_id(source_file)
+    print(
+        f"    - mkvmerge video-only remux (no re-encode, keep HDR/DoVi metadata), "
+        f"video TID {vid}"
+    )
+    args = [
+        "mkvmerge", "-o", str(output_file),
+        "--title", "",
+        "--no-audio",
+        "--no-subtitles",
+        "--no-buttons",
+        "--no-attachments",
+        "--no-chapters",
+        "--no-global-tags",
+        "--video-tracks", str(vid),
+        "--track-name", f"{vid}:",
+        str(source_file),
+    ]
+    print(f"    - Running mkvmerge: {' '.join(args)}")
+    run_cmd(args)
+    return file_is_usable(output_file)
+
+
+def prep_is_handbrake_reencode(path):
+    """Old 4K/HDR preps were HandBrake HEVC CRF 0. Remux path should not reuse those."""
+    try:
+        media = mediainfo_json(path)
+        general = {}
+        for t in media.get("media", {}).get("track", []):
+            if t.get("@type") == "General":
+                general = t
+                break
+        writing = " ".join(
+            str(general.get(k) or "")
+            for k in ("WritingApplication", "Encoded_Application", "Writing_library")
+        )
+        return "handbrake" in writing.lower()
+    except Exception:
+        return False
+
+
+def run_handbrake_intermediate(source_file, output_file, track, target_fps):
+    """Video-only CFR intermediate. All-intra for 1080p SDR; VFR 4K/HDR uses HEVC."""
+    _ffmpeg_args, encoder, label, encopts = intermediate_encoder(track)
+    print(f"    - HandBrakeCLI intermediate: encoder={encoder} ({label}), CFR {target_fps}")
+    handbrake_args = [
+        "HandBrakeCLI",
+        "--input", str(source_file),
+        "--output", str(output_file),
+        "--cfr",
+        "--rate", str(target_fps),
+        "--encoder", encoder,
+        "--quality", "0",
+        "--encoder-preset", "superfast",
+        "--encoder-tune", "fastdecode",
+    ]
+    if encopts:
+        handbrake_args += ["--encopts", encopts]
+    handbrake_args += [
+        "--audio", "none",
+        "--subtitle", "none",
+        "--crop-mode", "none",
+        "--no-markers",
+    ]
+    print(f"    - Running HandBrakeCLI: {' '.join(handbrake_args)}")
+    run_cmd(handbrake_args)
+    return file_is_usable(output_file)
+
+
+def create_ffmpeg_intermediate(source_file, output_file, track):
+    """Video-only all-intra CFR fallback. Strip metadata/chapters/titles."""
+    video_args, _hb, label, _encopts = intermediate_encoder(track)
+    fps = video_fps(track, source_file)
+    print(f"    - Creating ffmpeg intermediate: {label} (forced CFR)")
+    ffmpeg_args = [
+        "ffmpeg", "-hide_banner", "-v", "error", "-stats", "-y",
+        "-fflags", "+genpts",
+        "-i", str(source_file),
+        "-map", "0:v:0",
+        *video_args,
+        "-fps_mode", "cfr",
+    ]
+    if fps:
+        ffmpeg_args += ["-r", str(fps)]
+        print(f"    - Forcing CFR at {fps}")
+    ffmpeg_args += [
+        "-an", "-sn", "-dn",
+        "-map_metadata", "-1",
+        "-map_chapters", "-1",
+        "-metadata", "title=",
+        "-metadata:s:v:0", "title=",
+        str(output_file),
+    ]
+    print(f"    - Running ffmpeg: {' '.join(ffmpeg_args)}")
+    run_ffmpeg_logged(ffmpeg_args)
+    return file_is_usable(output_file)
+
+
+def prepare_av1an_input(file_path, is_vfr, target_cfr_fps, track):
+    """1080p SDR: HandBrake x264 all-intra. 4K/HDR CFR: mkvmerge video-only remux."""
+    prep_file = Path(f"{file_path.stem}{PREP_SUFFIX}")
+    temps = [prep_file]
+    uhd_or_hdr = is_4k_or_hdr(track)
+    if file_is_usable(prep_file):
+        if prep_is_vfr(prep_file):
+            print(f"    - Existing intermediate is VFR; deleting and remaking: {prep_file}")
+            prep_file.unlink(missing_ok=True)
+        elif uhd_or_hdr and not is_vfr and prep_is_handbrake_reencode(prep_file):
+            print(
+                f"    - Existing intermediate is a HandBrake re-encode; "
+                f"deleting and remuxing video-only: {prep_file}"
+            )
+            prep_file.unlink(missing_ok=True)
+        else:
+            print(f"    - Reusing existing intermediate (resume): {prep_file}")
+            return prep_file, temps
+
+    if uhd_or_hdr and not is_vfr:
+        if run_mkvmerge_video_only(file_path, prep_file):
+            strip_prep_tags(prep_file)
+            return prep_file, temps
+        print("    - Warning: mkvmerge video-only remux failed. Falling back to HandBrake.")
+
+    fps = handbrake_rate(track, file_path, target_cfr_fps if is_vfr else None)
+    if fps:
+        if run_handbrake_intermediate(file_path, prep_file, track, fps):
+            strip_prep_tags(prep_file)
+            return prep_file, temps
+        print("    - Warning: HandBrakeCLI produced an empty file. Falling back to ffmpeg.")
+    else:
+        print("    - Warning: could not determine FPS for HandBrake. Falling back to ffmpeg.")
+
+    if create_ffmpeg_intermediate(file_path, prep_file, track):
+        strip_prep_tags(prep_file)
+        return prep_file, temps
+    print("    - Warning: ffmpeg intermediate failed. Sending source to av1an as-is.")
+    return file_path, temps
+
+
+def strip_titles(mkv_path):
+    print("    - Clearing container and video-track titles...")
+    try:
+        run_cmd([
+            "mkvpropedit", str(mkv_path),
+            "--delete", "title",
+            "--edit", "track:v1",
+            "--delete", "name",
+        ])
+    except subprocess.CalledProcessError as e:
+        print(f"    - Warning: mkvpropedit could not clear titles ({e}). Continuing.")
+
+
+TRACK_FLAG_MAP = (
+    ("default_track", "flag-default", 0),
+    ("forced_track", "flag-forced", 0),
+    ("enabled_track", "flag-enabled", 1),
+    ("flag_hearing_impaired", "flag-hearing-impaired", 0),
+    ("flag_visual_impaired", "flag-visual-impaired", 0),
+    ("flag_text_descriptions", "flag-text-descriptions", 0),
+    ("flag_original", "flag-original", 0),
+    ("flag_commentary", "flag-commentary", 0),
+)
+
+
+def collect_track_meta(path):
+    """Audio/subtitle names and Matroska flags from the prepared source."""
+    mkv = mkvmerge_identify(path)
+    audio, subs = [], []
+    for t in mkv.get("tracks", []):
+        kind = t.get("type")
+        if kind not in ("audio", "subtitles"):
+            continue
+        props = t.get("properties") or {}
+        flags = {}
+        for json_key, prop_name, default in TRACK_FLAG_MAP:
+            if json_key in props:
+                flags[prop_name] = 1 if props[json_key] else 0
+            else:
+                flags[prop_name] = default
+        meta = {
+            "name": props.get("track_name") or "",
+            "language": props.get("language") or "und",
+            "language_ietf": props.get("language_ietf") or "",
+            "flags": flags,
+        }
+        if kind == "audio":
+            audio.append(meta)
+        else:
+            subs.append(meta)
+    return audio, subs
+
+
+def _append_track_restore(args, selector, meta, label):
+    name = meta.get("name") or ""
+    flags = meta.get("flags") or {}
+    language = meta.get("language") or "und"
+    language_ietf = meta.get("language_ietf") or ""
+    args += ["--edit", selector]
+    if name:
+        args += ["--set", f"name={name}"]
+        shown = name
+    else:
+        args += ["--delete", "name"]
+        shown = "(no title)"
+    args += ["--set", f"language={language}"]
+    if language_ietf:
+        args += ["--set", f"language-ietf={language_ietf}"]
+    bits = []
+    for _json_key, prop_name, _default in TRACK_FLAG_MAP:
+        value = flags.get(prop_name, 0)
+        args += ["--set", f"{prop_name}={value}"]
+        if value:
+            bits.append(prop_name.replace("flag-", ""))
+    extra = f" [{', '.join(bits)}]" if bits else ""
+    ietf = f"/{language_ietf}" if language_ietf else ""
+    print(f"      - {label}: {language}{ietf}  {shown}{extra}")
+
+
+def restore_track_meta(mkv_path, audio_meta, sub_meta):
+    """Re-apply source audio/subtitle titles and flags."""
+    if not audio_meta and not sub_meta:
+        return
+    print("    - Restoring audio and subtitle language, titles, and flags from source...")
+    args = ["mkvpropedit", str(mkv_path)]
+    out = mkvmerge_identify(mkv_path)
+    out_audio = [t for t in out.get("tracks", []) if t.get("type") == "audio"]
+    out_subs = [t for t in out.get("tracks", []) if t.get("type") == "subtitles"]
+    for i, meta in enumerate(audio_meta[: len(out_audio)], start=1):
+        _append_track_restore(args, f"track:a{i}", meta, f"audio a{i}")
+    for i, meta in enumerate(sub_meta[: len(out_subs)], start=1):
+        _append_track_restore(args, f"track:s{i}", meta, f"subtitle s{i}")
+    if args == ["mkvpropedit", str(mkv_path)]:
+        return
+    try:
+        run_cmd(args)
+    except subprocess.CalledProcessError as e:
+        print(f"    - Warning: mkvpropedit could not restore track titles/flags ({e}). Continuing.")
+
+
+def ffprobe_json(path):
+    raw = run_cmd(
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", str(path)],
+        capture_output=True,
+    )
+    return json.loads(raw)
+
+
+def mkvmerge_identify(path):
+    return json.loads(run_cmd(["mkvmerge", "-J", str(path)], capture_output=True))
+
 
 def _parse_loudnorm_json(stderr_output):
     json_start_index = stderr_output.find("{")
@@ -87,6 +697,7 @@ def _parse_loudnorm_json(stderr_output):
         raise ValueError("Could not find end of JSON block in ffmpeg output for loudness analysis.")
     return json.loads(stderr_output[json_start_index:json_end_index])
 
+
 def _finite_float(value, fallback):
     try:
         number = float(value)
@@ -94,13 +705,33 @@ def _finite_float(value, fallback):
         return fallback
     return number if math.isfinite(number) else fallback
 
-def apply_constant_gain_loudness(input_path, output_path, track_index):
-    """Two-pass ffmpeg loudnorm, linear (constant gain + true-peak). No asoftclip."""
+
+def stream_sample_rate(source_file, stream_index):
+    """Source track sample rate in Hz. loudnorm leaks 192 kHz; we restore this for opusenc's header."""
+    try:
+        for stream in ffprobe_json(source_file).get("streams", []):
+            if int(stream.get("index", -1)) != int(stream_index):
+                continue
+            rate = int(str(stream.get("sample_rate") or "0").split()[0])
+            if rate > 0:
+                return rate
+    except (TypeError, ValueError, subprocess.CalledProcessError, json.JSONDecodeError):
+        pass
+    return 48000
+
+
+def apply_constant_gain_loudness(input_path, output_path, track_index, sample_rate=48000):
+    """Two-pass ffmpeg loudnorm, linear (constant gain + true-peak). No asoftclip.
+
+    loudnorm true-peak uses 4× oversampling (48 kHz → 192 kHz). Pin the FLAC back
+    to the source rate so opusenc tags Input Sample Rate correctly (still encodes at 48 kHz).
+    """
     print(f"    - Normalizing Audio Track #{track_index} (loudnorm 2-pass linear)...")
     print(
         f"      - Targets: I={LOUDNESS_I} LUFS, TP={LOUDNESS_TP} dBTP, "
         f"LRA={LOUDNESS_LRA} LU (linear; not a compressor)"
     )
+    print(f"      - Restore sample rate after loudnorm: {sample_rate} Hz (source; Opus encode stays 48 kHz)")
     print("      - Pass 1: Measuring integrated loudness and true peak...")
     result = subprocess.run(
         [
@@ -148,10 +779,12 @@ def apply_constant_gain_loudness(input_path, output_path, track_index):
     run_ffmpeg_logged([
         "ffmpeg", "-hide_banner", "-v", "error", "-stats", "-y",
         "-i", str(input_path),
-        "-af", f"{loudnorm_apply},aformat=sample_fmts=s32",
+        "-af", f"{loudnorm_apply},aformat=sample_fmts=s32:sample_rates={sample_rate}",
+        "-ar", str(sample_rate),
         "-c:a", "flac", "-sample_fmt", "s32",
         str(output_path),
     ])
+
 
 def downmix_filters(ch):
     """Nightmode Dialogue (Collier / Harrelson). pan '<' renormalizes so the mix cannot clip."""
@@ -168,6 +801,7 @@ def downmix_filters(ch):
             "pan=stereo|c0<c2+0.30*c0+0.30*c4+0.30*c6|c1<c2+0.30*c1+0.30*c5+0.30*c7",
         ]
     return []
+
 
 def convert_audio_track(index, ch, audio_temp_dir, source_file, should_downmix):
     audio_temp_path = Path(audio_temp_dir)
@@ -213,7 +847,12 @@ def convert_audio_track(index, ch, audio_temp_dir, source_file, should_downmix):
     if not extracted:
         raise last_error
 
-    apply_constant_gain_loudness(temp_extracted, temp_normalized, index)
+    apply_constant_gain_loudness(
+        temp_extracted,
+        temp_normalized,
+        index,
+        sample_rate=stream_sample_rate(source_file, index),
+    )
 
     is_being_downmixed = should_downmix and ch >= 6
     if is_being_downmixed:
@@ -233,121 +872,95 @@ def convert_audio_track(index, ch, audio_temp_dir, source_file, should_downmix):
     run_cmd(["opusenc", "--vbr", "--bitrate", bitrate, str(temp_normalized), str(final_opus)])
     return final_opus
 
-def convert_video(source_file_base, source_file_full, is_vfr, target_cfr_fps_for_handbrake, autocrop_filter=None):
-    print("  --- Starting Video Processing ---")
-    # source_file_base is file_path.stem (e.g., "my.anime.episode.01")
-    vpy_file = Path(f"{source_file_base}.vpy")
-    ut_video_file = Path(f"{source_file_base}.ut.mkv")
-    encoded_video_file = Path(f"temp-{source_file_base}.mkv")
-    handbrake_cfr_intermediate_file = None # To store path of HandBrake output if created
 
-    current_input_for_utvideo = Path(source_file_full)
+def process_audio_tracks(source_file, audio_temp_dir, no_downmix):
+    """AAC/Opus remux. Other codecs: pan (optional) → LUFS → opusenc. Original order."""
+    probe = ffprobe_json(source_file)
+    mkv = mkvmerge_identify(source_file)
+    media = mediainfo_json(source_file)
+    mkv_audio = [t for t in mkv.get("tracks", []) if t.get("type") == "audio"]
+    media_audio = {
+        int(t.get("StreamOrder", -1)): t
+        for t in media.get("media", {}).get("track", [])
+        if t.get("@type") == "Audio"
+    }
+    plan = []
+    audio_i = 0
+    print("--- Starting Audio Processing ---")
+    for stream in probe.get("streams", []):
+        if stream.get("codec_type") != "audio":
+            continue
+        idx = int(stream["index"])
+        codec = (stream.get("codec_name") or "").lower()
+        channels = stream.get("channels", 2)
+        mkv_track = None
+        for t in mkv_audio:
+            if t.get("properties", {}).get("stream_id") == idx:
+                mkv_track = t
+                break
+        if mkv_track is None and audio_i < len(mkv_audio):
+            mkv_track = mkv_audio[audio_i]
+        audio_i += 1
+        props = (mkv_track or {}).get("properties") or {}
+        mkv_id = (mkv_track or {}).get("id")
+        language = props.get("language") or stream.get("tags", {}).get("language") or "und"
+        title = props.get("track_name") or ""
+        delay = 0
+        delay_raw = (media_audio.get(idx) or {}).get("Video_Delay")
+        if delay_raw is not None:
+            try:
+                delay_val = float(delay_raw)
+                delay = int(round(delay_val * 1000 if delay_val < 1 else delay_val))
+            except Exception:
+                delay = 0
+        print(f"Processing Audio Stream #{idx} (TID: {mkv_id}, Codec: {codec}, Channels: {channels}, Lang: {language})")
+        if codec in REMUX_CODECS and mkv_id is not None:
+            print("    - Remux (AAC/Opus), skip re-encode")
+            plan.append({"kind": "remux", "mkv_id": str(mkv_id)})
+        else:
+            opus_path = convert_audio_track(idx, channels, audio_temp_dir, source_file, not no_downmix)
+            plan.append({
+                "kind": "encode",
+                "path": opus_path,
+                "language": language,
+                "title": title,
+                "delay": delay,
+            })
+    print("--- Finished Audio Processing ---")
+    return plan
 
-    if is_vfr and target_cfr_fps_for_handbrake:
-        print(f"    - Source is VFR. Converting to CFR ({target_cfr_fps_for_handbrake}) with HandBrakeCLI...")
-        handbrake_cfr_intermediate_file = Path(f"{source_file_base}.cfr_temp.mkv")
-        handbrake_args = [
-            "HandBrakeCLI", 
-            "--input", str(source_file_full), 
-            "--output", str(handbrake_cfr_intermediate_file),
-            "--cfr", 
-            "--rate", str(target_cfr_fps_for_handbrake),
-            "--encoder", "x264_10bit", # Changed to x264_10bit for 10-bit CFR intermediate
-            "--quality", "0", # CRF 0 for x264 is often considered visually lossless, or near-lossless
-            "--encoder-preset", "superfast", # Use a fast preset for quicker processing
-            "--encoder-tune", "fastdecode", # Added tune for faster decoding
-            "--audio", "none", 
-            "--subtitle", "none",
-            "--crop-mode", "none" # Disable auto-cropping
-        ]
-        print(f"    - Running HandBrakeCLI: {' '.join(handbrake_args)}")
-        try:
-            run_cmd(handbrake_args)
-            if handbrake_cfr_intermediate_file.exists() and handbrake_cfr_intermediate_file.stat().st_size > 0:
-                print(f"    - HandBrake VFR to CFR conversion successful: {handbrake_cfr_intermediate_file}")
-                current_input_for_utvideo = handbrake_cfr_intermediate_file
-            else:
-                print(f"    - Warning: HandBrakeCLI VFR-to-CFR conversion failed or produced an empty file. Proceeding with original source for UTVideo.")
-                handbrake_cfr_intermediate_file = None # Ensure it's None if failed
-        except subprocess.CalledProcessError as e:
-            print(f"    - Error during HandBrakeCLI execution: {e}")
-            print(f"    - Proceeding with original source for UTVideo.")
-            handbrake_cfr_intermediate_file = None # Ensure it's None if failed
 
-
-    print("    - Creating UTVideo intermediate file (overwriting if exists)...")
-    # Check if source is already UTVideo
-    ffprobe_cmd = [
-        "ffprobe", "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1",
-        str(current_input_for_utvideo) # Use current input, which might be HandBrake output
+def mux_final(dest, encoded_video, source_file, audio_plan):
+    """av1an video only + audio in source order + source subs/attachments/chapters."""
+    extra = [
+        "--no-video", "--no-subtitles", "--no-attachments",
+        "--no-chapters", "--no-global-tags",
     ]
-    source_codec = run_cmd(ffprobe_cmd, capture_output=True, check=True).strip()
-
-    video_codec_args = ["-c:v", "utvideo"]
-    if source_codec == "utvideo" and current_input_for_utvideo == Path(source_file_full): # Only copy if original was UTVideo
-        print("    - Source is already UTVideo. Copying video stream...")
-        video_codec_args = ["-c:v", "copy"]
-
-    ffmpeg_args = [
-        "ffmpeg", "-hide_banner", "-v", "quiet", "-stats", "-y", "-i", str(current_input_for_utvideo),
-        "-map", "0:v:0", "-map_metadata", "-1", "-map_chapters", "-1", "-an", "-sn", "-dn",
+    args = [
+        "mkvmerge", "-o", str(dest),
+        "--title", "",
+        "--track-name", "0:",
+        "--no-audio", "--no-subtitles", "--no-attachments", "--no-chapters",
+        str(encoded_video),
     ]
-    if autocrop_filter:
-        ffmpeg_args += ["-vf", autocrop_filter]
-    ffmpeg_args += video_codec_args + [str(ut_video_file)]
-    run_cmd(ffmpeg_args)
+    for item in audio_plan:
+        if item["kind"] == "remux":
+            args += extra + ["--audio-tracks", item["mkv_id"], str(source_file)]
+        else:
+            sync = ["--sync", f"0:{item['delay']}"] if item.get("delay") else []
+            args += [
+                "--language", f"0:{item['language']}",
+                "--track-name", f"0:{item.get('title') or ''}",
+            ] + sync + [str(item["path"])]
+    args += ["--no-video", "--no-audio", str(source_file)]
+    print("Assembling final file with mkvmerge...")
+    print(f"    - mkvmerge: {' '.join(args)}")
+    run_cmd(args)
+    if not file_is_usable(dest):
+        raise RuntimeError(f"mkvmerge produced an empty file: {dest}")
 
-    print("    - Indexing UTVideo file with ffmsindex for VapourSynth...")
-    ffmsindex_args = ["ffmsindex", "-f", str(ut_video_file)]
-    run_cmd(ffmsindex_args)
-
-    ut_video_full_path = os.path.abspath(ut_video_file)
-    vpy_script_content = f"""import vapoursynth as vs
-core = vs.core
-core.num_threads = 4
-clip = core.ffms2.Source(source=r'''{ut_video_full_path}''')
-clip = core.resize.Point(clip, format=vs.YUV420P10, matrix_in_s="709") # type: ignore
-clip.set_output()
-"""
-    with vpy_file.open("w", encoding="utf-8") as f:
-        f.write(vpy_script_content)
-
-    print("    - Starting AV1 encode with av1an (this will take a long time)...")
-    total_cores = os.cpu_count() or 4 # Fallback if cpu_count is None
-    workers = max(1, (total_cores // 2) - 1) # Half the cores minus one, with a minimum of 1 worker.
-    print(f"    - Using {workers} workers for av1an (Total Cores: {total_cores}, Logic: (Cores/2)-1).")
-
-    # Create the parameter string for av1an's -v option, which expects a single string.
-    av1an_video_params_str = " ".join([f"--{key} {value}" for key, value in SVT_AV1_PARAMS.items()])
-    print(f"    - Using SVT-AV1 parameters: {av1an_video_params_str}")
-
-    av1an_enc_args = [
-        "av1an", "-i", str(vpy_file), "-o", str(encoded_video_file), "-n",
-        "-e", "svt-av1", "--resume", "--sc-pix-format", "yuv420p", "-c", "mkvmerge",
-        "--set-thread-affinity", "2", "--pix-format", "yuv420p10le", "--force", "--no-defaults",
-        "-w", str(workers),
-        "-v", av1an_video_params_str
-    ]
-    run_cmd(av1an_enc_args)
-    print("  --- Finished Video Processing ---")
-    return encoded_video_file, handbrake_cfr_intermediate_file
-
-def is_ffmpeg_decodable(file_path):
-    """Quickly check if ffmpeg can decode the input file."""
-    try:
-        # Try to decode a short segment of the first audio stream
-        subprocess.run([
-            "ffmpeg", "-v", "error", "-i", str(file_path), "-map", "0:a:0", "-t", "1", "-f", "null", "-"
-        ], check=True)
-        return True
-    except subprocess.CalledProcessError:
-        return False
 
 # --- CROPDETECT LOGIC FROM cropdetect.py ---
-import argparse as _argparse_cropdetect
-import multiprocessing as _multiprocessing_cropdetect
-from collections import Counter as _Counter_cropdetect
 
 COLOR_GREEN = "\033[92m"
 COLOR_RED = "\033[91m"
@@ -355,53 +968,57 @@ COLOR_YELLOW = "\033[93m"
 COLOR_RESET = "\033[0m"
 
 KNOWN_ASPECT_RATIOS = [
-    {"name": "HDTV (16:9)", "ratio": 16/9},
+    {"name": "HDTV (16:9)", "ratio": 16 / 9},
     {"name": "Widescreen (Scope)", "ratio": 2.39},
     {"name": "Widescreen (Flat)", "ratio": 1.85},
     {"name": "IMAX Digital (1.90:1)", "ratio": 1.90},
-    {"name": "Fullscreen (4:3)", "ratio": 4/3},
+    {"name": "Fullscreen (4:3)", "ratio": 4 / 3},
     {"name": "IMAX 70mm (1.43:1)", "ratio": 1.43},
 ]
 
+
 def _check_prerequisites_cropdetect():
-    for tool in ['ffmpeg', 'ffprobe']:
+    for tool in ["ffmpeg", "ffprobe"]:
         if not shutil.which(tool):
             print(f"Error: '{tool}' command not found. Is it installed and in your PATH?")
             return False
     return True
 
+
 def _analyze_segment_cropdetect(task_args):
     seek_time, input_file, width, height = task_args
     ffmpeg_args = [
-        'ffmpeg', '-hide_banner',
-        '-ss', str(seek_time),
-        '-i', input_file, '-t', '1', '-vf', 'cropdetect',
-        '-f', 'null', '-'
+        "ffmpeg", "-hide_banner",
+        "-ss", str(seek_time),
+        "-i", input_file, "-t", "1", "-vf", "cropdetect",
+        "-f", "null", "-",
     ]
-    result = subprocess.run(ffmpeg_args, capture_output=True, text=True, encoding='utf-8')
+    result = subprocess.run(ffmpeg_args, capture_output=True, text=True, encoding="utf-8")
     if result.returncode != 0:
         return []
-    crop_detections = re.findall(r'crop=(\d+):(\d+):(\d+):(\d+)', result.stderr)
+    crop_detections = re.findall(r"crop=(\d+):(\d+):(\d+):(\d+)", result.stderr)
     significant_crops = []
     for w_str, h_str, x_str, y_str in crop_detections:
         w, h, x, y = map(int, [w_str, h_str, x_str, y_str])
         significant_crops.append((f"crop={w}:{h}:{x}:{y}", seek_time))
     return significant_crops
 
+
 def _snap_to_known_ar_cropdetect(w, h, x, y, video_w, video_h, tolerance=0.03):
-    if h == 0: return f"crop={w}:{h}:{x}:{y}", None
+    if h == 0:
+        return f"crop={w}:{h}:{x}:{y}", None
     detected_ratio = w / h
     best_match = None
-    smallest_diff = float('inf')
+    smallest_diff = float("inf")
     for ar in KNOWN_ASPECT_RATIOS:
-        diff = abs(detected_ratio - ar['ratio'])
+        diff = abs(detected_ratio - ar["ratio"])
         if diff < smallest_diff:
             smallest_diff = diff
             best_match = ar
-    if not best_match or (smallest_diff / best_match['ratio']) >= tolerance:
+    if not best_match or (smallest_diff / best_match["ratio"]) >= tolerance:
         return f"crop={w}:{h}:{x}:{y}", None
     if abs(w - video_w) < 16:
-        new_h = round(video_w / best_match['ratio'])
+        new_h = round(video_w / best_match["ratio"])
         if new_h % 8 != 0:
             new_h = new_h + (8 - (new_h % 8))
         new_h = min(new_h, video_h)
@@ -409,9 +1026,9 @@ def _snap_to_known_ar_cropdetect(w, h, x, y, video_w, video_h, tolerance=0.03):
         if new_y % 2 != 0:
             new_y -= 1
         new_y = max(0, new_y)
-        return f"crop={video_w}:{new_h}:0:{new_y}", best_match['name']
+        return f"crop={video_w}:{new_h}:0:{new_y}", best_match["name"]
     if abs(h - video_h) < 16:
-        new_w = round(video_h * best_match['ratio'])
+        new_w = round(video_h * best_match["ratio"])
         if new_w % 8 != 0:
             new_w = new_w + (8 - (new_w % 8))
         new_w = min(new_w, video_w)
@@ -419,8 +1036,9 @@ def _snap_to_known_ar_cropdetect(w, h, x, y, video_w, video_h, tolerance=0.03):
         if new_x % 2 != 0:
             new_x -= 1
         new_x = max(0, new_x)
-        return f"crop={new_w}:{video_h}:{new_x}:0", best_match['name']
+        return f"crop={new_w}:{video_h}:{new_x}:0", best_match["name"]
     return f"crop={w}:{h}:{x}:{y}", None
+
 
 def _cluster_crop_values_cropdetect(crop_counts, tolerance=8):
     clusters = []
@@ -428,8 +1046,8 @@ def _cluster_crop_values_cropdetect(crop_counts, tolerance=8):
     while temp_counts:
         center_str, _ = temp_counts.most_common(1)[0]
         try:
-            _, values = center_str.split('=');
-            cw, ch, cx, cy = map(int, values.split(':'))
+            _, values = center_str.split("=")
+            cw, ch, cx, cy = map(int, values.split(":"))
         except (ValueError, IndexError):
             del temp_counts[center_str]
             continue
@@ -437,48 +1055,46 @@ def _cluster_crop_values_cropdetect(crop_counts, tolerance=8):
         crops_to_remove = []
         for crop_str, count in temp_counts.items():
             try:
-                _, values = crop_str.split('=');
-                w, h, x, y = map(int, values.split(':'))
+                _, values = crop_str.split("=")
+                w, h, x, y = map(int, values.split(":"))
                 if abs(x - cx) <= tolerance and abs(y - cy) <= tolerance:
                     cluster_total_count += count
                     crops_to_remove.append(crop_str)
             except (ValueError, IndexError):
                 continue
         if cluster_total_count > 0:
-            clusters.append({'center': center_str, 'count': cluster_total_count})
+            clusters.append({"center": center_str, "count": cluster_total_count})
         for crop_str in crops_to_remove:
             del temp_counts[crop_str]
-    clusters.sort(key=lambda c: c['count'], reverse=True)
+    clusters.sort(key=lambda c: c["count"], reverse=True)
     return clusters
+
 
 def _parse_crop_string_cropdetect(crop_str):
     try:
-        _, values = crop_str.split('=');
-        w, h, x, y = map(int, values.split(':'))
-        return {'w': w, 'h': h, 'x': x, 'y': y}
+        _, values = crop_str.split("=")
+        w, h, x, y = map(int, values.split(":"))
+        return {"w": w, "h": h, "x": x, "y": y}
     except (ValueError, IndexError):
         return None
 
+
 def _calculate_bounding_box_cropdetect(crop_keys):
-    min_x = min_w = min_y = min_h = float('inf')
-    max_x = max_w = max_y = max_h = float('-inf')
+    min_x = min_y = float("inf")
+    max_x = max_y = float("-inf")
     for key in crop_keys:
         parsed = _parse_crop_string_cropdetect(key)
         if not parsed:
             continue
-        w, h, x, y = parsed['w'], parsed['h'], parsed['x'], parsed['y']
+        w, h, x, y = parsed["w"], parsed["h"], parsed["x"], parsed["y"]
         min_x = min(min_x, x)
         min_y = min(min_y, y)
         max_x = max(max_x, x + w)
         max_y = max(max_y, y + h)
-        min_w = min(min_w, w)
-        min_h = min(min_h, h)
-        max_w = max(max_w, w)
-        max_h = max(max_h, h)
     if (max_x - min_x) <= 2 and (max_y - min_y) <= 2:
         return None
-    bounding_crop = f"crop={max_x - min_x}:{max_y - min_y}:{min_x}:{min_y}"
-    return bounding_crop
+    return f"crop={max_x - min_x}:{max_y - min_y}:{min_x}:{min_y}"
+
 
 def _analyze_video_cropdetect(input_file, duration, width, height, num_workers, significant_crop_threshold, min_crop, debug=False):
     num_tasks = num_workers * 4
@@ -495,123 +1111,260 @@ def _analyze_video_cropdetect(input_file, duration, width, height, num_workers, 
         return None
     crop_counts = _Counter_cropdetect(all_crop_strings)
     clusters = _cluster_crop_values_cropdetect(crop_counts)
-    total_detections = sum(c['count'] for c in clusters)
+    total_detections = sum(c["count"] for c in clusters)
     significant_clusters = []
     for cluster in clusters:
-        percentage = (cluster['count'] / total_detections) * 100
+        percentage = (cluster["count"] / total_detections) * 100
         if percentage >= significant_crop_threshold:
             significant_clusters.append(cluster)
     for cluster in significant_clusters:
-        parsed_crop = _parse_crop_string_cropdetect(cluster['center'])
+        parsed_crop = _parse_crop_string_cropdetect(cluster["center"])
         if parsed_crop:
             _, ar_label = _snap_to_known_ar_cropdetect(
-                parsed_crop['w'], parsed_crop['h'], parsed_crop['x'], parsed_crop['y'], width, height
+                parsed_crop["w"], parsed_crop["h"], parsed_crop["x"], parsed_crop["y"], width, height
             )
-            cluster['ar_label'] = ar_label
+            cluster["ar_label"] = ar_label
         else:
-            cluster['ar_label'] = None
+            cluster["ar_label"] = None
     if not significant_clusters:
         return None
-    elif len(significant_clusters) == 1:
+    if len(significant_clusters) == 1:
         dominant_cluster = significant_clusters[0]
-        parsed_crop = _parse_crop_string_cropdetect(dominant_cluster['center'])
+        parsed_crop = _parse_crop_string_cropdetect(dominant_cluster["center"])
         snapped_crop, ar_label = _snap_to_known_ar_cropdetect(
-            parsed_crop['w'], parsed_crop['h'], parsed_crop['x'], parsed_crop['y'], width, height
+            parsed_crop["w"], parsed_crop["h"], parsed_crop["x"], parsed_crop["y"], width, height
         )
         parsed_snapped = _parse_crop_string_cropdetect(snapped_crop)
-        if parsed_snapped and parsed_snapped['w'] == width and parsed_snapped['h'] == height:
+        if parsed_snapped and parsed_snapped["w"] == width and parsed_snapped["h"] == height:
             return None
-        else:
-            return snapped_crop
-    else:
-        crop_keys = [c['center'] for c in significant_clusters]
-        bounding_box_crop = _calculate_bounding_box_cropdetect(crop_keys)
-        if bounding_box_crop:
-            parsed_bb = _parse_crop_string_cropdetect(bounding_box_crop)
-            snapped_crop, ar_label = _snap_to_known_ar_cropdetect(
-                parsed_bb['w'], parsed_bb['h'], parsed_bb['x'], parsed_bb['y'], width, height
-            )
-            parsed_snapped = _parse_crop_string_cropdetect(snapped_crop)
-            if parsed_snapped and parsed_snapped['w'] == width and parsed_snapped['h'] == height:
-                return None
-            else:
-                return snapped_crop
-        else:
+        return snapped_crop
+    crop_keys = [c["center"] for c in significant_clusters]
+    bounding_box_crop = _calculate_bounding_box_cropdetect(crop_keys)
+    if bounding_box_crop:
+        parsed_bb = _parse_crop_string_cropdetect(bounding_box_crop)
+        snapped_crop, ar_label = _snap_to_known_ar_cropdetect(
+            parsed_bb["w"], parsed_bb["h"], parsed_bb["x"], parsed_bb["y"], width, height
+        )
+        parsed_snapped = _parse_crop_string_cropdetect(snapped_crop)
+        if parsed_snapped and parsed_snapped["w"] == width and parsed_snapped["h"] == height:
             return None
+        return snapped_crop
+    return None
+
 
 def detect_autocrop_filter(input_file, significant_crop_threshold=5.0, min_crop=10, debug=False):
     if not _check_prerequisites_cropdetect():
         return None
     try:
         probe_duration_args = [
-            'ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1',
-            input_file
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            input_file,
         ]
         duration_str = subprocess.check_output(probe_duration_args, stderr=subprocess.STDOUT, text=True)
         duration = int(float(duration_str))
         probe_res_args = [
-            'ffprobe', '-v', 'error',
-            '-select_streams', 'v',
-            '-show_entries', 'stream=width,height,disposition',
-            '-of', 'json',
-            input_file
+            "ffprobe", "-v", "error",
+            "-select_streams", "v",
+            "-show_entries", "stream=width,height,disposition",
+            "-of", "json",
+            input_file,
         ]
         probe_output = subprocess.check_output(probe_res_args, stderr=subprocess.STDOUT, text=True)
         streams_data = json.loads(probe_output)
         video_stream = None
-        for stream in streams_data.get('streams', []):
-            if stream.get('disposition', {}).get('attached_pic', 0) == 0:
+        for stream in streams_data.get("streams", []):
+            if stream.get("disposition", {}).get("attached_pic", 0) == 0:
                 video_stream = stream
                 break
-        if not video_stream or 'width' not in video_stream or 'height' not in video_stream:
+        if not video_stream or "width" not in video_stream or "height" not in video_stream:
             return None
-        width = int(video_stream['width'])
-        height = int(video_stream['height'])
+        width = int(video_stream["width"])
+        height = int(video_stream["height"])
     except Exception:
         return None
-    return _analyze_video_cropdetect(input_file, duration, width, height, max(1, os.cpu_count() // 2), significant_crop_threshold, min_crop, debug)
+    return _analyze_video_cropdetect(
+        input_file, duration, width, height, max(1, os.cpu_count() // 2),
+        significant_crop_threshold, min_crop, debug,
+    )
 
-def main(no_downmix=False, autocrop=False, preset=None, grain=None, norm_i=None, norm_tp=None):
+
+def convert_video(
+    file_path,
+    is_vfr,
+    target_cfr_fps,
+    track,
+    autocrop_filter=None,
+    preset_override=None,
+    crf_override=None,
+    grain=None,
+    tune_override=None,
+):
+    print("  --- Starting Video Processing ---")
+    vpy_file = Path(f"{file_path.stem}.vpy")
+    encoded_video_file = Path(f"temp-{file_path.stem}.mkv")
+
+    prep_file, temp_files = prepare_av1an_input(file_path, is_vfr, target_cfr_fps, track)
+    temp_files.append(Path(f"{prep_file}.ffindex"))
+    temp_files.append(Path(f"{prep_file}.lwi"))
+    temp_files.append(vpy_file)
+    temp_files.append(encoded_video_file)
+
+    print("    - Indexing intermediate file with ffmsindex for VapourSynth...")
+    run_cmd(["ffmsindex", "-f", str(prep_file)])
+
+    prep_full_path = str(Path(prep_file).resolve())
+    matrix_in = vs_matrix_in(track)
+    vpy_lines = [
+        "import vapoursynth as vs",
+        "core = vs.core",
+        "core.num_threads = 4",
+        f"clip = core.ffms2.Source(source=r'''{prep_full_path}''')",
+    ]
+    if autocrop_filter:
+        crop_match = re.match(r"crop=(\d+):(\d+):(\d+):(\d+)", autocrop_filter)
+        if crop_match:
+            cw, ch, cx, cy = crop_match.groups()
+            vpy_lines.append(
+                f"clip = core.std.CropAbs(clip, width={cw}, height={ch}, left={cx}, top={cy})"
+            )
+            print(f"    - Applying autocrop in VapourSynth: CropAbs(width={cw}, height={ch}, left={cx}, top={cy})")
+    vpy_lines.extend([
+        f'clip = core.resize.Point(clip, format=vs.YUV420P10, matrix_in_s="{matrix_in}") # type: ignore',
+        "clip.set_output()",
+    ])
+    with vpy_file.open("w", encoding="utf-8") as f:
+        f.write("\n".join(vpy_lines) + "\n")
+
+    params = svt_params_for_track(
+        track,
+        preset_override=preset_override,
+        crf_override=crf_override,
+        grain=grain,
+        tune_override=tune_override,
+    )
+    av1an_video_params_str = av1an_svt_param_string(params)
+    workers, total_cores = av1an_worker_count()
+    tune = params["tune"]
+    print(f"    - Path: {path_label(track)}")
+    print(
+        f"    - Using {workers} workers for av1an "
+        f"(Total Cores: {total_cores}, Logic: (Cores/2)-1)."
+    )
+    print(
+        f"    - preset: {params['preset']}  crf: {params['crf']}  "
+        f"tune: {tune} ({TUNE_NAMES.get(tune, '?')})  "
+        f"matrix_in: {matrix_in}"
+    )
+    print(f"    - Using SVT-AV1 parameters: {av1an_video_params_str}")
+
+    if file_is_usable(encoded_video_file):
+        print(f"    - Reusing existing av1an output (resume): {encoded_video_file}")
+        print("  --- Finished Video Processing ---")
+        return encoded_video_file, temp_files
+
+    print("    - Starting AV1 encode with av1an (this will take a long time)...")
+    av1an_enc_args = [
+        "av1an", "-i", str(vpy_file), "-o", str(encoded_video_file), "-n",
+        "-e", "svt-av1", "--resume", "--sc-pix-format", "yuv420p", "-c", "mkvmerge",
+        "--set-thread-affinity", "2", "--pix-format", "yuv420p10le", "--force", "--no-defaults",
+        "-w", str(workers),
+        "-v", av1an_video_params_str,
+    ]
+    run_cmd(av1an_enc_args)
+    if not file_is_usable(encoded_video_file):
+        raise RuntimeError(f"av1an finished but output is missing or empty: {encoded_video_file}")
+    print("  --- Finished Video Processing ---")
+    return encoded_video_file, temp_files
+
+
+def is_ffmpeg_decodable(file_path):
+    try:
+        subprocess.run([
+            "ffmpeg", "-v", "error", "-i", str(file_path),
+            "-map", "0:v:0", "-t", "1", "-f", "null", "-",
+        ], check=True)
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
+def list_source_mkvs(current_dir):
+    return sorted(
+        f for f in current_dir.glob("*.mkv")
+        if not (
+            f.name.endswith(CFR_SUFFIX)
+            or f.name.endswith(CFR_FULL_SUFFIX)
+            or f.name.endswith(PREP_SUFFIX)
+            or f.name.endswith(".x264.mkv")
+            or f.name.endswith(".hevc.mkv")
+            or f.name.endswith(".ut.mkv")
+            or f.name.endswith(".cfr_temp.mkv")
+            or f.name.endswith("_xav.mkv")
+            or f.name.startswith("temp-")
+            or f.name.startswith("output-")
+        )
+    )
+
+
+def video_temp_files(current_dir, file_path, extra):
+    files = [
+        current_dir / f"{file_path.stem}{CFR_SUFFIX}",
+        current_dir / f"{file_path.stem}{CFR_FULL_SUFFIX}",
+        current_dir / f"{file_path.stem}{PREP_SUFFIX}",
+        current_dir / f"{file_path.stem}.vpy",
+        current_dir / f"{file_path.stem}.prep.mkv.ffindex",
+        current_dir / f"{file_path.stem}.prep.mkv.lwi",
+        current_dir / f"{file_path.stem}.ut.mkv",
+        current_dir / f"{file_path.stem}.ut.mkv.lwi",
+        current_dir / f"{file_path.stem}.ut.mkv.ffindex",
+        current_dir / f"{file_path.stem}.cfr_temp.mkv",
+        current_dir / f"temp-{file_path.stem}.mkv",
+        current_dir / f"output-{file_path.name}",
+        current_dir / f"{file_path.name}.ffindex",
+    ]
+    for path in current_dir.glob(f"{file_path.stem}*_scd.txt"):
+        if path not in files:
+            files.append(path)
+    for path in extra:
+        if path and path not in files:
+            files.append(path)
+    return files
+
+
+def main(no_downmix=False, autocrop=False, preset=None, crf=None, grain=None, tune=None, norm_i=None, norm_tp=None):
+    check_tools()
     global LOUDNESS_I, LOUDNESS_TP
     if norm_i is not None:
         LOUDNESS_I = norm_i
     if norm_tp is not None:
         LOUDNESS_TP = norm_tp
-    check_tools()
-
-    # Override default SVT-AV1 params if provided via command line
-    if preset is not None:
-        SVT_AV1_PARAMS["preset"] = preset
-    if grain is not None:
-        SVT_AV1_PARAMS["film-grain"] = grain
-
     current_dir = Path(".")
-    files_to_process = sorted(
-        f for f in current_dir.glob("*.mkv")
-        if not (f.name.endswith(".ut.mkv") or f.name.startswith("temp-") or f.name.startswith("output-") or f.name.endswith(".cfr_temp.mkv"))
-    )
-    if not files_to_process:
+    if not list_source_mkvs(current_dir):
         print("No MKV files found to process. Exiting.")
         return
     DIR_COMPLETED.mkdir(exist_ok=True, parents=True)
     DIR_ORIGINAL.mkdir(exist_ok=True, parents=True)
     DIR_CONV_LOGS.mkdir(exist_ok=True, parents=True)
+    DIR_FAILED.mkdir(exist_ok=True, parents=True)
+    failed_this_run = set()
+
     while True:
-        files_to_process = sorted(
-            f for f in current_dir.glob("*.mkv")
-            if not (f.name.endswith(".ut.mkv") or f.name.startswith("temp-") or f.name.startswith("output-") or f.name.endswith(".cfr_temp.mkv"))
-        )
+        files_to_process = [
+            f for f in list_source_mkvs(current_dir)
+            if f.resolve() not in failed_this_run
+        ]
         if not files_to_process:
             print("No more .mkv files found to process in the current directory. The script will now exit.")
             break
         file_path = files_to_process[0]
         if not is_ffmpeg_decodable(file_path):
-            print(f"ERROR: ffmpeg cannot decode '{file_path.name}'. Skipping this file.", file=sys.stderr)
+            print(f"ERROR: ffmpeg cannot decode video in '{file_path.name}'. Skipping this file.", file=sys.stderr)
             shutil.move(str(file_path), DIR_ORIGINAL / file_path.name)
             continue
+
         print("-" * shutil.get_terminal_size(fallback=(80, 24)).columns)
-        log_file_name = f"{file_path.stem}.log"
-        log_file_path = DIR_CONV_LOGS / log_file_name
+        log_file_path = DIR_CONV_LOGS / f"{file_path.stem}.log"
         original_stdout_console = sys.stdout
         original_stderr_console = sys.stderr
         print(f"Processing: {file_path.name}", file=original_stdout_console)
@@ -619,244 +1372,100 @@ def main(no_downmix=False, autocrop=False, preset=None, grain=None, norm_i=None,
         log_file_handle = None
         processing_error_occurred = False
         date_for_runtime_calc = datetime.now()
+        extra_temps = []
+        audio_temp_dir = None
         try:
-            log_file_handle = open(log_file_path, 'w', encoding='utf-8')
-            sys.stdout = log_file_handle
-            sys.stderr = log_file_handle
+            log_file_handle = open(log_file_path, "w", encoding="utf-8", buffering=1)
+            sys.stdout = Tee(log_file_handle, original_stdout_console)
+            sys.stderr = Tee(log_file_handle, original_stderr_console)
             print(f"STARTING LOG FOR: {file_path.name}")
             print(f"Processing started at: {date_for_runtime_calc}")
             print(f"Full input file path: {file_path.resolve()}")
             print("-" * shutil.get_terminal_size(fallback=(80, 24)).columns)
-            input_file_abs = file_path.resolve()
-            intermediate_output_file = current_dir / f"output-{file_path.name}"
-            audio_temp_dir = None
-            handbrake_intermediate_for_cleanup = None
-            try:
-                audio_temp_dir = tempfile.mkdtemp(prefix="anime_audio_")
+
+            print(f"Analyzing file: {file_path.resolve()}")
+            media_info = mediainfo_json(file_path)
+            track = video_track(media_info)
+            audio_meta, sub_meta = collect_track_meta(file_path)
+            is_vfr, target_cfr_fps = detect_vfr(media_info)
+
+            autocrop_filter = None
+            if autocrop:
+                print("--- Running autocrop detection ---")
+                autocrop_filter = detect_autocrop_filter(str(file_path.resolve()))
+                if autocrop_filter:
+                    print(f"    - Autocrop filter detected: {autocrop_filter}")
+                else:
+                    print("    - No crop needed or detected.")
+
+            encoded_video_file, extra_temps = convert_video(
+                file_path,
+                is_vfr,
+                target_cfr_fps,
+                track,
+                autocrop_filter=autocrop_filter,
+                preset_override=preset,
+                crf_override=crf,
+                grain=grain,
+                tune_override=tune,
+            )
+
+            muxed = Path(f"output-{file_path.name}")
+            extra_temps.append(muxed)
+            if file_is_usable(muxed):
+                print(f"    - Reusing remuxed output (resume): {muxed}")
+            else:
+                audio_temp_dir = tempfile.mkdtemp(prefix="audio_tmp_")
                 print(f"Audio temporary directory created at: {audio_temp_dir}")
-                print(f"Analyzing file: {input_file_abs}")
-                ffprobe_info_json = run_cmd([
-                    "ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", "-show_format", str(input_file_abs)
-                ], capture_output=True)
-                ffprobe_info = json.loads(ffprobe_info_json)
-                mkvmerge_info_json = run_cmd([
-                    "mkvmerge", "-J", str(input_file_abs)
-                ], capture_output=True)
-                mkv_info = json.loads(mkvmerge_info_json)
-                mediainfo_json = run_cmd([
-                    "mediainfo", "--Output=JSON", "-f", str(input_file_abs)
-                ], capture_output=True)
-                media_info = json.loads(mediainfo_json)
-                is_vfr = False
-                target_cfr_fps_for_handbrake = None
-                video_track_info = None
-                if media_info.get("media") and media_info["media"].get("track"):
-                    for track in media_info["media"]["track"]:
-                        if track.get("@type") == "Video":
-                            video_track_info = track
-                            break
-                if video_track_info:
-                    frame_rate_mode = video_track_info.get("FrameRate_Mode")
-                    if frame_rate_mode and frame_rate_mode.upper() in ["VFR", "VARIABLE"]:
-                        is_vfr = True
-                        print(f"    - Detected VFR based on MediaInfo FrameRate_Mode: {frame_rate_mode}")
-                        original_fps_str = video_track_info.get("FrameRate_Original_String")
-                        if original_fps_str:
-                            match = re.search(r'\((\d+/\d+)\)', original_fps_str)
-                            if match:
-                                target_cfr_fps_for_handbrake = match.group(1)
-                            else:
-                                target_cfr_fps_for_handbrake = video_track_info.get("FrameRate_Original")
-                        if not target_cfr_fps_for_handbrake:
-                            target_cfr_fps_for_handbrake = video_track_info.get("FrameRate_Original")
-                        if not target_cfr_fps_for_handbrake:
-                            target_cfr_fps_for_handbrake = video_track_info.get("FrameRate")
-                            if target_cfr_fps_for_handbrake:
-                                print(f"    - Using MediaInfo FrameRate ({target_cfr_fps_for_handbrake}) as fallback for HandBrake target FPS.")
-                        if target_cfr_fps_for_handbrake:
-                            print(f"    - Target CFR for HandBrake: {target_cfr_fps_for_handbrake}")
-                            if isinstance(target_cfr_fps_for_handbrake, str) and "/" in target_cfr_fps_for_handbrake:
-                                try:
-                                    num, den = map(float, target_cfr_fps_for_handbrake.split('/'))
-                                    target_cfr_fps_for_handbrake = f"{num / den:.3f}"
-                                    print(f"    - Converted fractional FPS to decimal for HandBrake: {target_cfr_fps_for_handbrake}")
-                                except ValueError:
-                                    print(f"    - Warning: Could not parse fractional FPS '{target_cfr_fps_for_handbrake}'. HandBrakeCLI might fail.")
-                                    is_vfr = False
-                        else:
-                            print("    - Warning: VFR detected, but could not determine target CFR from MediaInfo. Will attempt standard UTVideo conversion without HandBrake.")
-                            is_vfr = False
-                    else:
-                        print(f"    - Video appears to be CFR or FrameRate_Mode not specified as VFR/Variable by MediaInfo.")
-                autocrop_filter = None
-                if autocrop:
-                    print("--- Running autocrop detection ---")
-                    autocrop_filter = detect_autocrop_filter(str(input_file_abs))
-                    if autocrop_filter:
-                        print(f"    - Autocrop filter detected: {autocrop_filter}")
-                    else:
-                        print("    - No crop needed or detected.")
-                encoded_video_file, handbrake_intermediate_for_cleanup = convert_video(
-                    file_path.stem, str(input_file_abs), is_vfr, target_cfr_fps_for_handbrake, autocrop_filter=autocrop_filter
-                )
+                audio_plan = process_audio_tracks(file_path, audio_temp_dir, no_downmix)
+                mux_final(muxed, encoded_video_file, file_path, audio_plan)
 
-                print("--- Starting Audio Processing ---")
-                processed_audio_files = []
-                audio_tracks_to_remux = []
-                audio_streams = [s for s in ffprobe_info.get("streams", []) if s.get("codec_type") == "audio"]
+            strip_titles(muxed)
+            restore_track_meta(muxed, audio_meta, sub_meta)
 
-                # Build mkvmerge track mapping by track ID
-                mkv_audio_tracks = {t["id"]: t for t in mkv_info.get("tracks", []) if t.get("type") == "audio"}
+            print("Moving files to final destinations...")
+            shutil.move(str(file_path), DIR_ORIGINAL / file_path.name)
+            shutil.move(str(muxed), DIR_COMPLETED / file_path.name)
 
-                # Build mediainfo track mapping by StreamOrder
-                media_tracks_data = media_info.get("media", {}).get("track", [])
-                mediainfo_audio_tracks = {int(t.get("StreamOrder", -1)): t for t in media_tracks_data if t.get("@type") == "Audio"}
+            print("Cleaning up temporary files (after successful processing)...")
+            for temp_vid_file in video_temp_files(current_dir, file_path, extra_temps):
+                if temp_vid_file.exists() and temp_vid_file.resolve() != (DIR_COMPLETED / file_path.name).resolve():
+                    print(f"    Deleting: {temp_vid_file}")
+                    temp_vid_file.unlink(missing_ok=True)
 
-                for stream in audio_streams:
-                    stream_index = stream["index"]
-                    codec = stream.get("codec_name")
-                    channels = stream.get("channels", 2)
-                    language = stream.get("tags", {}).get("language", "und")
-
-                    # Find mkvmerge track by matching ffprobe stream index to mkvmerge track's 'properties'->'stream_id'
-                    mkv_track = None
-                    for t in mkv_info.get("tracks", []):
-                        if t.get("type") == "audio" and t.get("properties", {}).get("stream_id") == stream_index:
-                            mkv_track = t
-                            break
-                    if not mkv_track:
-                        # Fallback: try by position
-                        mkv_track = mkv_info.get("tracks", [])[stream_index] if stream_index < len(mkv_info.get("tracks", [])) else {}
-
-                    track_id = mkv_track.get("id", -1)
-                    track_title = mkv_track.get("properties", {}).get("track_name", "")
-
-                    # Find mediainfo track by StreamOrder
-                    audio_track_info = mediainfo_audio_tracks.get(stream_index)
-                    track_delay = 0
-                    delay_raw = audio_track_info.get("Video_Delay") if audio_track_info else None
-                    if delay_raw is not None:
-                        try:
-                            delay_val = float(delay_raw)
-                            # If the value is a float < 1, it's seconds, so convert to ms.
-                            if delay_val < 1:
-                                track_delay = int(round(delay_val * 1000))
-                            else:
-                                track_delay = int(round(delay_val))
-                        except Exception:
-                            track_delay = 0
-
-                    print(f"Processing Audio Stream #{stream_index} (TID: {track_id}, Codec: {codec}, Channels: {channels})")
-                    if codec in REMUX_CODECS:
-                        audio_tracks_to_remux.append(str(track_id))
-                    else:
-                        # Convert any codec that is not in REMUX_CODECS
-                        opus_file = convert_audio_track(
-                            stream_index, channels, audio_temp_dir, str(input_file_abs), not no_downmix
-                        )
-                        processed_audio_files.append({
-                            "Path": opus_file,
-                            "Language": language,
-                            "Title": track_title,
-                            "Delay": track_delay
-                        })
-
-                print("--- Finished Audio Processing ---")
-
-                # Final mux
-                print("Assembling final file with mkvmerge...")
-                mkvmerge_args = ["mkvmerge", "-o", str(intermediate_output_file), str(encoded_video_file)]
-                for file_info in processed_audio_files:
-                    sync_switch = ["--sync", f"0:{file_info['Delay']}"] if file_info["Delay"] else []
-                    mkvmerge_args += [
-                        "--language", f"0:{file_info['Language']}",
-                        "--track-name", f"0:{file_info['Title']}"
-                    ] + sync_switch + [str(file_info["Path"])]
-
-                source_copy_args = ["--no-video"]
-                if audio_tracks_to_remux:
-                    source_copy_args += ["--audio-tracks", ",".join(audio_tracks_to_remux)]
-                else:
-                    source_copy_args += ["--no-audio"]
-                mkvmerge_args += source_copy_args + [str(input_file_abs)]
-                run_cmd(mkvmerge_args)
-
-                # Move files
-                print("Moving files to final destinations...")
-                shutil.move(str(file_path), DIR_ORIGINAL / file_path.name)
-                shutil.move(str(intermediate_output_file), DIR_COMPLETED / file_path.name)
-
-                print("Cleaning up persistent video temporary files (after successful processing)...")
-                video_temp_files_on_success = [
-                    current_dir / f"{file_path.stem}.vpy",
-                    current_dir / f"{file_path.stem}.ut.mkv",
-                    current_dir / f"temp-{file_path.stem}.mkv", # This is encoded_video_file
-                    current_dir / f"{file_path.stem}.ut.mkv.lwi", 
-                    current_dir / f"{file_path.stem}.ut.mkv.ffindex",
-                ]
-                if handbrake_intermediate_for_cleanup and handbrake_intermediate_for_cleanup.exists():
-                    video_temp_files_on_success.append(handbrake_intermediate_for_cleanup)
-                
-                for temp_vid_file in video_temp_files_on_success:
-                    if temp_vid_file.exists():
-                        print(f"    Deleting: {temp_vid_file}")
-                        temp_vid_file.unlink(missing_ok=True)
-                    else:
-                        print(f"    Skipping (not found): {temp_vid_file}")
-
-            except Exception as e:
-                print(f"ERROR: An error occurred while processing '{file_path.name}': {e}", file=sys.stderr) # Goes to log
-                original_stderr_console.write(f"ERROR during processing of '{file_path.name}': {e}\nSee log '{log_file_path}' for details.\n")
-                processing_error_occurred = True
-            finally:
-                # This is the original 'finally' block. Its prints go to the log file.
-                print("--- Starting Universal Cleanup (for this file) ---")
-                print("  - Cleaning up disposable audio temporary directory...")
-                if audio_temp_dir and Path(audio_temp_dir).exists():
-                    shutil.rmtree(audio_temp_dir, ignore_errors=True)
-                    print(f"    - Deleted audio temp dir: {audio_temp_dir}")
-                elif audio_temp_dir: # Was created but now not found
-                    print(f"    - Audio temp dir not found or already cleaned: {audio_temp_dir}")
-                else: # Was never created
-                    print(f"    - Audio temp dir was not created.")
-                
-                print("  - Cleaning up intermediate output file (if it wasn't moved on success)...")
-                if intermediate_output_file.exists(): # Check if it still exists (e.g. error before move)
-                    if processing_error_occurred:
-                        print(f"    - WARNING: Processing error occurred. Intermediate output file '{intermediate_output_file}' is being preserved at its original path for inspection.")
-                    else:
-                        # No processing error, so it should have been moved.
-                        # If it's still here, it's unexpected but we'll clean it up.
-                        print(f"    - INFO: Intermediate output file '{intermediate_output_file}' found at original path despite no errors (expected to be moved). Cleaning up.")
-                        intermediate_output_file.unlink(missing_ok=True) # Only unlink if no error and it exists
-                        print(f"    - Deleted intermediate output file from original path: {intermediate_output_file}")
-                else:
-                    # File does not exist at original path
-                    if not processing_error_occurred:
-                        print(f"    - Intermediate output file successfully moved (not found at original path, as expected): {intermediate_output_file}")
-                    else:
-                        print(f"    - Processing error occurred, and intermediate output file '{intermediate_output_file}' not found at original path (likely not created or cleaned by another step).")
-            # --- End of original per-file processing block ---
-
-            print(f"FINISHED LOG FOR: {file_path.name}")
-            # --- End of log-specific messages ---
-
-        finally: # Outer finally for restoring stdout/stderr and closing log file
+        except Exception as e:
+            print(f"ERROR: An error occurred while processing '{file_path.name}': {e}", file=sys.stderr)
+            original_stderr_console.write(
+                f"ERROR during processing of '{file_path.name}': {e}\nSee log '{log_file_path}' for details.\n"
+            )
+            processing_error_occurred = True
+        finally:
+            if audio_temp_dir and Path(audio_temp_dir).exists():
+                shutil.rmtree(audio_temp_dir, ignore_errors=True)
             runtime = datetime.now() - date_for_runtime_calc
-            runtime_str = str(runtime).split('.')[0]
-            
-            # This print goes to the log file, as stdout is not yet restored.
+            runtime_str = str(runtime).split(".")[0]
+            print(f"FINISHED LOG FOR: {file_path.name}")
             print(f"\nTotal runtime for this file: {runtime_str}")
-            
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+            except Exception:
+                pass
             if sys.stdout != original_stdout_console:
                 sys.stdout = original_stdout_console
             if sys.stderr != original_stderr_console:
                 sys.stderr = original_stderr_console
             if log_file_handle:
                 log_file_handle.close()
-            
-            # Announce to console (original stdout/stderr) that this file is done
+
             if processing_error_occurred:
+                failed_this_run.add(file_path.resolve())
+                if file_path.exists():
+                    failed_dest = DIR_FAILED / file_path.name
+                    shutil.move(str(file_path), failed_dest)
+                    original_stderr_console.write(
+                        f"Moved to {failed_dest}. Intermediates were kept so a retry can resume.\n"
+                    )
                 original_stderr_console.write(f"File: {file_path.name}\n")
                 original_stderr_console.write(f"Log: {log_file_path}\n")
                 original_stderr_console.write(f"Runtime: {runtime_str}\n")
@@ -865,14 +1474,76 @@ def main(no_downmix=False, autocrop=False, preset=None, grain=None, norm_i=None,
                 original_stdout_console.write(f"Log: {log_file_path}\n")
                 original_stdout_console.write(f"Runtime: {runtime_str}\n")
 
+
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Batch-process MKV files with resumable video encoding, audio downmixing, per-file logging, and optional autocrop.")
-    parser.add_argument("--no-downmix", action="store_true", help="Preserve original audio channel layout.")
-    parser.add_argument("--autocrop", action="store_true", help="Automatically detect and crop black bars from video using cropdetect.")
-    parser.add_argument("--preset", type=int, help=f"Set the encoding preset. Lower is slower/better compression. (default: {SVT_AV1_PARAMS['preset']})")
-    parser.add_argument("--grain", type=int, help="Set the film-grain value (number). Adjusts the film grain synthesis level. (If omitted, grain synthesis is disabled.)")
-    parser.add_argument("--norm-i", type=float, help=f"Target integrated loudness in LUFS (default: {LOUDNESS_I})")
-    parser.add_argument("--norm-tp", type=float, help=f"True-peak ceiling in dBTP (default: {LOUDNESS_TP})")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Batch-process MKV files with av1an + SVT-AV1-Essential. "
+            "Auto-detects SDR/HDR and 1080p/4K. Audio is LUFS/Opus or AAC remux; "
+            "final mkvmerge is this script."
+        )
+    )
+    parser.add_argument(
+        "--no-downmix",
+        action="store_true",
+        help="Keep surround on re-encoded tracks (no Nightmode Dialogue pan). AAC/Opus are always remuxed.",
+    )
+    parser.add_argument(
+        "--autocrop",
+        action="store_true",
+        help="Automatically detect and crop black bars from video using cropdetect.",
+    )
+    parser.add_argument(
+        "--preset",
+        type=int,
+        default=None,
+        help=(
+            f"Override SVT-AV1 preset. Default: {PRESET_1080} if height<={HEIGHT_4K} and SDR, "
+            f"else {PRESET_4K}."
+        ),
+    )
+    parser.add_argument(
+        "--crf",
+        type=int,
+        default=None,
+        help=f"Override SVT-AV1 CRF. Default: {DEFAULT_CRF} for all resolutions (SDR and HDR).",
+    )
+    parser.add_argument(
+        "--grain",
+        type=int,
+        help="Set the film-grain value (number). Adjusts the film grain synthesis level. (If omitted, grain synthesis is disabled.)",
+    )
+    parser.add_argument(
+        "--tune",
+        type=int,
+        choices=sorted(TUNE_NAMES),
+        default=None,
+        help=(
+            "SVT-AV1-Essential --tune: optimize the encoding process for different desired outcomes "
+            "[0 = VQ, 1 = PSNR, 2 = SSIM, 3 = IQ (Image Quality), 4 = MS_SSIM] "
+            f"(default: {DEFAULT_TUNE} = {TUNE_NAMES[DEFAULT_TUNE]})."
+        ),
+    )
+    parser.add_argument(
+        "--norm-i",
+        type=float,
+        default=None,
+        help=f"Target integrated loudness in LUFS (default: {LOUDNESS_I}).",
+    )
+    parser.add_argument(
+        "--norm-tp",
+        type=float,
+        default=None,
+        help=f"True-peak ceiling in dBTP (default: {LOUDNESS_TP}).",
+    )
     args = parser.parse_args()
-    main(no_downmix=args.no_downmix, autocrop=args.autocrop, preset=args.preset, grain=args.grain, norm_i=args.norm_i, norm_tp=args.norm_tp)
+    main(
+        no_downmix=args.no_downmix,
+        autocrop=args.autocrop,
+        preset=args.preset,
+        crf=args.crf,
+        grain=args.grain,
+        tune=args.tune,
+        norm_i=args.norm_i,
+        norm_tp=args.norm_tp,
+    )

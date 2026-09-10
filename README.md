@@ -6,15 +6,12 @@ This repository contains Python scripts for batch-processing MKV files to encode
 ## Scripts Overview
 
 *   **`aom_opus_encoder.py`**: Uses the `aom` encoder (specifically designed for the `aom-psy101` fork) via `av1an`. It is tuned for high perceptual quality with specific psychovisual parameters and optional film grain synthesis. All sources now get a HandBrakeCLI CFR intermediate (with ffmpeg as fallback) instead of a UTVideo pass.
-*   **`svt_opus_encoder.py`**: Uses the `svt-av1` encoder (specifically designed for the `SVT-AV1-Essential` fork) via `av1an`. It provides a good balance between encoding speed and quality, and allows customization of preset and film-grain from the command line.
-*   **`hdr_svt_opus_encoder.py`**: A specialized script for 4K HDR movies using the `SVT-AV1-Essential` encoder. It is designed for pre-processed CFR inputs, preserves original surround sound audio without downmixing, and retains HDR metadata.
+*   **`svt_opus_encoder.py`**: Uses the `svt-av1` encoder (specifically designed for the `SVT-AV1-Essential` fork) via `av1an`. Auto-detects SDR vs HDR and 1080p vs 4K, then selects the matching intermediate, VapourSynth matrix, and SVT color/preset settings. Av1an worker count is `(cpu_count // 2) - 1`.
 *   **`xav_automation.py`**: Uses the `xav` chunking encoder and `svt-av1` (SVT-AV1-Essential) instead of `av1an`. Features native autocrop, scene-detect, and chunking. Automatically selects intermediate encoder based on resolution and HDR status.
 
 ## Encoding Parameters Documentation
 
-For detailed information on the specific FFmpeg arguments, audio downmixing logic, VFR-to-CFR conversion processes, and the special SVT-AV1, AomEnc, and xav parameters used by the standard scripts, please refer to the [`parameters.md`](parameters.md) file.
-
-For the HDR-specific encoder parameters and settings used in `hdr_svt_opus_encoder.py`, please see [`parameters_hdr.md`](parameters_hdr.md).
+For detailed information on the specific FFmpeg arguments, audio downmixing logic, VFR-to-CFR conversion processes, and the special SVT-AV1, AomEnc, and xav parameters used by the scripts, please refer to the [`parameters.md`](parameters.md) file.
 
 ## Prerequisites
 
@@ -25,7 +22,7 @@ The scripts require several external tools to be installed and available in your
 *   **opusenc** (opus-tools): For encoding audio tracks to the Opus codec.
 *   **mediainfo**: For extracting detailed media information (especially frame rate details).
 *   **av1an**: The core chunking encoder used to run multiple encode workers in parallel.
-*   **HandBrakeCLI**: Used as a CFR pre-processor to create a constant-frame-rate video intermediate before the main encode (all sources for `xav_automation.py` and `aom_opus_encoder.py`; VFR sources only for `svt_opus_encoder.py`).
+*   **HandBrakeCLI**: Used as a CFR pre-processor to create a constant-frame-rate video intermediate before the main encode (all 1080p SDR sources for `svt_opus_encoder.py`, `xav_automation.py`, and `aom_opus_encoder.py`).
 *   **ffmsindex** (ffms2): For indexing the video intermediate for Vapoursynth.
 *   **Vapoursynth**: Required by `av1an` as the frame server via the generated `.vpy` scripts.
 *   *(Specific to `aom_opus_encoder.py`)*: **aom-psy101** encoder. You must download the correct version from [Damian101's aom-psy101 GitLab](https://gitlab.com/damian101/aom-psy101).
@@ -43,12 +40,12 @@ The scripts require several external tools to be installed and available in your
     *   Encodes to Opus with bitrates automatically chosen based on the channel count (e.g., 128k for Stereo, 256k for 5.1).
     *   Directly remuxes existing `aac` or `opus` tracks without re-encoding.
     *   Preserves track languages, titles, flags, and delays.
-*   **VFR to CFR Conversion**: Detects Variable Frame Rate (VFR) media and automatically converts it to Constant Frame Rate (CFR) using HandBrakeCLI (virtually lossless CRF 0 intermediate) to prevent audio desync issues. `xav_automation.py` and `aom_opus_encoder.py` create a HandBrakeCLI intermediate for all sources (with ffmpeg as fallback); `svt_opus_encoder.py` converts only detected VFR sources. `xav_automation.py` selects the intermediate encoder automatically based on resolution/HDR (x264 for ≤1080p SDR, x265 for >1080p or HDR).
-*   **Automatic Cropping**: Optional `--autocrop` flag detects black bars and determines the optimal cropping parameters before encoding (in `svt_opus_encoder.py`). `xav_automation.py` relies on xav's native autocrop.
+*   **VFR to CFR Conversion**: Detects Variable Frame Rate (VFR) media and automatically converts it to Constant Frame Rate (CFR) using HandBrakeCLI (virtually lossless CRF 0 intermediate) to prevent audio desync issues. `svt_opus_encoder.py` and `xav_automation.py` select the intermediate automatically based on resolution/HDR: x264 all-intra for ≤1080p SDR, mkvmerge video-only remux for 4K/HDR CFR (keeps HDR/DoVi metadata), HandBrake `x265_10bit` for VFR 4K/HDR, ffmpeg as fallback. `aom_opus_encoder.py` creates a HandBrakeCLI intermediate for all sources (1080p SDR only).
+*   **Automatic Cropping**: Optional `--autocrop` flag detects black bars and applies the crop in VapourSynth before encoding (in `svt_opus_encoder.py` and `aom_opus_encoder.py`). `xav_automation.py` relies on xav's native autocrop.
 *   **Organized Output**: 
     *   Completed files are moved to a `completed/` directory.
     *   Original files are moved to an `original/` directory.
-    *   Failed files are moved to a `failed/` directory (in `xav_automation.py`), preserving intermediates for retry.
+    *   Failed files are moved to a `failed/` directory (in `svt_opus_encoder.py` and `xav_automation.py`), preserving intermediates for retry.
     *   Per-file processing logs are saved in a `conv_logs/` directory.
     *   Temporary files are automatically cleaned up upon success.
 
@@ -81,24 +78,18 @@ svt_opus_encoder.py [options]
 **Options:**
 *   `--no-downmix`: Preserve original audio channel layout (do not downmix 5.1/7.1 to stereo).
 *   `--autocrop`: Automatically detect and crop black bars from the video.
-*   `--preset <int>`: Set the SVT-AV1 encoding speed preset (e.g., 0-13). Lower is slower and yields better compression. Defaults to 1.
+*   `--preset <int>`: Override SVT-AV1 preset. Default: 1 if height ≤1080 and SDR, else 2.
+*   `--crf <int>`: Override SVT-AV1 CRF. Default: 30 for all resolutions (SDR and HDR).
 *   `--grain <int>`: Set the `film-grain` value. Adjusts the film grain synthesis level. Disabled by default.
+*   `--tune <int>`: SVT-AV1-Essential `--tune` mode: 0=VQ, 1=PSNR, 2=SSIM, 3=IQ, 4=MS_SSIM (default: 2 = SSIM).
 *   `--norm-i <float>`: Target integrated loudness in LUFS (default: -16.0).
 *   `--norm-tp <float>`: True-peak ceiling in dBTP (default: -1.5).
 
-### `hdr_svt_opus_encoder.py`
-
-```bash
-hdr_svt_opus_encoder.py [options]
-```
-
-**Options:**
-*   `--no-downmix`: Preserve original audio channel layout (do not downmix 5.1/7.1 to stereo).
-*   `--preset <int>`: Set the SVT-AV1 encoding speed preset (e.g., 0-13). Lower is slower and yields better compression. Defaults to 2.
-*   `--crf <int>`: Set the SVT-AV1 Constant Rate Factor (CRF) for video quality (e.g., 0-63). Lower is better quality. Defaults to 30.
-*   `--grain <int>`: Set the `film-grain` value. Adjusts the film grain synthesis level. Disabled by default.
-*   `--norm-i <float>`: Target integrated loudness in LUFS (default: -16.0).
-*   `--norm-tp <float>`: True-peak ceiling in dBTP (default: -1.5).
+**Workflow specific to `svt_opus_encoder.py`:**
+1. **Detection**: MediaInfo HDR format/transfer (PQ/HLG/DoVi) and height `>1080` choose the encode path. 10-bit BT.709 Hi10p stays SDR.
+2. **Video Preparation**: ≤1080p SDR gets a HandBrake x264 all-intra CFR intermediate. 4K/HDR CFR is an mkvmerge video-only remux. VFR 4K/HDR uses HandBrake `x265_10bit`. ffmpeg is a fallback. The prep file is indexed with `ffmsindex` and fed to VapourSynth (`709` for SDR, `2020ncl` for HDR).
+3. **Video Encode**: `av1an` + SVT-AV1-Essential. Workers are `(cpu_count // 2) - 1`. CRF is always 30 unless `--crf` is set. HDR sets BT.2020 / PQ (or HLG) color metadata.
+4. **Audio / Remux / Failures**: Same as `xav_automation.py` (ordered AAC/Opus remux or LUFS→Opus, restore track titles/flags, move failures to `failed/`).
 
 ### `xav_automation.py`
 
@@ -125,7 +116,7 @@ xav_automation.py [options]
 2.  **Analysis**: Examines video and audio tracks using `ffprobe` and `mediainfo`.
 3.  **Video Processing**:
     *   Runs crop detection (if `--autocrop` is enabled).
-    *   Creates a CFR video intermediate via HandBrakeCLI (all sources for `xav_automation.py` and `aom_opus_encoder.py`; VFR sources only for `svt_opus_encoder.py`), with ffmpeg as a fallback. The intermediate encoder is auto-selected based on resolution/HDR where applicable.
+    *   Creates a CFR video intermediate (HandBrakeCLI for ≤1080p SDR; mkvmerge video-only remux for 4K/HDR CFR in `svt_opus_encoder.py` and `xav_automation.py`), with ffmpeg as a fallback. The intermediate encoder is auto-selected based on resolution/HDR where applicable.
     *   Encodes the video using `av1an` (or `xav` for `xav_automation.py`).
 4.  **Audio Processing**:
     *   Remuxes AAC/Opus.

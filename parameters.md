@@ -46,23 +46,14 @@ When preserving the original channel layout (no downmixing) or if the source is 
 
 ### `svt_opus_encoder.py`
 
-To handle Variable Frame Rate (VFR) sources reliably before UTVideo intermediate generation, `HandBrakeCLI` is used to convert them to Constant Frame Rate (CFR). Only detected VFR sources are converted; CFR sources skip this step.
+`svt_opus_encoder.py` uses the same intermediate strategy as `xav_automation.py` (no UTVideo pass). The prep file is indexed with `ffmsindex` and fed to VapourSynth / av1an:
 
-The exact HandBrakeCLI arguments used:
-```text
-HandBrakeCLI \
-  --input <source_file> \
-  --output <intermediate_cfr_file> \
-  --cfr \
-  --rate <target_cfr_fps> \
-  --encoder x264_10bit \
-  --quality 0 \
-  --encoder-preset superfast \
-  --encoder-tune fastdecode \
-  --audio none \
-  --subtitle none \
-  --crop-mode none
-```
+- **≤1080p SDR (8-bit)**: HandBrakeCLI `x264` CRF 0, all-intra (`keyint=1:bframes=0`)
+- **≤1080p SDR (10-bit / Hi10p)**: HandBrakeCLI `x264_10bit` CRF 0, all-intra
+- **>1080p or HDR, CFR**: mkvmerge video-only remux (no re-encode; keeps HDR10/DoVi track properties)
+- **>1080p or HDR, VFR**: HandBrakeCLI `x265_10bit` CRF 0, normal GOP
+
+If HandBrakeCLI fails or cannot determine the frame rate, ffmpeg is used as a fallback with equivalent settings (forced CFR via `-fps_mode cfr`).
 
 ### `aom_opus_encoder.py`
 
@@ -126,21 +117,24 @@ Parameters parsed to the `aom` encoder:
 ### SVT-AV1 (SVT-AV1-Essential)
 > **Special Version Repository**: [https://github.com/nekotrix/SVT-AV1-Essential/](https://github.com/nekotrix/SVT-AV1-Essential/)
 
-Parameters initialized for the `svt-av1` encoder (as used in `svt_opus_encoder.py`):
+Parameters initialized for the `svt-av1` encoder (as used in `svt_opus_encoder.py`). Color metadata and preset are chosen per file from MediaInfo (SDR vs HDR, height ≤1080 vs 4K). CRF is always `30` unless `--crf` is passed, so Essential does not apply `--quality medium` (CRF 35) above 1080p.
 
-| Parameter | Value | Description |
-| :--- | :--- | :--- |
-| `--preset` | `1` | Speed preset. Lower is slower and yields better compression efficiency. |
-| `--color-primaries` | `1` | BT.709 color primaries (Standard SDR). |
-| `--transfer-characteristics`| `1` | BT.709 transfer characteristics (Standard SDR). |
-| `--matrix-coefficients` | `1` | BT.709 matrix coefficients (Standard SDR). |
-| `--scd` | `0` | Scene change detection OFF (av1an handles scene cuts). |
-| `--scm` | `0` | Screen content detection OFF (0: off, 1: on, 2: content adaptive). |
-| `--keyint` | `0` | Keyframe interval OFF (av1an inserts keyframes). |
-| `--auto-tiling` | `1` | Automatically determine the number of tiles based on resolution. |
-| `--progress` | `2` | Detailed progress output. |
+| Parameter | SDR | HDR (PQ) | HDR (HLG) | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `--preset` | `1` (≤1080p) / `2` (>1080p) | `2` | `2` | Speed preset. Lower is slower and yields better compression efficiency. |
+| `--crf` | `30` | `30` | `30` | Constant Rate Factor. Always passed. |
+| `--color-primaries` | `1` (BT.709) | `9` (BT.2020) | `9` (BT.2020) | Color primaries. |
+| `--transfer-characteristics` | `1` (BT.709) | `16` (PQ / SMPTE 2084) | `18` (HLG) | Transfer characteristics. |
+| `--matrix-coefficients` | `1` (BT.709) | `9` (BT.2020 NCL) | `9` (BT.2020 NCL) | Matrix coefficients. VapourSynth uses `matrix_in_s="709"` or `"2020ncl"` to match. |
+| `--scd` | `0` | `0` | `0` | Scene change detection OFF (av1an handles scene cuts). |
+| `--scm` | `0` | `0` | `0` | Screen content detection OFF (0: off, 1: on, 2: content adaptive). |
+| `--keyint` | `0` | `0` | `0` | Keyframe interval OFF (av1an inserts keyframes). |
+| `--lp` | `2` | `2` | `2` | Logical processors per av1an worker (matches `--set-thread-affinity 2`). |
+| `--auto-tiling` | `1` | `1` | `1` | Automatically determine the number of tiles based on resolution. |
+| `--tune` | `2` | `2` | `2` | SVT-AV1-Essential tune: 0=VQ, 1=PSNR, 2=SSIM, 3=IQ, 4=MS_SSIM. |
+| `--progress` | `2` | `2` | `2` | Detailed progress output. |
 
-*(Note: `--preset` can be overridden when executing the script. Grain synthesis (`--film-grain`) is omitted by default unless `--grain` is provided. CRF is not set in the default params and must be provided via the chunking encoder.)*
+*(Note: `--preset`, `--crf`, and `--tune` can be overridden when executing the script. Grain synthesis (`--film-grain`) is omitted by default unless `--grain` is provided. Dolby Vision sources are encoded as HDR10/HLG AV1; Av1an/SVT does not emit a DoVi RPU.)*
 
 ### SVT-AV1 via xav (SVT-AV1-Essential)
 
@@ -189,6 +183,8 @@ av1an -i <vpy_script> -o <encoded_mkv> -n \
   -w <calculated_workers> \
   -v "<svt_av1_encoder_parameters_above>"
 ```
+
+`<calculated_workers>` is `(cpu_count // 2) - 1` (minimum 1), not a fixed worker count.
 
 ### xav (SVT-AV1)
 Arguments used to start `xav` using the SVT-AV1 encoder (as used in `xav_automation.py`):
