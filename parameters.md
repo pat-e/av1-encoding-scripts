@@ -57,10 +57,12 @@ If HandBrakeCLI fails or cannot determine the frame rate, ffmpeg is used as a fa
 
 ### `aom_opus_encoder.py`
 
-`aom_opus_encoder.py` creates a HandBrakeCLI CFR intermediate for **all** sources (both VFR and CFR), replacing the previous UTVideo pass. The intermediate is indexed with `ffmsindex` and fed directly to VapourSynth. The intermediate encoder is selected based on bit depth (1080p SDR only — no HEVC/HDR path):
+`aom_opus_encoder.py` uses the same intermediate strategy as `svt_opus_encoder.py`. The prep file is indexed with `ffmsindex` and fed to VapourSynth / av1an:
 
-- **8-bit SDR**: `x264` CRF 0, all-intra (`keyint=1:bframes=0`)
-- **10-bit SDR (Hi10p)**: `x264_10bit` CRF 0, all-intra (`keyint=1:bframes=0`)
+- **≤1080p SDR (8-bit)**: HandBrakeCLI `x264` CRF 0, all-intra (`keyint=1:bframes=0`)
+- **≤1080p SDR (10-bit / Hi10p)**: HandBrakeCLI `x264_10bit` CRF 0, all-intra
+- **>1080p or HDR, CFR**: mkvmerge video-only remux (no re-encode; keeps HDR10/DoVi track properties)
+- **>1080p or HDR, VFR**: HandBrakeCLI `x265_10bit` CRF 0, normal GOP
 
 If HandBrakeCLI fails or cannot determine the frame rate, ffmpeg is used as a fallback with equivalent settings (forced CFR via `-fps_mode cfr`).
 
@@ -87,7 +89,7 @@ Parameters parsed to the `aom` encoder:
 | `--cpu-used` | `2` | Speed preset. Lower is slower/better quality. 4 is default, 2 is slow/high quality |
 | `--good` | *(flag)* | Good quality mode (deadline preset) |
 | `--end-usage` | `q` | Constant Quality mode |
-| `--cq-level` | `24` | The target quality level (0-63). Lower is better quality/larger file |
+| `--cq-level` | `25` | The target quality level (0-63). Lower is better quality/larger file. Always passed. |
 | `--min-q` | `8` | Minimum allowable quantizer to prevent bitrate spikes on flat frames |
 | `--threads` | `2` | Threads per av1an worker |
 | `--tune-content` | `psy` | Specialized tuning for psychovisual quality (needs aom-psy101) |
@@ -108,11 +110,11 @@ Parameters parsed to the `aom` encoder:
 | `--enable-chroma-deltaq` | `1` | Enable chroma quantization adjustment |
 | `--enable-qm` | `1` | Enable quantization matrices for better high-frequency detail retention |
 | `--lag-in-frames` | `64` | Max lookahead buffer (default is 19, max is 64) for improved temporal filtering and rate control |
-| `--color-primaries` | `bt709` | Standard SDR color space |
-| `--transfer-characteristics`| `bt709` | Standard SDR transfer characteristics |
-| `--matrix-coefficients` | `bt709` | Standard SDR matrix coefficients |
+| `--color-primaries` | `bt709` (SDR) / `bt2020` (HDR) | Color primaries |
+| `--transfer-characteristics`| `bt709` (SDR) / `smpte2084` (PQ) / `arib-std-b67` (HLG) | Transfer characteristics |
+| `--matrix-coefficients` | `bt709` (SDR) / `bt2020ncl` (HDR) | Matrix coefficients. VapourSynth uses `matrix_in_s="709"` or `"2020ncl"` to match. |
 
-*(Note: `--cq-level` dynamically defaults to `24` but can be overwritten when executing the script via the `--crf` argument. `--photon-noise` is omitted by default unless `--grain` is provided.)*
+*(Note: `--cq-level` defaults to `25` for all resolutions and can be overwritten via `--crf`. `--photon-noise` is omitted by default unless `--grain` is provided. Dolby Vision sources are encoded as HDR10/HLG AV1; Av1an/aom does not emit a DoVi RPU.)*
 
 ### SVT-AV1 (SVT-AV1-Essential)
 > **Special Version Repository**: [https://github.com/nekotrix/SVT-AV1-Essential/](https://github.com/nekotrix/SVT-AV1-Essential/)
