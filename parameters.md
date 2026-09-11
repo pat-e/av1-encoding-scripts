@@ -6,7 +6,7 @@ This document details the configuration parameters used across the AomEnc, SVT-A
 
 All scripts use a two-pass linear constant-gain loudness normalization approach (no dynamic LRA compression). The process measures integrated loudness and true peak, then applies a linear loudnorm pass (`linear=true`) to reach the target LUFS while respecting the true-peak limit.
 
-- **Target Integrated Loudness (I)**: `-16.0` LUFS
+- **Target Integrated Loudness (I)**: `-18.0` LUFS
 - **True Peak Ceiling (TP)**: `-1.5` dBTP
 
 These defaults can be overridden at runtime with `--norm-i` and `--norm-tp`.

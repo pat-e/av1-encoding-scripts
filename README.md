@@ -35,7 +35,7 @@ The scripts require several external tools to be installed and available in your
 *   **Resumable Encoding**: Because it uses `av1an`, if an encode is interrupted, you can restart the script, and it will resume from where it left off.
 *   **Audio Normalization and Downmixing**: 
     *   Extracts audio tracks to FLAC.
-    *   Applies a two-pass linear constant-gain loudness normalization (Target: -16.0 LUFS, True Peak: -1.5 dBTP, LRA: 20 LU). Configurable via `--norm-i` and `--norm-tp`.
+    *   Applies a two-pass linear constant-gain loudness normalization (Target: -18.0 LUFS, True Peak: -1.5 dBTP, LRA: 20 LU). Configurable via `--norm-i` and `--norm-tp`.
     *   Downmixes 5.1/7.1 surround sound to stereo (unless `--no-downmix` is specified). All scripts use a robust multi-pass downmix filter fallback system to prevent clipping.
     *   Encodes to Opus with bitrates automatically chosen based on the channel count (e.g., 128k for Stereo, 256k for 5.1).
     *   Directly remuxes existing `aac` or `opus` tracks without re-encoding.
@@ -66,7 +66,7 @@ aom_opus_encoder.py [options]
 *   `--autocrop`: Automatically detect and crop black bars from the video.
 *   `--grain <int>`: Set the `photon-noise` value for grain synthesis. Disabled by default.
 *   `--crf <int>`: Override aom `cq-level`. Default: 25 for all resolutions (SDR and HDR).
-*   `--norm-i <float>`: Target integrated loudness in LUFS (default: -16.0).
+*   `--norm-i <float>`: Target integrated loudness in LUFS (default: -18.0).
 *   `--norm-tp <float>`: True-peak ceiling in dBTP (default: -1.5).
 
 **Workflow specific to `aom_opus_encoder.py`:**
@@ -88,7 +88,7 @@ svt_opus_encoder.py [options]
 *   `--crf <int>`: Override SVT-AV1 CRF. Default: 30 for all resolutions (SDR and HDR).
 *   `--grain <int>`: Set the `film-grain` value. Adjusts the film grain synthesis level. Disabled by default.
 *   `--tune <int>`: SVT-AV1-Essential `--tune` mode: 0=VQ, 1=PSNR, 2=SSIM, 3=IQ, 4=MS_SSIM (default: 2 = SSIM).
-*   `--norm-i <float>`: Target integrated loudness in LUFS (default: -16.0).
+*   `--norm-i <float>`: Target integrated loudness in LUFS (default: -18.0).
 *   `--norm-tp <float>`: True-peak ceiling in dBTP (default: -1.5).
 
 **Workflow specific to `svt_opus_encoder.py`:**
@@ -107,7 +107,7 @@ xav_automation.py [options]
 *   `--no-downmix`: Keep surround on re-encoded tracks (no 0.30 pan). AAC/Opus are always remuxed.
 *   `--preset <int>`: Override SVT-AV1 preset. Default: 1 if height ≤1080, else 2.
 *   `--tune <int>`: SVT-AV1-Essential `--tune` mode: 0=VQ, 1=PSNR, 2=SSIM, 3=IQ, 4=MS_SSIM (default: 2 = SSIM).
-*   `--norm-i <float>`: Target integrated loudness in LUFS (default: -16.0).
+*   `--norm-i <float>`: Target integrated loudness in LUFS (default: -18.0).
 *   `--norm-tp <float>`: True-peak ceiling in dBTP (default: -1.5).
 
 **Workflow specific to `xav_automation.py`:**

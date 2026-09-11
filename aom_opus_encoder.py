@@ -12,7 +12,7 @@
 # --cq-level 25 always (overridable with --crf). Two-pass av1an.
 # Av1an workers: (cpu_count // 2) - 1, not a fixed count.
 # Audio: AAC/Opus remuxed. Else: Nightmode Dialogue pan (`<` so the mix cannot clip)
-# → ffmpeg loudnorm 2-pass linear (I=-16, TP=-1.5, LRA=20) → opusenc.
+# → ffmpeg loudnorm 2-pass linear (I=-18, TP=-1.5, LRA=20) → opusenc.
 # Final mkvmerge: av1an video + processed/remuxed audio + source subs/attachments/chapters.
 
 import argparse
@@ -46,7 +46,7 @@ CFR_FULL_SUFFIX = ".cfr_full.mkv"
 HEIGHT_4K = 1080
 DEFAULT_CQ = 25
 
-LOUDNESS_I = -16.0
+LOUDNESS_I = -18.0
 LOUDNESS_TP = -1.5
 LOUDNESS_LRA = 20.0
 

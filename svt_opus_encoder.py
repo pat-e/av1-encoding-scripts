@@ -13,7 +13,7 @@
 # --crf 30 always (overrides Essential --quality medium, which would be CRF 35 above 1080p).
 # Av1an workers: (cpu_count // 2) - 1, not a fixed count.
 # Audio: AAC/Opus remuxed. Else: Nightmode Dialogue pan (`<` so the mix cannot clip)
-# → ffmpeg loudnorm 2-pass linear (I=-16, TP=-1.5, LRA=20) → opusenc.
+# → ffmpeg loudnorm 2-pass linear (I=-18, TP=-1.5, LRA=20) → opusenc.
 # Final mkvmerge: av1an video + processed/remuxed audio + source subs/attachments/chapters.
 
 import argparse
@@ -58,7 +58,7 @@ TUNE_NAMES = {
     4: "MS_SSIM",
 }
 
-LOUDNESS_I = -16.0
+LOUDNESS_I = -18.0
 LOUDNESS_TP = -1.5
 LOUDNESS_LRA = 20.0
 

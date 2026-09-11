@@ -13,7 +13,7 @@
 # Above 1080p:    -p "--preset 2 --tune 1"  -w 4  -b 1
 # --tune is SVT-AV1-Essential (default 1 = PSNR). Workers/buff are fixed, not CLI.
 # Audio: AAC/Opus remuxed. Else: Nightmode Dialogue pan (`<` so the mix cannot clip)
-# → ffmpeg loudnorm 2-pass linear (I=-16, TP=-1.5, LRA=20) → opusenc.
+# → ffmpeg loudnorm 2-pass linear (I=-18, TP=-1.5, LRA=20) → opusenc.
 # Final mkvmerge: xav video + processed/remuxed audio + source subs/attachments/chapters.
 
 import json
@@ -55,7 +55,7 @@ TUNE_NAMES = {
 }
 
 # Constant-gain loudness: EBU R128 / ffmpeg loudnorm 2-pass linear (no LRA compressor).
-LOUDNESS_I = -16.0
+LOUDNESS_I = -18.0
 LOUDNESS_TP = -1.5
 # loudnorm max. If target LRA < measured LRA, it silently switches to dynamic (compresses).
 LOUDNESS_LRA = 20.0
