@@ -87,6 +87,7 @@ def check_luma_for_group(task_args):
 KNOWN_ASPECT_RATIOS = [
     {"name": "HDTV (16:9)", "ratio": 16/9},
     {"name": "Widescreen (Scope)", "ratio": 2.39},
+    {"name": "Widescreen (CinemaScope)", "ratio": 2.35},
     {"name": "Widescreen (Flat)", "ratio": 1.85},
     {"name": "IMAX Digital (1.90:1)", "ratio": 1.90},
     {"name": "Fullscreen (4:3)", "ratio": 4/3},
@@ -116,11 +117,23 @@ def snap_to_known_ar(w, h, x, y, video_w, video_h, tolerance=0.03):
     if abs(w - video_w) < 16:
         new_h = round(video_w / best_match['ratio'])
         
-        # Round height up to the nearest multiple of 8 for cleaner dimensions and less aggressive cropping.
-        if new_h % 8 != 0:
-            new_h = new_h + (8 - (new_h % 8))
+        # Round height up to the nearest multiple of 4 (mod-4).
+        if new_h % 4 != 0:
+            new_h = new_h + (4 - (new_h % 4))
 
-        new_y = round((video_h - new_h) / 2)
+        # DO NO HARM: If snapping reduces the bounding box height, it cuts into the image!
+        # Cancel the snap, and just round the ORIGINAL height up to mod-4.
+        if new_h < h:
+            new_h = h
+            if new_h % 4 != 0:
+                new_h = new_h + (4 - (new_h % 4))
+            best_match['name'] = f"Custom AR (Near {best_match['name']})"
+
+        # Preserve asymmetric crops: calculate new_y based on the original y offset
+        # instead of blindly centering it on the screen.
+        new_y = y + round((h - new_h) / 2)
+        new_y = max(0, min(new_y, video_h - new_h))
+        
         # Ensure y offset is an even number for compatibility.
         if new_y % 2 != 0:
             new_y -= 1
@@ -131,11 +144,22 @@ def snap_to_known_ar(w, h, x, y, video_w, video_h, tolerance=0.03):
     if abs(h - video_h) < 16:
         new_w = round(video_h * best_match['ratio'])
 
-        # Round width up to the nearest multiple of 8.
-        if new_w % 8 != 0:
-            new_w = new_w + (8 - (new_w % 8))
+        # Round width up to the nearest multiple of 4 (mod-4).
+        if new_w % 4 != 0:
+            new_w = new_w + (4 - (new_w % 4))
 
-        new_x = round((video_w - new_w) / 2)
+        # DO NO HARM: If snapping reduces the bounding box width, it cuts into the image!
+        # Cancel the snap, and just round the ORIGINAL width up to mod-4.
+        if new_w < w:
+            new_w = w
+            if new_w % 4 != 0:
+                new_w = new_w + (4 - (new_w % 4))
+            best_match['name'] = f"Custom AR (Near {best_match['name']})"
+
+        # Preserve asymmetric crops
+        new_x = x + round((w - new_w) / 2)
+        new_x = max(0, min(new_x, video_w - new_w))
+        
         # Ensure x offset is an even number.
         if new_x % 2 != 0:
             new_x -= 1
@@ -196,9 +220,10 @@ def parse_crop_string(crop_str):
 
 def calculate_bounding_box(crop_keys):
     """Calculates a bounding box that contains all given crop rectangles."""
-    min_x = min_w = min_y = min_h = float('inf')
-    max_x = max_w = max_y = max_h = float('-inf')
-
+    min_x = min_y = float('inf')
+    max_x = max_y = float('-inf')
+    
+    valid_keys = 0
     for key in crop_keys:
         parsed = parse_crop_string(key)
         if not parsed:
@@ -210,15 +235,10 @@ def calculate_bounding_box(crop_keys):
         min_y = min(min_y, y)
         max_x = max(max_x, x + w)
         max_y = max(max_y, y + h)
-        
-        min_w = min(min_w, w)
-        min_h = min(min_h, h)
-        max_w = max(max_w, w)
-        max_h = max(max_h, h)
+        valid_keys += 1
 
-    # Heuristic: if the bounding box is very close to the min/max, it means all crops were similar
-    if (max_x - min_x) <= 2 and (max_y - min_y) <= 2:
-        return None # Too uniform, don't create a bounding box
+    if valid_keys == 0:
+        return None
 
     # Create a crop that spans the entire bounding box
     bounding_crop = f"crop={max_x - min_x}:{max_y - min_y}:{min_x}:{min_y}"
@@ -250,9 +270,10 @@ def analyze_video(input_file, duration, width, height, num_workers, significant_
     print(f"\n--- Analyzing Video: {os.path.basename(input_file)} ---")
     
     # Step 1: Analyze video in segments to detect crops
-    num_tasks = num_workers * 4 
-    segment_duration = max(1, duration // num_tasks)
-    tasks = [(i * segment_duration, input_file, width, height) for i in range(num_tasks)]
+    # Sample every 30 seconds to ensure short scenes (like IMAX) are not missed
+    sample_interval = 30
+    num_tasks = max(1, duration // sample_interval)
+    tasks = [(i * sample_interval, input_file, width, height) for i in range(num_tasks)]
     
     print(f"Analyzing {len(tasks)} segments across {num_workers} worker(s)...")
     
@@ -291,17 +312,25 @@ def analyze_video(input_file, duration, width, height, num_workers, significant_
             percentage = (cluster['count'] / total_detections) * 100
             print(f"  - Center: {cluster['center']}, Count: {cluster['count']} ({percentage:.1f}%)")
 
-    # Step 3: Filter clusters that are below the significance threshold
+    # Step 3: Identify primary clusters (for reporting) and safe clusters (for bounding box)
     significant_clusters = []
+    safe_clusters = []
+    
+    # We require a small threshold of detections to consider a cluster "safe" and not just noise.
+    # Since a 1-second sample at 24fps yields ~24 detections, a minimum of 10 detections is robust.
+    min_frames_for_safe_cluster = 10 
+    
     for cluster in clusters:
         percentage = (cluster['count'] / total_detections) * 100
+        if cluster['count'] >= min_frames_for_safe_cluster:
+            safe_clusters.append(cluster)
         if percentage >= significant_crop_threshold:
             significant_clusters.append(cluster)
 
-    # Step 4: Determine final recommendation based on significant clusters
+    # Step 4: Determine final recommendation based on safe clusters
     print("\n--- Determining Final Crop Recommendation ---")
 
-    for cluster in significant_clusters:
+    for cluster in safe_clusters:
         parsed_crop = parse_crop_string(cluster['center'])
         if parsed_crop:
             _, ar_label = snap_to_known_ar(
@@ -311,12 +340,12 @@ def analyze_video(input_file, duration, width, height, num_workers, significant_
         else:
             cluster['ar_label'] = None
 
-    if not significant_clusters:
-        print(f"{COLOR_RED}No single crop value meets the {significant_crop_threshold}% significance threshold.{COLOR_RESET}")
-        print("Recommendation: Do not crop. Try lowering the -sct threshold.")
+    if not safe_clusters:
+        print(f"{COLOR_RED}No safe crop clusters detected above noise threshold.{COLOR_RESET}")
+        print("Recommendation: Do not crop.")
 
-    elif len(significant_clusters) == 1:
-        dominant_cluster = significant_clusters[0]
+    elif len(safe_clusters) == 1:
+        dominant_cluster = safe_clusters[0]
         parsed_crop = parse_crop_string(dominant_cluster['center'])
         snapped_crop, ar_label = snap_to_known_ar(
             parsed_crop['w'], parsed_crop['h'], parsed_crop['x'], parsed_crop['y'], width, height
@@ -333,11 +362,11 @@ def analyze_video(input_file, duration, width, height, num_workers, significant_
         else:
             print(f"\n{COLOR_GREEN}Recommended crop filter: -vf {snapped_crop}{COLOR_RESET}")
 
-    else: # len > 1, mixed AR case
-        print(f"{COLOR_YELLOW}Mixed aspect ratios detected (e.g., IMAX scenes).{COLOR_RESET}")
-        print("Calculating a safe 'master' crop to contain all significant scenes.")
+    else: # len(safe_clusters) > 1, mixed AR case
+        print(f"{COLOR_YELLOW}Mixed aspect ratios detected (e.g., IMAX or Open Matte scenes).{COLOR_RESET}")
+        print("Calculating a safe bounding box crop to contain all valid scenes.")
 
-        crop_keys = [c['center'] for c in significant_clusters]
+        crop_keys = [c['center'] for c in safe_clusters]
         bounding_box_crop = calculate_bounding_box(crop_keys)
         
         if bounding_box_crop:
@@ -346,11 +375,12 @@ def analyze_video(input_file, duration, width, height, num_workers, significant_
                 parsed_bb['w'], parsed_bb['h'], parsed_bb['x'], parsed_bb['y'], width, height
             )
 
-            print("\n--- Detected Significant Ratios ---")
-            for cluster in significant_clusters:
+            print("\n--- Detected Aspect Ratios ---")
+            for cluster in safe_clusters:
                 percentage = (cluster['count'] / total_detections) * 100
                 label = f"'{cluster['ar_label']}'" if cluster['ar_label'] else "Custom AR"
-                print(f"  - {label} ({cluster['center']}) was found in {percentage:.1f}% of samples.")
+                sig_note = " (Primary)" if cluster in significant_clusters else " (Minority/IMAX)"
+                print(f"  - {label} ({cluster['center']}) was found in {percentage:.1f}% of samples.{sig_note}")
 
             print(f"\n{COLOR_GREEN}Analysis complete.{COLOR_RESET}")
             if ar_label:

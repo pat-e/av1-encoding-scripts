@@ -970,6 +970,7 @@ COLOR_RESET = "\033[0m"
 KNOWN_ASPECT_RATIOS = [
     {"name": "HDTV (16:9)", "ratio": 16 / 9},
     {"name": "Widescreen (Scope)", "ratio": 2.39},
+    {"name": "Widescreen (CinemaScope)", "ratio": 2.35},
     {"name": "Widescreen (Flat)", "ratio": 1.85},
     {"name": "IMAX Digital (1.90:1)", "ratio": 1.90},
     {"name": "Fullscreen (4:3)", "ratio": 4 / 3},
@@ -1007,6 +1008,45 @@ def _analyze_segment_cropdetect(task_args):
 def _snap_to_known_ar_cropdetect(w, h, x, y, video_w, video_h, tolerance=0.03):
     if h == 0:
         return f"crop={w}:{h}:{x}:{y}", None
+    detected_ratio = w / h
+    best_match = None
+    smallest_diff = float("inf")
+    for ar in KNOWN_ASPECT_RATIOS:
+        diff = abs(detected_ratio - ar["ratio"])
+        if diff < smallest_diff:
+            smallest_diff = diff
+            best_match = ar
+    if not best_match or (smallest_diff / best_match["ratio"]) >= tolerance:
+        return f"crop={w}:{h}:{x}:{y}", None
+    if abs(w - video_w) < 16:
+        new_h = round(video_w / best_match["ratio"])
+        if new_h % 4 != 0:
+            new_h = new_h + (4 - (new_h % 4))
+        if new_h < h:
+            new_h = h
+            if new_h % 4 != 0:
+                new_h = new_h + (4 - (new_h % 4))
+            best_match["name"] = f"Custom AR (Near {best_match['name']})"
+        new_y = y + round((h - new_h) / 2)
+        new_y = max(0, min(new_y, video_h - new_h))
+        if new_y % 2 != 0:
+            new_y -= 1
+        return f"crop={video_w}:{new_h}:0:{new_y}", best_match["name"]
+    if abs(h - video_h) < 16:
+        new_w = round(video_h * best_match["ratio"])
+        if new_w % 4 != 0:
+            new_w = new_w + (4 - (new_w % 4))
+        if new_w < w:
+            new_w = w
+            if new_w % 4 != 0:
+                new_w = new_w + (4 - (new_w % 4))
+            best_match["name"] = f"Custom AR (Near {best_match['name']})"
+        new_x = x + round((w - new_w) / 2)
+        new_x = max(0, min(new_x, video_w - new_w))
+        if new_x % 2 != 0:
+            new_x -= 1
+        return f"crop={new_w}:{video_h}:{new_x}:0", best_match["name"]
+    return f"crop={w}:{h}:{x}:{y}", None
     detected_ratio = w / h
     best_match = None
     smallest_diff = float("inf")
@@ -1097,18 +1137,72 @@ def _calculate_bounding_box_cropdetect(crop_keys):
 
 
 def _analyze_video_cropdetect(input_file, duration, width, height, num_workers, significant_crop_threshold, min_crop, debug=False):
-    num_tasks = num_workers * 4
-    segment_duration = max(1, duration // num_tasks)
-    tasks = [(i * segment_duration, input_file, width, height) for i in range(num_tasks)]
+    sample_interval = 30
+    num_tasks = max(1, duration // sample_interval)
+    tasks = [(i * sample_interval, input_file, width, height) for i in range(num_tasks)]
+    
     crop_results = []
     with _multiprocessing_cropdetect.Pool(processes=num_workers) as pool:
         results_iterator = pool.imap_unordered(_analyze_segment_cropdetect, tasks)
         for result in results_iterator:
             crop_results.append(result)
+            
     all_crops_with_ts = [crop for sublist in crop_results for crop in sublist]
     all_crop_strings = [item[0] for item in all_crops_with_ts]
     if not all_crop_strings:
         return None
+        
+    crop_counts = _Counter_cropdetect(all_crop_strings)
+    clusters = _cluster_crop_values_cropdetect(crop_counts)
+    total_detections = sum(c["count"] for c in clusters)
+    
+    significant_clusters = []
+    safe_clusters = []
+    min_frames_for_safe_cluster = 10
+    
+    for cluster in clusters:
+        percentage = (cluster["count"] / total_detections) * 100
+        if cluster["count"] >= min_frames_for_safe_cluster:
+            safe_clusters.append(cluster)
+        if percentage >= significant_crop_threshold:
+            significant_clusters.append(cluster)
+            
+    for cluster in safe_clusters:
+        parsed_crop = _parse_crop_string_cropdetect(cluster["center"])
+        if parsed_crop:
+            _, ar_label = _snap_to_known_ar_cropdetect(
+                parsed_crop["w"], parsed_crop["h"], parsed_crop["x"], parsed_crop["y"], width, height
+            )
+            cluster["ar_label"] = ar_label
+        else:
+            cluster["ar_label"] = None
+            
+    if not safe_clusters:
+        return None
+    elif len(safe_clusters) == 1:
+        dominant_cluster = safe_clusters[0]
+        parsed_crop = _parse_crop_string_cropdetect(dominant_cluster["center"])
+        snapped_crop, ar_label = _snap_to_known_ar_cropdetect(
+            parsed_crop["w"], parsed_crop["h"], parsed_crop["x"], parsed_crop["y"], width, height
+        )
+        parsed_snapped = _parse_crop_string_cropdetect(snapped_crop)
+        if parsed_snapped and parsed_snapped["w"] == width and parsed_snapped["h"] == height:
+            return None
+        return snapped_crop
+    else:
+        crop_keys = [c["center"] for c in safe_clusters]
+        bounding_box_crop = _calculate_bounding_box_cropdetect(crop_keys)
+        if bounding_box_crop:
+            parsed_bb = _parse_crop_string_cropdetect(bounding_box_crop)
+            snapped_crop, ar_label = _snap_to_known_ar_cropdetect(
+                parsed_bb["w"], parsed_bb["h"], parsed_bb["x"], parsed_bb["y"], width, height
+            )
+            parsed_snapped = _parse_crop_string_cropdetect(snapped_crop)
+            if parsed_snapped and parsed_snapped["w"] == width and parsed_snapped["h"] == height:
+                return None
+            return snapped_crop
+        else:
+            return None
     crop_counts = _Counter_cropdetect(all_crop_strings)
     clusters = _cluster_crop_values_cropdetect(crop_counts)
     total_detections = sum(c["count"] for c in clusters)
