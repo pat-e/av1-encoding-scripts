@@ -4,11 +4,13 @@
 # For more information and to install xav, visit: https://github.com/emrakyz/xav
 #
 # Batch encode: xav is VIDEO ONLY (no -a). Audio, subs, attachments, mux: this script.
-# Every 1080p SDR file gets a video-only HandBrake x264 all-intra intermediate.
-# 4K or real HDR: mkvmerge video-only remux (no re-encode; keeps HDR/DoVi track metadata).
-# VFR 4K/HDR (rare): HandBrake x265_10bit CFR fallback.
-# ffmpeg is only a fallback if HandBrake produces an empty 1080p SDR file.
-# Forced CFR — xav crashes on VFR. 1080p SDR stays x264 (10-bit HEVC SDR still → x264_10bit).
+# xav accepts only yuv420p (8-bit) or yuv420p10le (10-bit). 8-bit is upconverted inside xav.
+# Packet-CFR probe (ffprobe PTS) gates HandBrake. MediaInfo/ffprobe "CFR" flags are not trusted.
+# Skip HandBrake only if packets prove CFR AND MediaInfo is not VFR AND pix_fmt is already
+# yuv420p / yuv420p10le. Then mkvmerge video-only remux (1080p or 4K/HDR).
+# Otherwise HandBrake: 1080p SDR → x264 / x264_10bit all-intra; 4K/HDR → x265_10bit.
+# Format convert: 12/16-bit → 10-bit; 4:2:2 / 4:4:4 / RGB → yuv420p10le.
+# ffmpeg is only a fallback if HandBrake produces an empty file.
 # 1080p or lower: -p "--preset 1 --tune 1"  -w 4  -b 1
 # Above 1080p:    -p "--preset 2 --tune 1"  -w 4  -b 1
 # --tune is SVT-AV1-Essential (default 1 = PSNR). Workers/buff are fixed, not CLI.
@@ -63,6 +65,16 @@ LOUDNESS_LRA = 20.0
 CFR_SUFFIX = ".cfr.mkv"
 CFR_FULL_SUFFIX = ".cfr_full.mkv"
 PREP_SUFFIX = ".prep.mkv"
+
+# Fail-closed packet-PTS CFR probe. MediaInfo FrameRate_Mode is not proof.
+CFR_DURATION_REL_TOL = 0.012
+CFR_MAX_OUTLIER_RATIO = 0.002
+CFR_MIN_PACKETS = 120
+CFR_PROBE_PACKETS = 800
+CFR_HEADER_FPS_REL_TOL = 0.03
+CFR_PTS_JUMP_ALLOW = 2
+
+XAV_PIX_FMTS = {"yuv420p", "yuv420p10le"}
 
 
 class Tee:
@@ -197,6 +209,74 @@ def video_fps(track, source_file=None):
     return None
 
 
+def video_chroma(track):
+    if not track:
+        return ""
+    raw = track.get("ChromaSubsampling") or track.get("Chroma_subsampling") or ""
+    match = re.search(r"(\d:\d:\d)", str(raw))
+    return match.group(1) if match else ""
+
+
+def video_color_space(track):
+    if not track:
+        return ""
+    return str(track.get("ColorSpace") or track.get("Color_space") or "").upper()
+
+
+def ffprobe_pix_fmt(path):
+    try:
+        for stream in ffprobe_json(path).get("streams", []):
+            if stream.get("codec_type") == "video":
+                return str(stream.get("pix_fmt") or "").lower()
+    except (subprocess.CalledProcessError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return ""
+
+
+def xav_input_ok(path, track=None):
+    """xav: yuv420p or yuv420p10le only. No RGB / 4:2:2 / 4:4:4 / 12-bit+."""
+    fmt = ffprobe_pix_fmt(path)
+    if fmt:
+        if fmt in XAV_PIX_FMTS:
+            return True, fmt
+        return False, fmt
+    if track is None:
+        try:
+            track = video_track(mediainfo_json(path))
+        except Exception:
+            track = None
+    if not track:
+        return False, "unknown pixel format"
+    space = video_color_space(track)
+    chroma = video_chroma(track)
+    depth = video_bit_depth(track)
+    bits = []
+    if space and space not in ("YUV", "YCBCR", "Y'UV"):
+        bits.append(space)
+    if chroma and chroma != "4:2:0":
+        bits.append(chroma)
+    if depth not in (8, 10):
+        bits.append(f"{depth}-bit")
+    if not chroma or not space:
+        return False, "unknown pixel format"
+    if bits:
+        return False, " ".join(bits)
+    return True, f"YUV 4:2:0 {depth}-bit"
+
+
+def _fps_float(raw):
+    if not raw:
+        return None
+    raw = str(raw).split()[0]
+    try:
+        if "/" in raw:
+            num, den = map(float, raw.split("/", 1))
+            return (num / den) if den else None
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def is_4k_path(track):
     return video_height(track) > HEIGHT_4K
 
@@ -232,8 +312,20 @@ def is_4k_or_hdr(track):
 
 
 def intermediate_encoder(track):
-    """Return (ffmpeg codec args, handbrake encoder, label, handbrake --encopts or None)."""
-    ten = video_bit_depth(track) >= 10 or is_4k_or_hdr(track)
+    """Return (ffmpeg codec args, handbrake encoder, label, handbrake --encopts or None).
+
+    Output is always 4:2:0. 12/16-bit and 4:2:2/4:4:4/RGB become yuv420p10le.
+    8-bit 4:2:0 1080p SDR stays 8-bit x264 (xav upconverts).
+    """
+    depth = video_bit_depth(track)
+    chroma = video_chroma(track)
+    space = video_color_space(track)
+    already_8bit_420 = (
+        depth == 8
+        and (not chroma or chroma == "4:2:0")
+        and (not space or space in ("YUV", "YCBCR", "Y'UV"))
+    )
+    need_10 = (not already_8bit_420) or is_4k_or_hdr(track) or depth >= 10
     if is_4k_or_hdr(track):
         ffmpeg_args = [
             "-c:v", "libx265",
@@ -243,8 +335,8 @@ def intermediate_encoder(track):
             "-pix_fmt", "yuv420p10le",
             "-x265-params", "info=0",
         ]
-        return ffmpeg_args, "x265_10bit", "libx265 10-bit CRF 0, normal GOP (VFR 4K/HDR fallback)", None
-    if ten:
+        return ffmpeg_args, "x265_10bit", "libx265 10-bit CRF 0 yuv420p10le, normal GOP (4K/HDR)", None
+    if need_10:
         ffmpeg_args = [
             "-c:v", "libx264",
             "-crf", "0",
@@ -254,16 +346,18 @@ def intermediate_encoder(track):
             "-g", "1",
             "-bf", "0",
         ]
-        return ffmpeg_args, "x264_10bit", "libx264 10-bit CRF 0 all-intra (1080p SDR Hi10p)", "keyint=1:bframes=0"
+        why = "Hi10p" if depth >= 10 else f"convert {space or 'YUV'} {chroma or '?'} {depth}-bit"
+        return ffmpeg_args, "x264_10bit", f"libx264 10-bit CRF 0 all-intra yuv420p10le ({why})", "keyint=1:bframes=0"
     ffmpeg_args = [
         "-c:v", "libx264",
         "-crf", "0",
         "-preset", "superfast",
         "-tune", "fastdecode",
+        "-pix_fmt", "yuv420p",
         "-g", "1",
         "-bf", "0",
     ]
-    return ffmpeg_args, "x264", "libx264 8-bit CRF 0 all-intra (1080p SDR)", "keyint=1:bframes=0"
+    return ffmpeg_args, "x264", "libx264 8-bit CRF 0 all-intra yuv420p (1080p SDR)", "keyint=1:bframes=0"
 
 
 def xav_worker_count():
@@ -317,12 +411,111 @@ def detect_vfr(media_info):
                 target_cfr_fps = f"{num / den:.3f}"
                 print(f"    - Converted fractional FPS to decimal for HandBrake: {target_cfr_fps}")
             except ValueError:
-                print(f"    - Warning: Could not parse fractional FPS '{target_cfr_fps}'. Sending source to xav as-is.")
-                is_vfr = False
+                print(f"    - Warning: Could not parse fractional FPS '{target_cfr_fps}'. HandBrake will still run.")
     else:
-        print("    - Warning: VFR detected, but could not determine target CFR. Sending source to xav as-is.")
-        is_vfr = False
+        print("    - Warning: VFR detected, but could not determine target CFR. HandBrake will still run.")
     return is_vfr, target_cfr_fps
+
+
+def _read_video_packets(source_file, limit):
+    """First `limit` video packets. None on hard failure."""
+    interval_cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "packet=pts_time,dts_time,duration_time",
+        "-read_intervals", f"%+#{limit}",
+        "-of", "json",
+        str(source_file),
+    ]
+    try:
+        raw = run_cmd(interval_cmd, capture_output=True)
+        packets = json.loads(raw).get("packets") or []
+        if packets:
+            return packets[:limit]
+    except (subprocess.CalledProcessError, json.JSONDecodeError, TypeError):
+        pass
+    csv_cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "packet=pts_time,dts_time,duration_time",
+        "-of", "csv=p=0:nokey=1",
+        str(source_file),
+    ]
+    try:
+        proc = subprocess.Popen(
+            csv_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+        packets = []
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            parts = [p.strip() for p in line.strip().split(",")]
+            if not parts:
+                continue
+            packets.append({
+                "pts_time": parts[0] if len(parts) > 0 else None,
+                "dts_time": parts[1] if len(parts) > 1 else None,
+                "duration_time": parts[2] if len(parts) > 2 else None,
+            })
+            if len(packets) >= limit:
+                break
+        proc.kill()
+        proc.wait()
+        return packets
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def probe_true_cfr(source_file, track=None):
+    """Return (is_true_cfr, reason, nominal_fps). Fail closed on any doubt."""
+    packets = _read_video_packets(source_file, CFR_PROBE_PACKETS)
+    if packets is None:
+        return False, "ffprobe error", None
+    times = []
+    for packet in packets:
+        raw = packet.get("pts_time")
+        if raw in (None, "", "N/A"):
+            raw = packet.get("dts_time")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(value):
+            continue
+        if value < 0:
+            return False, "negative timestamp", None
+        times.append(value)
+    if len(times) < CFR_MIN_PACKETS:
+        return False, f"too few packets ({len(times)})", None
+    dups = 0
+    back = 0
+    for first, second in zip(times, times[1:]):
+        if second < first - 1e-6:
+            back += 1
+        elif abs(second - first) < 1e-9:
+            dups += 1
+    if dups + back > CFR_PTS_JUMP_ALLOW:
+        return False, f"non-monotonic PTS (dups={dups}, back={back})", None
+    durations = [second - first for first, second in zip(times, times[1:]) if second > first]
+    if len(durations) < CFR_MIN_PACKETS:
+        return False, f"too few durations ({len(durations)})", None
+    ordered = sorted(durations)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        median = ordered[mid]
+    else:
+        median = 0.5 * (ordered[mid - 1] + ordered[mid])
+    if median <= 0:
+        return False, "non-positive median duration", None
+    lo = median * (1.0 - CFR_DURATION_REL_TOL)
+    hi = median * (1.0 + CFR_DURATION_REL_TOL)
+    outliers = sum(1 for duration in durations if duration < lo or duration > hi)
+    if outliers / len(durations) > CFR_MAX_OUTLIER_RATIO:
+        pct = 100.0 * outliers / len(durations)
+        return False, f"{pct:.1f}% outliers ({outliers}/{len(durations)})", None
+    fps = 1.0 / median
+    header = _fps_float(video_fps(track, source_file) if track is not None else None)
+    if header and header > 0:
+        if abs(fps - header) / header > CFR_HEADER_FPS_REL_TOL:
+            return False, f"header {header:.3f} fps vs packets {fps:.3f} fps", None
+    return True, f"median {median:.5f} s, {outliers}/{len(durations)} outliers, ~{fps:.3f} fps", f"{fps:.3f}"
 
 
 def handbrake_rate(track, source_file, vfr_target=None):
@@ -477,25 +670,48 @@ def create_ffmpeg_intermediate(source_file, output_file, track):
 
 
 def prepare_xav_input(file_path, is_vfr, target_cfr_fps, track):
-    """1080p SDR: HandBrake x264 all-intra. 4K/HDR CFR: mkvmerge video-only remux."""
+    """Remux if packet-CFR + xav-compatible pixels. Else HandBrake (CFR + 4:2:0 8/10-bit)."""
     prep_file = Path(f"{file_path.stem}{PREP_SUFFIX}")
     temps = [prep_file]
     uhd_or_hdr = is_4k_or_hdr(track)
+
+    true_cfr, cfr_reason, _nominal = probe_true_cfr(file_path, track)
+    pix_ok, pix_reason = xav_input_ok(file_path, track)
+    if true_cfr:
+        print(f"    - Packet CFR probe: PASS ({cfr_reason})")
+    else:
+        print(f"    - Packet CFR probe: FAIL ({cfr_reason}) → HandBrake")
+    if pix_ok:
+        print(f"    - xav pixel format: OK ({pix_reason})")
+    else:
+        print(f"    - xav pixel format: incompatible ({pix_reason}) → convert to yuv420p10le")
+    if is_vfr:
+        print("    - MediaInfo VFR: HandBrake CFR hammer (probe cannot skip)")
+
+    skip_handbrake = true_cfr and (not is_vfr) and pix_ok
+
     if file_is_usable(prep_file):
+        remake_why = None
         if prep_is_vfr(prep_file):
-            print(f"    - Existing intermediate is VFR; deleting and remaking: {prep_file}")
-            prep_file.unlink(missing_ok=True)
-        elif uhd_or_hdr and not is_vfr and prep_is_handbrake_reencode(prep_file):
-            print(
-                f"    - Existing intermediate is a HandBrake re-encode; "
-                f"deleting and remuxing video-only: {prep_file}"
-            )
+            remake_why = "existing intermediate is VFR"
+        else:
+            prep_cfr, prep_cfr_reason, _ = probe_true_cfr(prep_file)
+            if not prep_cfr:
+                remake_why = f"existing intermediate packet CFR fail ({prep_cfr_reason})"
+            else:
+                prep_pix, prep_pix_reason = xav_input_ok(prep_file)
+                if not prep_pix:
+                    remake_why = f"existing intermediate not xav-compatible ({prep_pix_reason})"
+        if remake_why is None and uhd_or_hdr and skip_handbrake and prep_is_handbrake_reencode(prep_file):
+            remake_why = "HandBrake re-encode; remuxing video-only instead"
+        if remake_why:
+            print(f"    - Deleting and remaking: {prep_file} ({remake_why})")
             prep_file.unlink(missing_ok=True)
         else:
             print(f"    - Reusing existing intermediate (resume): {prep_file}")
             return prep_file, temps
 
-    if uhd_or_hdr and not is_vfr:
+    if skip_handbrake:
         if run_mkvmerge_video_only(file_path, prep_file):
             strip_prep_tags(prep_file)
             return prep_file, temps
