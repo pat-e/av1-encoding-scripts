@@ -68,10 +68,13 @@ PREP_SUFFIX = ".prep.mkv"
 
 # Fail-closed packet-PTS CFR probe. MediaInfo FrameRate_Mode is not proof.
 # Relative 1.2% is too tight for MKV 1ms ticks (24 fps = 41ms vs 42ms → fake 33% outliers).
+# A handful of outliers is GOP-start / window-edge noise, not VFR (2/799 used to fail at 0.2%).
 CFR_DURATION_REL_TOL = 0.012
 CFR_DURATION_ABS_TOL = 0.002
 CFR_PTS_MERGE = 0.0005
-CFR_MAX_OUTLIER_RATIO = 0.002
+CFR_MAX_OUTLIER_RATIO = 0.01
+CFR_MAX_OUTLIER_ABS = 4
+CFR_EDGE_DROP = 1
 CFR_MIN_PACKETS = 120
 CFR_PROBE_PACKETS = 800
 CFR_HEADER_FPS_REL_TOL = 0.03
@@ -501,7 +504,11 @@ def probe_true_cfr(source_file, track=None):
     durations = [second - first for first, second in zip(unique, unique[1:])]
     if len(durations) < CFR_MIN_PACKETS:
         return False, f"too few durations ({len(durations)})", None
-    ordered = sorted(durations)
+    if len(durations) > CFR_EDGE_DROP * 2 + 8:
+        measured = durations[CFR_EDGE_DROP:-CFR_EDGE_DROP]
+    else:
+        measured = durations
+    ordered = sorted(measured)
     mid = len(ordered) // 2
     if len(ordered) % 2:
         median = ordered[mid]
@@ -510,10 +517,11 @@ def probe_true_cfr(source_file, track=None):
     if median <= 0:
         return False, "non-positive median duration", None
     slop = max(median * CFR_DURATION_REL_TOL, CFR_DURATION_ABS_TOL)
-    outliers = sum(1 for duration in durations if abs(duration - median) > slop)
-    if outliers / len(durations) > CFR_MAX_OUTLIER_RATIO:
-        pct = 100.0 * outliers / len(durations)
-        return False, f"{pct:.1f}% outliers ({outliers}/{len(durations)}, slop={slop*1000:.1f}ms)", None
+    outliers = sum(1 for duration in measured if abs(duration - median) > slop)
+    allowed = max(CFR_MAX_OUTLIER_ABS, int(len(measured) * CFR_MAX_OUTLIER_RATIO))
+    if outliers > allowed:
+        pct = 100.0 * outliers / len(measured)
+        return False, f"{pct:.1f}% outliers ({outliers}/{len(measured)}, slop={slop*1000:.1f}ms)", None
     fps = 1.0 / median
     header = _fps_float(video_fps(track, source_file) if track is not None else None)
     if header and header > 0:
@@ -521,7 +529,7 @@ def probe_true_cfr(source_file, track=None):
             return False, f"header {header:.3f} fps vs packets {fps:.3f} fps", None
     return (
         True,
-        f"median {median*1000:.2f} ms, {outliers}/{len(durations)} outliers, ~{fps:.3f} fps",
+        f"median {median*1000:.2f} ms, {outliers}/{len(measured)} outliers, ~{fps:.3f} fps",
         f"{fps:.3f}",
     )
 

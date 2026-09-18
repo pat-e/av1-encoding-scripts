@@ -8,12 +8,15 @@ All scripts use a two-pass linear constant-gain loudness normalization approach 
 
 - **Target Integrated Loudness (I)**: `-18.0` LUFS
 - **True Peak Ceiling (TP)**: `-1.5` dBTP
+- **Loudness Range (LRA)**: `20.0` LU (set high so loudnorm stays in linear/constant-gain mode; it is not used as a compressor)
 
-These defaults can be overridden at runtime with `--norm-i` and `--norm-tp`.
+These I/TP defaults can be overridden at runtime with `--norm-i` and `--norm-tp`. If the measured source LRA is greater than 20, ffmpeg loudnorm may silently switch to dynamic mode.
+
+loudnorm true-peak analysis uses 4× oversampling (48 kHz → 192 kHz). After the second pass, the FLAC is pinned back to the source track's sample rate (`aformat=sample_fmts=s32:sample_rates=<source>`) so `opusenc` tags Input Sample Rate correctly. Opus still encodes at 48 kHz internally. If the source rate cannot be read, 48000 Hz is used.
 
 ## Audio Demuxing & Downmixing
 
-The audio processing extracts streams using `ffmpeg` and automatically downmixes surround layouts to stereo if requested.
+The audio processing extracts streams using `ffmpeg` (`-drc_scale 0` so decoder DRC is off) and automatically downmixes surround layouts to stereo if requested. Existing `aac` and `opus` tracks are remuxed without re-encoding.
 
 ### Downmixing Parameters (Nightmode Dialogue)
 
@@ -34,26 +37,29 @@ When downmixing, the scripts use a multi-pass fallback system ("Nightmode Dialog
   3. Fallback: `-ac 2`
 
 ### Non-Downmixed Encoding Bitrates (Opus)
-When preserving the original channel layout (no downmixing) or if the source is already stereo/mono, audio is encoded with the following bitrates based on channel count:
+When preserving the original channel layout (no downmixing) or if the source is already stereo/mono, audio is encoded with `opusenc --vbr` at the following bitrates based on channel count:
 
 - **Mono (1 channel)**: `64k`
 - **Stereo (2 channels)**: `128k`
 - **5.1 Surround (6 channels)**: `256k`
 - **7.1 Surround (8 channels)**: `384k`
 - **Other/Uncommon Layouts**: `192k` (fallback default)
+- **Downmixed 5.1/7.1**: `128k` (treated as stereo)
 
 ## VFR to CFR Conversion
 
 ### `svt_opus_encoder.py`
 
-`svt_opus_encoder.py` uses the same intermediate strategy as `xav_automation.py` (no UTVideo pass). The prep file is indexed with `ffmsindex` and fed to VapourSynth / av1an:
+`svt_opus_encoder.py` uses MediaInfo `FrameRate_Mode` (not a packet-PTS probe). The prep file is indexed with `ffmsindex` and fed to VapourSynth / av1an:
 
 - **≤1080p SDR (8-bit)**: HandBrakeCLI `x264` CRF 0, all-intra (`keyint=1:bframes=0`)
 - **≤1080p SDR (10-bit / Hi10p)**: HandBrakeCLI `x264_10bit` CRF 0, all-intra
 - **>1080p or HDR, CFR**: mkvmerge video-only remux (no re-encode; keeps HDR10/DoVi track properties)
 - **>1080p or HDR, VFR**: HandBrakeCLI `x265_10bit` CRF 0, normal GOP
 
-If HandBrakeCLI fails or cannot determine the frame rate, ffmpeg is used as a fallback with equivalent settings (forced CFR via `-fps_mode cfr`).
+If VFR is reported but a target frame rate cannot be determined, the source is sent on without a HandBrake pass. If HandBrakeCLI fails or cannot determine the frame rate, ffmpeg is used as a fallback with equivalent settings (forced CFR via `-fps_mode cfr`). Existing 4K/HDR HandBrake re-encode intermediates are discarded and remuxed instead.
+
+HandBrake always gets `--rate` from MediaInfo's original frame rate (never HandBrake's guessed 29.97).
 
 ### `aom_opus_encoder.py`
 
@@ -68,13 +74,39 @@ If HandBrakeCLI fails or cannot determine the frame rate, ffmpeg is used as a fa
 
 ### `xav_automation.py`
 
-`xav_automation.py` creates a HandBrakeCLI CFR intermediate for **all** sources (both VFR and CFR) because xav requires seekable, constant-frame-rate input. The intermediate encoder is selected automatically based on resolution and HDR status:
+xav requires seekable, constant-frame-rate input in `yuv420p` or `yuv420p10le` only. MediaInfo/ffprobe "CFR" flags are not trusted.
 
-- **≤1080p SDR (8-bit)**: `x264` CRF 0, all-intra (`keyint=1:bframes=0`)
-- **≤1080p SDR (10-bit / Hi10p)**: `x264_10bit` CRF 0, all-intra (`keyint=1:bframes=0`)
-- **>1080p or HDR**: `x265_10bit` CRF 0, normal GOP (not all-intra)
+**Skip HandBrake** (mkvmerge video-only remux, 1080p or 4K/HDR) only when all of these are true:
 
-If HandBrakeCLI fails or cannot determine the frame rate, ffmpeg is used as a fallback with equivalent settings.
+1. Packet-PTS probe proves CFR (fail-closed)
+2. MediaInfo `FrameRate_Mode` is not VFR/Variable
+3. Pixel format is already `yuv420p` or `yuv420p10le`
+
+Otherwise HandBrake runs (CFR hammer plus format conversion). ffmpeg is only a fallback if HandBrake produces an empty file.
+
+When HandBrake (or ffmpeg) re-encodes:
+
+- **≤1080p SDR, 8-bit 4:2:0**: `x264` CRF 0, all-intra (`keyint=1:bframes=0`), `yuv420p` (xav upconverts 8-bit internally)
+- **≤1080p SDR that needs 10-bit** (Hi10p, 12/16-bit, 4:2:2, 4:4:4, RGB): `x264_10bit` CRF 0, all-intra, `yuv420p10le`
+- **>1080p or HDR**: `x265_10bit` CRF 0, normal GOP, `yuv420p10le`
+
+An existing `.prep.mkv` is remade if it is VFR, fails the packet CFR probe, is not xav-compatible, or (for 4K/HDR that should remux) was a leftover HandBrake re-encode.
+
+#### Packet-level CFR probe
+
+The probe reads up to 800 video packets via ffprobe, merges same-frame NAL timestamps within 0.5 ms, and compares inter-frame durations to the median. It fails closed on any doubt (too few packets, negative timestamps, header FPS mismatch, too many outliers).
+
+A handful of duration outliers is treated as GOP-start / probe-window noise, not VFR. The first and last measured duration are dropped before the median/outlier test. At 0.2% max outliers, 2/799 already failed; the floor is now `max(4, 1% of measured durations)`.
+
+| Check | Value |
+| :--- | :--- |
+| Packets sampled | 800 |
+| Minimum unique PTS / durations | 120 |
+| Same-frame PTS merge | 0.5 ms |
+| Edge durations dropped | first and last (when enough samples remain) |
+| Duration slop | max(1.2% of median, 2 ms) — 2 ms so 24 fps MKV 41/42 ms ticks still count as CFR |
+| Outliers allowed | `max(4, 1% of measured durations)` |
+| Header FPS vs packet FPS | within 3% |
 
 ## Encoder-Specific Parameters
 
@@ -123,7 +155,7 @@ Parameters initialized for the `svt-av1` encoder (as used in `svt_opus_encoder.p
 
 | Parameter | SDR | HDR (PQ) | HDR (HLG) | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| `--preset` | `1` (≤1080p) / `2` (>1080p) | `2` | `2` | Speed preset. Lower is slower and yields better compression efficiency. |
+| `--preset` | `1` (≤1080p) / `2` (>1080p) | `2` | `2` | Speed preset. Lower is slower and yields better compression efficiency. HDR uses 2 even at 1080p. |
 | `--crf` | `30` | `30` | `30` | Constant Rate Factor. Always passed. |
 | `--color-primaries` | `1` (BT.709) | `9` (BT.2020) | `9` (BT.2020) | Color primaries. |
 | `--transfer-characteristics` | `1` (BT.709) | `16` (PQ / SMPTE 2084) | `18` (HLG) | Transfer characteristics. |
@@ -144,10 +176,10 @@ Parameters used for the `svt-av1` encoder when invoked via `xav` (as used in `xa
 
 | Parameter | Value | Description |
 | :--- | :--- | :--- |
-| `--preset` | `1` (≤1080p) / `2` (>1080p) | Speed preset. Automatically chosen based on video height. |
+| `--preset` | `1` (≤1080p) / `2` (>1080p) | Speed preset. Chosen from video height only (HDR 1080p stays preset 1 unless `--preset` is set). |
 | `--tune` | `2` | SVT-AV1-Essential tune mode: 0=VQ, 1=PSNR, 2=SSIM, 3=IQ, 4=MS_SSIM. |
 
-*(Note: `--preset` and `--tune` can be overridden when executing the script. CRF is not passed as a default parameter.)*
+*(Note: `--preset` and `--tune` can be overridden when executing the script. CRF is not passed as a default parameter. Color primaries/transfer/matrix are not set on the xav command line.)*
 
 ## Chunking Encoder Initiation Commands
 
@@ -187,6 +219,8 @@ av1an -i <vpy_script> -o <encoded_mkv> -n \
 ```
 
 `<calculated_workers>` is `(cpu_count // 2) - 1` (minimum 1), not a fixed worker count.
+
+The VapourSynth script uses `ffms2.Source`, optional `std.CropAbs` when `--autocrop` is set, then `resize.Point` to `YUV420P10` with `matrix_in_s="709"` (SDR) or `"2020ncl"` (HDR).
 
 ### xav (SVT-AV1)
 Arguments used to start `xav` using the SVT-AV1 encoder (as used in `xav_automation.py`):
