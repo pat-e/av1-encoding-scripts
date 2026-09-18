@@ -11,9 +11,9 @@
 # Otherwise HandBrake: 1080p SDR → x264 / x264_10bit all-intra; 4K/HDR → x265_10bit.
 # Format convert: 12/16-bit → 10-bit; 4:2:2 / 4:4:4 / RGB → yuv420p10le.
 # ffmpeg is only a fallback if HandBrake produces an empty file.
-# 1080p or lower: -p "--preset 1 --tune 1"  -w 4  -b 1
-# Above 1080p:    -p "--preset 2 --tune 1"  -w 4  -b 1
-# --tune is SVT-AV1-Essential (default 1 = PSNR). Workers/buff are fixed, not CLI.
+# 1080p or lower: -p "--preset 1 --tune 2"  -w 4  -b 1
+# Above 1080p:    -p "--preset 2 --tune 2"  -w 4  -b 1
+# --tune is SVT-AV1-Essential (default 2 = SSIM). Workers/buff are fixed, not CLI.
 # Audio: AAC/Opus remuxed. Else: Nightmode Dialogue pan (`<` so the mix cannot clip)
 # → ffmpeg loudnorm 2-pass linear (I=-18, TP=-1.5, LRA=20) → opusenc.
 # Final mkvmerge: xav video + processed/remuxed audio + source subs/attachments/chapters.
@@ -45,7 +45,7 @@ XAV_WORKERS = 4
 PRESET_1080 = 1
 PRESET_4K = 2
 HEIGHT_4K = 1080
-# SVT-AV1-Essential --tune (default 1 = PSNR).
+# SVT-AV1-Essential --tune (default 2 = SSIM).
 # https://github.com/nekotrix/SVT-AV1-Essential/blob/Essential-v4.0.1/Docs/Parameters.md
 XAV_TUNE = 2
 TUNE_NAMES = {
