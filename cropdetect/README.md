@@ -63,13 +63,22 @@ Snapping only runs when the detection is clearly letterboxed (width ≈ full fra
 
 ## Installation
 
-The script is already in this repository. Make it executable if you want to run it directly:
+This folder is the standalone crop tool. From the repository root:
 
 ```bash
-chmod +x cropdetect.py
+chmod +x cropdetect/cropdetect.py
+python3 cropdetect/cropdetect.py "path/to/your/video.mkv"
+```
+
+To put it on your `PATH`:
+
+```bash
+ln -s /path/to/av1-encoding-scripts/cropdetect/cropdetect.py ~/bin/cropdetect.py
 ```
 
 ## Usage
+
+From this directory:
 
 ```bash
 python3 cropdetect.py "path/to/your/video.mkv"
@@ -147,7 +156,7 @@ Recommendation: Do not crop.
 
 ## Integration with Other Scripts
 
-`svt_opus_encoder.py` and `aom_opus_encoder.py` still contain an **older copy** of this logic behind `--autocrop`. They have not been switched to this standalone script yet. `xav_automation.py` uses xav's native autocrop and does not call `cropdetect.py`.
+[`svt_opus_encoder.py`](../svt_opus_encoder.py) and [`aom_opus_encoder.py`](../aom_opus_encoder.py) still contain an **older copy** of this logic behind `--autocrop`. They have not been switched to this standalone script yet. [`xav_automation.py`](../xav_automation.py) uses xav's native autocrop and does not call this tool.
 
 ## Notes
 

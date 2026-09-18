@@ -1,6 +1,6 @@
 # Encoding Configuration Parameters
 
-This document details the configuration parameters used across the AomEnc, SVT-AV1, and xav encoding scripts.
+This document details the configuration parameters used across the AomEnc, SVT-AV1, and xav encoding scripts. How the pipelines run (and why) is in [GUIDE.md](GUIDE.md).
 
 ## Audio Loudness Normalization
 
