@@ -67,12 +67,14 @@ CFR_FULL_SUFFIX = ".cfr_full.mkv"
 PREP_SUFFIX = ".prep.mkv"
 
 # Fail-closed packet-PTS CFR probe. MediaInfo FrameRate_Mode is not proof.
+# Relative 1.2% is too tight for MKV 1ms ticks (24 fps = 41ms vs 42ms → fake 33% outliers).
 CFR_DURATION_REL_TOL = 0.012
+CFR_DURATION_ABS_TOL = 0.002
+CFR_PTS_MERGE = 0.0005
 CFR_MAX_OUTLIER_RATIO = 0.002
 CFR_MIN_PACKETS = 120
 CFR_PROBE_PACKETS = 800
 CFR_HEADER_FPS_REL_TOL = 0.03
-CFR_PTS_JUMP_ALLOW = 2
 
 XAV_PIX_FMTS = {"yuv420p", "yuv420p10le"}
 
@@ -464,7 +466,11 @@ def _read_video_packets(source_file, limit):
 
 
 def probe_true_cfr(source_file, track=None):
-    """Return (is_true_cfr, reason, nominal_fps). Fail closed on any doubt."""
+    """Return (is_true_cfr, reason, nominal_fps). Fail closed on any doubt.
+
+    Uses unique display PTS (merge same-frame NALs). Allows ±2ms so 24 fps
+    MKV files with 41ms/42ms ticks still count as CFR.
+    """
     packets = _read_video_packets(source_file, CFR_PROBE_PACKETS)
     if packets is None:
         return False, "ffprobe error", None
@@ -484,16 +490,15 @@ def probe_true_cfr(source_file, track=None):
         times.append(value)
     if len(times) < CFR_MIN_PACKETS:
         return False, f"too few packets ({len(times)})", None
-    dups = 0
-    back = 0
-    for first, second in zip(times, times[1:]):
-        if second < first - 1e-6:
-            back += 1
-        elif abs(second - first) < 1e-9:
-            dups += 1
-    if dups + back > CFR_PTS_JUMP_ALLOW:
-        return False, f"non-monotonic PTS (dups={dups}, back={back})", None
-    durations = [second - first for first, second in zip(times, times[1:]) if second > first]
+    times.sort()
+    unique = []
+    for value in times:
+        if unique and abs(value - unique[-1]) < CFR_PTS_MERGE:
+            continue
+        unique.append(value)
+    if len(unique) < CFR_MIN_PACKETS:
+        return False, f"too few unique PTS ({len(unique)})", None
+    durations = [second - first for first, second in zip(unique, unique[1:])]
     if len(durations) < CFR_MIN_PACKETS:
         return False, f"too few durations ({len(durations)})", None
     ordered = sorted(durations)
@@ -504,18 +509,21 @@ def probe_true_cfr(source_file, track=None):
         median = 0.5 * (ordered[mid - 1] + ordered[mid])
     if median <= 0:
         return False, "non-positive median duration", None
-    lo = median * (1.0 - CFR_DURATION_REL_TOL)
-    hi = median * (1.0 + CFR_DURATION_REL_TOL)
-    outliers = sum(1 for duration in durations if duration < lo or duration > hi)
+    slop = max(median * CFR_DURATION_REL_TOL, CFR_DURATION_ABS_TOL)
+    outliers = sum(1 for duration in durations if abs(duration - median) > slop)
     if outliers / len(durations) > CFR_MAX_OUTLIER_RATIO:
         pct = 100.0 * outliers / len(durations)
-        return False, f"{pct:.1f}% outliers ({outliers}/{len(durations)})", None
+        return False, f"{pct:.1f}% outliers ({outliers}/{len(durations)}, slop={slop*1000:.1f}ms)", None
     fps = 1.0 / median
     header = _fps_float(video_fps(track, source_file) if track is not None else None)
     if header and header > 0:
         if abs(fps - header) / header > CFR_HEADER_FPS_REL_TOL:
             return False, f"header {header:.3f} fps vs packets {fps:.3f} fps", None
-    return True, f"median {median:.5f} s, {outliers}/{len(durations)} outliers, ~{fps:.3f} fps", f"{fps:.3f}"
+    return (
+        True,
+        f"median {median*1000:.2f} ms, {outliers}/{len(durations)} outliers, ~{fps:.3f} fps",
+        f"{fps:.3f}",
+    )
 
 
 def handbrake_rate(track, source_file, vfr_target=None):
