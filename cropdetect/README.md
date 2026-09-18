@@ -63,25 +63,18 @@ Snapping only runs when the detection is clearly letterboxed (width ≈ full fra
 
 ## Installation
 
-This folder is the standalone crop tool. From the repository root:
-
-```bash
-chmod +x cropdetect/cropdetect.py
-python3 cropdetect/cropdetect.py "path/to/your/video.mkv"
-```
-
-To put it on your `PATH`:
-
-```bash
-ln -s /path/to/av1-encoding-scripts/cropdetect/cropdetect.py ~/bin/cropdetect.py
-```
+The script starts with `#!/usr/bin/env python3`. Copy it into your `bin` folder (or run it from this directory) and invoke it by name.
 
 ## Usage
 
-From this directory:
+```bash
+cropdetect.py "path/to/your/video.mkv"
+```
+
+From this folder, same thing:
 
 ```bash
-python3 cropdetect.py "path/to/your/video.mkv"
+./cropdetect.py "path/to/your/video.mkv"
 ```
 
 A 45-minute episode at the default 2s interval is on the order of ~1,300 seeks per pass (Pass 2 only runs if a crop would be applied). Use more workers if you have the cores.
