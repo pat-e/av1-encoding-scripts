@@ -11,9 +11,10 @@
 # Otherwise HandBrake: 1080p SDR → x264 / x264_10bit all-intra; 4K/HDR → x265_10bit.
 # Format convert: 12/16-bit → 10-bit; 4:2:2 / 4:4:4 / RGB → yuv420p10le.
 # ffmpeg is only a fallback if HandBrake produces an empty file.
-# 1080p or lower: -p "--preset 1 --tune 2"  -w 4  -b 1
-# Above 1080p:    -p "--preset 2 --tune 2"  -w 4  -b 1
-# --tune is SVT-AV1-Essential (default 2 = SSIM). Workers/buff are fixed, not CLI.
+# 1080p or lower: -p "--preset 1 --tune 2 --crf 30"  -w 4  -b 1
+# Above 1080p:    -p "--preset 2 --tune 2 --crf 30"  -w 4  -b 1
+# --tune is SVT-AV1-Essential (default 2 = SSIM). --crf 30 always so Essential
+# does not apply --quality medium (CRF 35) above 1080p. Workers/buff are fixed.
 # Audio: AAC/Opus remuxed. Else: Nightmode Dialogue pan (`<` so the mix cannot clip)
 # → ffmpeg loudnorm 2-pass linear (I=-18, TP=-1.5, LRA=20) → opusenc.
 # Final mkvmerge: xav video + processed/remuxed audio + source subs/attachments/chapters.
@@ -48,6 +49,8 @@ HEIGHT_4K = 1080
 # SVT-AV1-Essential --tune (default 2 = SSIM).
 # https://github.com/nekotrix/SVT-AV1-Essential/blob/Essential-v4.0.1/Docs/Parameters.md
 XAV_TUNE = 2
+# Always pass --crf so Essential does not use --quality medium (CRF 35) above 1080p.
+DEFAULT_CRF = 30
 TUNE_NAMES = {
     0: "VQ",
     1: "PSNR",
@@ -379,6 +382,12 @@ def xav_tune(override=None):
     if override is not None:
         return int(override)
     return int(XAV_TUNE)
+
+
+def xav_crf(override=None):
+    if override is not None:
+        return int(override)
+    return int(DEFAULT_CRF)
 
 
 def detect_vfr(media_info):
@@ -1143,23 +1152,25 @@ def mux_final(dest, xav_output, source_file, audio_plan):
         raise RuntimeError(f"mkvmerge produced an empty file: {dest}")
 
 
-def run_xav(xav_input, xav_output, track, preset_override=None, tune_override=None):
+def run_xav(xav_input, xav_output, track, preset_override=None, tune_override=None, crf_override=None):
     if file_is_usable(xav_output):
         print(f"    - Reusing existing xav output (resume): {xav_output}")
         return
 
     preset = xav_preset(track, preset_override)
     tune = xav_tune(tune_override)
+    crf = xav_crf(crf_override)
     workers = xav_worker_count()
     buff = XAV_BUFF
     path_label = "4K+" if is_4k_path(track) else "1080p or lower"
     print(f"    - Path: {path_label} (height={video_height(track)})")
     print(
-        f"    - Workers: {workers}  preset: {preset}  tune: {tune} ({TUNE_NAMES.get(tune, '?')})  "
+        f"    - Workers: {workers}  preset: {preset}  crf: {crf}  "
+        f"tune: {tune} ({TUNE_NAMES.get(tune, '?')})  "
         f"-b {buff}  (no -a: audio is this script)"
     )
 
-    encoder_params = f"--preset {preset} --tune {tune}"
+    encoder_params = f"--preset {preset} --tune {tune} --crf {crf}"
     xav_args = [
         "xav",
         "-e", XAV_ENCODER,
@@ -1226,7 +1237,7 @@ def video_temp_files(current_dir, file_path, extra):
     return files
 
 
-def main(no_downmix=False, preset=None, tune=None, norm_i=None, norm_tp=None):
+def main(no_downmix=False, preset=None, tune=None, crf=None, norm_i=None, norm_tp=None):
     check_tools()
     global LOUDNESS_I, LOUDNESS_TP
     if norm_i is not None:
@@ -1291,6 +1302,7 @@ def main(no_downmix=False, preset=None, tune=None, norm_i=None, norm_tp=None):
                 track,
                 preset_override=preset,
                 tune_override=tune,
+                crf_override=crf,
             )
 
             audio_temp_dir = None
@@ -1386,6 +1398,15 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--crf",
+        type=int,
+        default=None,
+        help=(
+            f"Override SVT-AV1 CRF. Default: {DEFAULT_CRF} for all resolutions "
+            "(overrides Essential --quality medium, which would be CRF 35 above 1080p)."
+        ),
+    )
+    parser.add_argument(
         "--norm-i",
         type=float,
         default=None,
@@ -1402,6 +1423,7 @@ if __name__ == "__main__":
         no_downmix=args.no_downmix,
         preset=args.preset,
         tune=args.tune,
+        crf=args.crf,
         norm_i=args.norm_i,
         norm_tp=args.norm_tp,
     )

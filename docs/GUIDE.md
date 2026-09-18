@@ -108,13 +108,14 @@ xav_automation.py [options]
 *   `--no-downmix`: Keep surround on re-encoded tracks (no Nightmode Dialogue pan). AAC/Opus are always remuxed.
 *   `--preset <int>`: Override SVT-AV1 preset. Default: 1 if height ≤1080, else 2 (height only; HDR 1080p still uses preset 1 unless overridden).
 *   `--tune <int>`: SVT-AV1-Essential `--tune` mode: 0=VQ, 1=PSNR, 2=SSIM, 3=IQ, 4=MS_SSIM (default: 2 = SSIM).
+*   `--crf <int>`: Override SVT-AV1 CRF. Default: 30 for all resolutions (SDR and HDR). Always passed so Essential does not use CRF 35 above 1080p.
 *   `--norm-i <float>`: Target integrated loudness in LUFS (default: -18.0).
 *   `--norm-tp <float>`: True-peak ceiling in dBTP (default: -1.5).
 
 **Workflow specific to `xav_automation.py`:**
 1. **CFR / pixel-format gate**: ffprobe packet PTS must prove CFR (fail-closed). MediaInfo `FrameRate_Mode` is not treated as proof of CFR. If MediaInfo reports VFR, HandBrake always runs. A few GOP-start or probe-window duration outliers are allowed so real CFR MKVs are not sent to HandBrake. xav accepts only `yuv420p` or `yuv420p10le`; anything else (4:2:2, 4:4:4, RGB, 12-bit+) is converted.
 2. **Video Preparation**: Skip HandBrake only when packets prove CFR, MediaInfo is not VFR, and the pixel format is already xav-compatible. Then mkvmerge video-only remuxes (1080p or 4K/HDR; no re-encode; keeps HDR10/DoVi track properties). Otherwise HandBrake: x264 all-intra for ≤1080p SDR 8-bit 4:2:0, `x264_10bit` all-intra for 1080p SDR that needs 10-bit, `x265_10bit` normal GOP for >1080p or HDR. ffmpeg is a fallback if HandBrake produces an empty file.
-3. **Video Encode**: `xav` handles autocrop, scene-detect, and chunking natively (`xav -e svt-av1 -p "--preset <p> --tune <t>" -w 4 -b 1`). No `av1an` or `.vpy` required. CRF is not passed.
+3. **Video Encode**: `xav` handles autocrop, scene-detect, and chunking natively (`xav -e svt-av1 -p "--preset <p> --tune <t> --crf <c>" -w 4 -b 1`). No `av1an` or `.vpy` required. CRF is always 30 unless `--crf` is set (same as `svt_opus_encoder.py`), so Essential does not apply `--quality medium` / CRF 35 above 1080p.
 4. **Audio Processing**: Audio is extracted, optionally downmixed (with multiple filter fallbacks), normalized with a two-pass linear constant-gain loudnorm (sample rate restored after loudnorm), and encoded to Opus. AAC/Opus tracks are remuxed directly.
 5. **Remuxing**: Combines using `mkvmerge` (xav video + processed/remuxed audio + source subs/attachments/chapters). Track metadata (flags, titles, languages) is restored from the source. Failed files move the source MKV to `failed/` while keeping video intermediates for easy retry resuming.
 

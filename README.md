@@ -6,7 +6,7 @@ Batch-encode `.mkv` files to **AV1** video and **Opus** audio. Drop the MKVs in 
 | :--- | :--- | :--- |
 | [`svt_opus_encoder.py`](svt_opus_encoder.py) | [SVT-AV1-Essential](https://github.com/nekotrix/SVT-AV1-Essential/) via av1an | Auto SDR/HDR and 1080p/4K. Default CRF 30, tune SSIM. |
 | [`aom_opus_encoder.py`](aom_opus_encoder.py) | [aom-psy101](https://gitlab.com/damian101/aom-psy101) via av1an | Same prep path as SVT. Default cq-level 25, two-pass. |
-| [`xav_automation.py`](xav_automation.py) | [xav](https://github.com/emrakyz/xav) + SVT-AV1-Essential | Native autocrop/chunking. Packet-CFR probe before HandBrake. |
+| [`xav_automation.py`](xav_automation.py) | [xav](https://github.com/emrakyz/xav) + SVT-AV1-Essential | Native autocrop/chunking. Packet-CFR probe before HandBrake. CRF 30 always (not Essential’s 35 above 1080p). |
 | [`cropdetect/cropdetect.py`](cropdetect/cropdetect.py) | ffmpeg cropdetect | Safe crop for mixed AR (flashbacks, IMAX). Own [readme](cropdetect/). |
 
 Put the scripts (or symlinks) on your `PATH`, `cd` to a directory of `.mkv` files, and run the script you want:

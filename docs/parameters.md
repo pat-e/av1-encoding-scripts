@@ -178,8 +178,9 @@ Parameters used for the `svt-av1` encoder when invoked via `xav` (as used in `xa
 | :--- | :--- | :--- |
 | `--preset` | `1` (≤1080p) / `2` (>1080p) | Speed preset. Chosen from video height only (HDR 1080p stays preset 1 unless `--preset` is set). |
 | `--tune` | `2` | SVT-AV1-Essential tune mode: 0=VQ, 1=PSNR, 2=SSIM, 3=IQ, 4=MS_SSIM. |
+| `--crf` | `30` | Constant Rate Factor. Always passed for every resolution so Essential does not apply `--quality medium` (CRF 35) above 1080p. |
 
-*(Note: `--preset` and `--tune` can be overridden when executing the script. CRF is not passed as a default parameter. Color primaries/transfer/matrix are not set on the xav command line.)*
+*(Note: `--preset`, `--tune`, and `--crf` can be overridden when executing the script. Color primaries/transfer/matrix are not set on the xav command line.)*
 
 ## Chunking Encoder Initiation Commands
 
@@ -226,7 +227,7 @@ The VapourSynth script uses `ffms2.Source`, optional `std.CropAbs` when `--autoc
 Arguments used to start `xav` using the SVT-AV1 encoder (as used in `xav_automation.py`):
 ```text
 xav -e svt-av1 \
-  -p "--preset <preset> --tune <tune>" \
+  -p "--preset <preset> --tune <tune> --crf <crf>" \
   -w 4 \
   -b 1 \
   <intermediate_file> \
@@ -236,5 +237,6 @@ xav -e svt-av1 \
 - `-b 1`: Buffer size of 1.
 - `--preset`: Defaults to `1` for ≤1080p, `2` for >1080p (overridable via `--preset`).
 - `--tune`: Defaults to `2` (SSIM) (overridable via `--tune`).
+- `--crf`: Defaults to `30` for all resolutions (overridable via `--crf`). Always passed.
 
-*(Note: `--preset` and `--tune` can be overridden when executing the script, which modifies the arguments passed to `-p`. No `-a` flag is used — audio processing is handled entirely by the script.)*
+*(Note: `--preset`, `--tune`, and `--crf` can be overridden when executing the script, which modifies the arguments passed to `-p`. No `-a` flag is used — audio processing is handled entirely by the script.)*
