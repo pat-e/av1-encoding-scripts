@@ -17,7 +17,9 @@
 # does not apply --quality medium (CRF 35) above 1080p. Workers/buff are fixed.
 # Audio: AAC/Opus remuxed. Else: Nightmode Dialogue pan (`<` so the mix cannot clip)
 # → ffmpeg loudnorm 2-pass linear (I=-18, TP=-1.5, LRA=20) → opusenc.
-# Final mkvmerge: xav video + processed/remuxed audio + source subs/attachments/chapters.
+# Final mkvmerge: xav video + processed/remuxed audio + source subs/chapters.
+# Font attachments: only those referenced by remaining ASS/SSA (skip with --nofontsclean / -nfc).
+# Non-font attachments are always kept. The untouched source stays in original/.
 
 import json
 import math
@@ -31,7 +33,7 @@ from datetime import datetime
 from pathlib import Path
 
 REQUIRED_TOOLS = [
-    "ffmpeg", "ffprobe", "mkvmerge", "mkvpropedit",
+    "ffmpeg", "ffprobe", "mkvmerge", "mkvextract", "mkvpropedit",
     "opusenc", "mediainfo", "xav", "HandBrakeCLI",
 ]
 DIR_COMPLETED = Path("completed")
@@ -109,11 +111,42 @@ class Tee:
         return any(getattr(f, "isatty", lambda: False)() for f in self.files)
 
 
-def check_tools():
-    for tool in REQUIRED_TOOLS:
-        if shutil.which(tool) is None:
-            print(f"Required tool '{tool}' not found in PATH.")
+def fonttools_available():
+    try:
+        import fontTools.ttLib  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def check_tools(report_only=False):
+    """PATH tools are required. fonttools is optional: missing means skip font cleanup."""
+    missing = [tool for tool in REQUIRED_TOOLS if shutil.which(tool) is None]
+    has_fonttools = fonttools_available()
+    if report_only:
+        print("Tool check (no encode)")
+        for tool in REQUIRED_TOOLS:
+            state = "OK" if tool not in missing else "MISSING"
+            print(f"  {state:7} {tool}")
+        if has_fonttools:
+            print("  OK      fonttools (Python package)")
+        else:
+            print("  MISSING fonttools (Python package)")
+            print("          Arch: sudo pacman -S python-fonttools")
+            print("          Else: pip install fonttools")
+            print("          Without it, font cleanup is skipped and every font stays attached.")
+        if missing:
+            print(f"Missing required tools: {', '.join(missing)}")
             sys.exit(1)
+        if not has_fonttools:
+            print("Required tools are present. fonttools is missing, so font cleanup will be skipped.")
+            sys.exit(1)
+        print("All tools available.")
+        return
+    if missing:
+        for tool in missing:
+            print(f"Required tool '{tool}' not found in PATH.")
+        sys.exit(1)
 
 
 def run_cmd(cmd, capture_output=False, check=True):
@@ -1122,12 +1155,23 @@ def process_audio_tracks(source_file, audio_temp_dir, no_downmix):
     return plan
 
 
-def mux_final(dest, xav_output, source_file, audio_plan):
-    """xav video only + audio in source order + source subs/attachments/chapters."""
+def mux_final(dest, xav_output, source_file, audio_plan, clean_fonts=True, work_dir=None):
+    """xav video only + audio in source order + source subs/chapters.
+
+    Default: drop font attachments not referenced by remaining ASS/SSA.
+    Non-font attachments stay. --nofontsclean copies every attachment.
+    """
     extra = [
         "--no-video", "--no-subtitles", "--no-attachments",
         "--no-chapters", "--no-global-tags",
     ]
+    source_tail = ["--no-video", "--no-audio"]
+    attach_args = []
+    if clean_fonts:
+        kept = fonts_to_keep(source_file, work_dir)
+        if kept is not None:
+            source_tail.append("--no-attachments")
+            attach_args = attachment_merge_args(kept)
     args = [
         "mkvmerge", "-o", str(dest),
         "--title", "",
@@ -1144,12 +1188,191 @@ def mux_final(dest, xav_output, source_file, audio_plan):
                 "--language", f"0:{item['language']}",
                 "--track-name", f"0:{item.get('title') or ''}",
             ] + sync + [str(item["path"])]
-    args += ["--no-video", "--no-audio", str(source_file)]
+    args += source_tail + [str(source_file)] + attach_args
     print("Assembling final file with mkvmerge...")
     print(f"    - mkvmerge: {' '.join(args)}")
     run_cmd(args)
     if not file_is_usable(dest):
         raise RuntimeError(f"mkvmerge produced an empty file: {dest}")
+
+
+FONT_MIME_MARKERS = ("font", "truetype", "opentype", "sfnt", "application/x-truetype-font")
+
+
+def is_font_attachment(att):
+    mime = str(att.get("content_type") or "").lower()
+    name = str(att.get("file_name") or "").lower()
+    if any(marker in mime for marker in FONT_MIME_MARKERS):
+        return True
+    return name.endswith((".ttf", ".otf", ".ttc", ".otc"))
+
+
+def safe_font_filename(name):
+    return "".join(c for c in name if c.isalpha() or c.isdigit() or c in " .-_").rstrip() or "font"
+
+
+def get_ass_font_names(ass_path):
+    """Style Fontname plus \\fn overrides. Case-insensitive. V4 and V4+."""
+    fonts = set()
+    in_styles = False
+    in_events = False
+    fontname_idx = -1
+    with open(ass_path, "r", encoding="utf-8", errors="ignore") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith("["):
+                section = line.lower()
+                in_styles = section in ("[v4+ styles]", "[v4 styles]")
+                in_events = section == "[events]"
+                continue
+            if in_styles:
+                if line.lower().startswith("format:"):
+                    cols = [col.strip().lower() for col in line.split(":", 1)[1].split(",")]
+                    fontname_idx = cols.index("fontname") if "fontname" in cols else -1
+                elif line.lower().startswith("style:") and fontname_idx != -1:
+                    cols = [col.strip() for col in line.split(":", 1)[1].split(",")]
+                    if len(cols) > fontname_idx and cols[fontname_idx]:
+                        fonts.add(cols[fontname_idx])
+            if in_events and line.lower().startswith("dialogue:"):
+                for match in re.findall(r"\\fn([^\\}]+)", line):
+                    name = match.strip()
+                    if name:
+                        fonts.add(name)
+    return {name.lower() for name in fonts}
+
+
+def get_internal_font_names(font_path):
+    from fontTools.ttLib import TTFont
+    names = set()
+    try:
+        font = TTFont(str(font_path), fontNumber=0)
+        for record in font["name"].names:
+            if record.nameID in (1, 4, 16):
+                try:
+                    names.add(record.toUnicode().lower())
+                except Exception:
+                    pass
+        font.close()
+    except Exception as exc:
+        print(f"      Warning: could not read font metadata for {font_path.name}: {exc}")
+    return names
+
+
+def fonts_to_keep(source_file, work_dir):
+    """Attachments to re-add, or None if the source has no font attachments.
+
+    Fonts are kept only when an ASS/SSA style or \\fn names them (filename or
+    internal family / full / typographic name). Other attachments are always kept.
+    """
+    info = mkvmerge_identify(source_file)
+    attachments = info.get("attachments") or []
+    font_atts = [a for a in attachments if is_font_attachment(a)]
+    other_atts = [a for a in attachments if a not in font_atts]
+    if not font_atts:
+        print("    - Font cleaner: no font attachments.")
+        return None
+    if not fonttools_available():
+        print(
+            "    - Font cleanup could not be completed because fonttools is missing. "
+            "Keeping every font attachment."
+        )
+        print("      Arch: sudo pacman -S python-fonttools    Else: pip install fonttools")
+        return None
+
+    tracks = info.get("tracks") or []
+    ass_tracks = []
+    for track in tracks:
+        if track.get("type") != "subtitles":
+            continue
+        codec_id = str((track.get("properties") or {}).get("codec_id") or "")
+        codec = str(track.get("codec") or "")
+        if "S_TEXT/ASS" in codec_id or "S_TEXT/SSA" in codec_id or "SubStationAlpha" in codec:
+            ass_tracks.append(track)
+
+    temp_dir = Path(work_dir) if work_dir else Path(tempfile.mkdtemp(prefix="font_tmp_"))
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    required = set()
+    if ass_tracks:
+        extract = ["mkvextract", "tracks", str(source_file)]
+        ass_files = []
+        for track in ass_tracks:
+            out_ass = temp_dir / f"subs_{track['id']}.ass"
+            extract.append(f"{track['id']}:{out_ass}")
+            ass_files.append(out_ass)
+        print(f"    - Font cleaner: reading {len(ass_tracks)} ASS/SSA track(s)...")
+        run_cmd(extract)
+        for ass_file in ass_files:
+            found = get_ass_font_names(ass_file)
+            print(f"      - {ass_file.name}: {len(found)} font name(s)")
+            required.update(found)
+        print(f"    - Fonts referenced by subtitles: {sorted(required) or '(none)'}")
+    else:
+        print("    - Font cleaner: no ASS/SSA tracks; dropping every font attachment.")
+
+    kept = []
+    if required:
+        extract_fonts = ["mkvextract", "attachments", str(source_file)]
+        for att in font_atts:
+            out_font = temp_dir / f"att_{att['id']}_{safe_font_filename(att.get('file_name') or 'font')}"
+            extract_fonts.append(f"{att['id']}:{out_font}")
+            att["temp_path"] = out_font
+        print(f"    - Font cleaner: checking {len(font_atts)} font attachment(s)...")
+        run_cmd(extract_fonts)
+        for att in font_atts:
+            path = att.get("temp_path")
+            if not path or not Path(path).exists():
+                print(f"      [SKIP]  id {att.get('id')} did not extract")
+                continue
+            filename_stem = Path(att.get("file_name") or "").stem.lower()
+            if filename_stem and filename_stem in required:
+                print(f"      [MATCH] '{att.get('file_name')}' via filename")
+                kept.append(att)
+                continue
+            internal = get_internal_font_names(path)
+            hit = required.intersection(internal)
+            if hit:
+                print(f"      [MATCH] '{att.get('file_name')}' via internal names: {sorted(hit)}")
+                kept.append(att)
+            else:
+                print(f"      [SKIP]  '{att.get('file_name')}' unused. Internal: {sorted(internal)[:5]}")
+    else:
+        print(f"    - Font cleaner: dropping all {len(font_atts)} font attachment(s).")
+
+    font_kept = len(kept)
+
+    if other_atts:
+        extract_other = ["mkvextract", "attachments", str(source_file)]
+        for att in other_atts:
+            out_other = temp_dir / f"other_{att['id']}_{safe_font_filename(att.get('file_name') or 'att')}"
+            extract_other.append(f"{att['id']}:{out_other}")
+            att["temp_path"] = out_other
+        print(f"    - Font cleaner: keeping {len(other_atts)} non-font attachment(s).")
+        run_cmd(extract_other)
+        kept.extend(a for a in other_atts if a.get("temp_path") and Path(a["temp_path"]).exists())
+
+    print(
+        f"    - Font cleaner: keeping {font_kept} font(s), "
+        f"dropping {len(font_atts) - font_kept}."
+    )
+    return kept
+
+
+def attachment_merge_args(attachments):
+    args = []
+    for att in attachments:
+        path = att.get("temp_path")
+        if not path:
+            continue
+        mime = att.get("content_type") or "application/octet-stream"
+        name = att.get("file_name") or Path(path).name
+        args += [
+            "--attachment-name", name,
+            "--attachment-mime-type", mime,
+            "--attach-file", str(path),
+        ]
+    return args
 
 
 def run_xav(xav_input, xav_output, track, preset_override=None, tune_override=None, crf_override=None):
@@ -1237,7 +1460,10 @@ def video_temp_files(current_dir, file_path, extra):
     return files
 
 
-def main(no_downmix=False, preset=None, tune=None, crf=None, norm_i=None, norm_tp=None):
+def main(no_downmix=False, preset=None, tune=None, crf=None, norm_i=None, norm_tp=None, no_font_clean=False, check_only=False):
+    if check_only:
+        check_tools(report_only=True)
+        return
     check_tools()
     global LOUDNESS_I, LOUDNESS_TP
     if norm_i is not None:
@@ -1314,7 +1540,11 @@ def main(no_downmix=False, preset=None, tune=None, crf=None, norm_i=None, norm_t
                 audio_temp_dir = tempfile.mkdtemp(prefix="audio_tmp_")
                 print(f"Audio temporary directory created at: {audio_temp_dir}")
                 audio_plan = process_audio_tracks(file_path, audio_temp_dir, no_downmix)
-                mux_final(muxed, xav_output, file_path, audio_plan)
+                mux_final(
+                    muxed, xav_output, file_path, audio_plan,
+                    clean_fonts=not no_font_clean,
+                    work_dir=audio_temp_dir,
+                )
 
             strip_titles(muxed)
             restore_track_meta(muxed, audio_meta, sub_meta)
@@ -1418,6 +1648,16 @@ if __name__ == "__main__":
         default=None,
         help=f"True-peak ceiling in dBTP (default: {LOUDNESS_TP}).",
     )
+    parser.add_argument(
+        "--nofontsclean", "-nfc",
+        action="store_true",
+        help="Keep every font attachment. Default: drop fonts not used by remaining ASS/SSA tracks.",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Check required tools and fonttools, then exit. Does not encode.",
+    )
     args = parser.parse_args()
     main(
         no_downmix=args.no_downmix,
@@ -1426,4 +1666,6 @@ if __name__ == "__main__":
         crf=args.crf,
         norm_i=args.norm_i,
         norm_tp=args.norm_tp,
+        no_font_clean=args.nofontsclean,
+        check_only=args.check,
     )
