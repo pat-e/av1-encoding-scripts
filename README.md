@@ -17,11 +17,19 @@ svt_opus_encoder.py
 # or: xav_automation.py
 ```
 
-**Requires in `PATH`:** ffmpeg, ffprobe, mkvmerge, mkvpropedit, opusenc, mediainfo, HandBrakeCLI. Av1an scripts also need av1an, ffmsindex, and VapourSynth. xav needs `xav` built with SVT-AV1-Essential.
+**Requires in `PATH`:** ffmpeg, ffprobe, mkvmerge, mkvextract, mkvpropedit, opusenc, mediainfo, HandBrakeCLI. Av1an scripts also need av1an, ffmsindex, and VapourSynth. xav needs `xav` built with SVT-AV1-Essential. Python [fonttools](https://github.com/fonttools/fonttools) is optional (Arch: `python-fonttools`, otherwise `pip install fonttools`). Without it, unused-font cleanup is skipped and every font stays attached.
 
-Common flags: `--no-downmix`, `--autocrop` (av1an scripts), `--crf` / `--preset` / `--tune` / `--grain` where the encoder supports them, `--norm-i` / `--norm-tp` (defaults −18 LUFS / −1.5 dBTP).
+Common flags: `--no-downmix`, `--autocrop` (av1an scripts), `--crf` / `--preset` / `--tune` / `--grain` where the encoder supports them, `--norm-i` / `--norm-tp` (defaults −18 LUFS / −1.5 dBTP), `--nofontsclean` / `-nfc` (keep every attached font).
 
 Audio: AAC/Opus remuxed; everything else loudnorm → Opus. Output folders: `completed/`, `original/`, `failed/`, `conv_logs/`. Encodes resume from `.prep.mkv` / `temp-*.mkv` when present.
+
+**Subtitle fonts:** On the final mux, a font attachment is kept only when a remaining ASS/SSA track names it. Every other attachment stays. `--nofontsclean` / `-nfc` copies every font. The encode log records one line each for fonts kept, dropped, and missing. Kept and dropped use the font’s full name, not the attachment filename, so the same font matches across MKVs that attach it under different file names. Missing names are the ones written in the subtitles. A semicolon separates names, because a comma can be part of a font name. `(none)` means that list is empty.
+
+```
+    - FONT_CLEAN kept: Arial Bold; Noto Sans CJK JP
+    - FONT_CLEAN dropped: Comic Sans MS
+    - FONT_CLEAN missing: Open Sans
+```
 
 How it works and why (HandBrake vs remux, VFR, downmix, folders): **[Encoding guide](docs/GUIDE.md)**  
 Encoder flags, loudnorm, CFR probe, av1an/xav command lines: **[Parameters](docs/parameters.md)**

@@ -15,7 +15,8 @@ A standalone crop detector lives in [`../cropdetect/`](../cropdetect/). The same
 The scripts require several external tools to be installed and available in your system's `PATH`:
 
 *   **ffmpeg** & **ffprobe**: For video/audio extraction, filtering (cropdetect), loudnorm analysis, and (in `xav_automation.py`) packet-level CFR probing.
-*   **mkvtoolnix** (`mkvmerge`, `mkvpropedit`): For remuxing the final MKV file and restoring track metadata.
+*   **mkvtoolnix** (`mkvmerge`, `mkvextract`, `mkvpropedit`): For remuxing the final MKV file, reading subtitle tracks and attachments during font cleanup, and restoring track metadata.
+*   **fonttools** (optional Python package): Reads the name inside a font file so unused attachments can be dropped. Arch: `sudo pacman -S python-fonttools`. Elsewhere: `pip install fonttools`. If it is missing, font cleanup is skipped and every font stays attached.
 *   **opusenc** (opus-tools): For encoding audio tracks to the Opus codec.
 *   **mediainfo**: For extracting detailed media information (especially frame rate details and HDR metadata).
 *   **av1an**: The core chunking encoder used by `svt_opus_encoder.py` and `aom_opus_encoder.py` to run multiple encode workers in parallel.
@@ -42,6 +43,14 @@ The scripts require several external tools to be installed and available in your
     *   `svt_opus_encoder.py` and `aom_opus_encoder.py` use MediaInfo `FrameRate_Mode`. ≤1080p SDR always gets a HandBrake x264 all-intra intermediate. 4K/HDR CFR is an mkvmerge video-only remux (keeps HDR/DoVi metadata). VFR 4K/HDR uses HandBrake `x265_10bit`. ffmpeg is a fallback.
     *   `xav_automation.py` does not trust MediaInfo/ffprobe "CFR" flags. A packet-PTS probe must prove CFR, MediaInfo must not report VFR, and the pixel format must already be `yuv420p` or `yuv420p10le` before HandBrake is skipped. Then mkvmerge video-only remuxes (1080p or 4K/HDR). Otherwise HandBrake converts to CFR and to an xav-compatible 4:2:0 8-bit or 10-bit format. ffmpeg is a fallback.
 *   **Automatic Cropping**: Optional `--autocrop` flag detects black bars and applies the crop in VapourSynth before encoding (in `svt_opus_encoder.py` and `aom_opus_encoder.py`). `xav_automation.py` relies on xav's native autocrop (no CLI flag).
+*   **Subtitle font cleanup**: On the final mux, a font attachment is kept only when a remaining ASS/SSA style or `\fn` override names it (the attachment’s filename, or the font’s family, full, or typographic name). Every non-font attachment is kept. Names the subtitles ask for but no attachment provides are not in the output; they are logged as missing. With no ASS/SSA tracks, every font attachment is dropped. `--nofontsclean` / `-nfc` copies every font instead.
+    The per-file log in `conv_logs/` has one line for kept, one for dropped, and one for missing. Kept and dropped use the font’s full name, not the attachment filename, so the same font can be tracked across MKVs that use different file names. Names are separated with `; ` because a comma can be part of a font name (`Arial, Bold`). An empty list is `(none)`.
+
+    ```
+        - FONT_CLEAN kept: Arial Bold; Noto Sans CJK JP
+        - FONT_CLEAN dropped: Comic Sans MS
+        - FONT_CLEAN missing: Open Sans
+    ```
 *   **Organized Output**:
     *   Completed files are moved to a `completed/` directory.
     *   Original files are moved to an `original/` directory.
@@ -69,6 +78,7 @@ aom_opus_encoder.py [options]
 *   `--crf <int>`: Override aom `cq-level`. Default: 25 for all resolutions (SDR and HDR).
 *   `--norm-i <float>`: Target integrated loudness in LUFS (default: -18.0).
 *   `--norm-tp <float>`: True-peak ceiling in dBTP (default: -1.5).
+*   `--nofontsclean`, `-nfc`: Keep every font attachment. Default: drop fonts that remaining ASS/SSA tracks do not name.
 
 **Workflow specific to `aom_opus_encoder.py`:**
 1. **Detection**: Same MediaInfo HDR/4K rules as `svt_opus_encoder.py`. 10-bit BT.709 Hi10p stays SDR.
@@ -91,6 +101,7 @@ svt_opus_encoder.py [options]
 *   `--tune <int>`: SVT-AV1-Essential `--tune` mode: 0=VQ, 1=PSNR, 2=SSIM, 3=IQ, 4=MS_SSIM (default: 2 = SSIM).
 *   `--norm-i <float>`: Target integrated loudness in LUFS (default: -18.0).
 *   `--norm-tp <float>`: True-peak ceiling in dBTP (default: -1.5).
+*   `--nofontsclean`, `-nfc`: Keep every font attachment. Default: drop fonts that remaining ASS/SSA tracks do not name.
 
 **Workflow specific to `svt_opus_encoder.py`:**
 1. **Detection**: MediaInfo HDR format/transfer (PQ/HLG/DoVi) and height `>1080` choose the encode path. 10-bit BT.709 Hi10p stays SDR.
@@ -111,13 +122,14 @@ xav_automation.py [options]
 *   `--crf <int>`: Override SVT-AV1 CRF. Default: 30 for all resolutions (SDR and HDR). Always passed so Essential does not use CRF 35 above 1080p.
 *   `--norm-i <float>`: Target integrated loudness in LUFS (default: -18.0).
 *   `--norm-tp <float>`: True-peak ceiling in dBTP (default: -1.5).
+*   `--nofontsclean`, `-nfc`: Keep every font attachment. Default: drop fonts that remaining ASS/SSA tracks do not name.
 
 **Workflow specific to `xav_automation.py`:**
 1. **CFR / pixel-format gate**: ffprobe packet PTS must prove CFR (fail-closed). MediaInfo `FrameRate_Mode` is not treated as proof of CFR. If MediaInfo reports VFR, HandBrake always runs. A few GOP-start or probe-window duration outliers are allowed so real CFR MKVs are not sent to HandBrake. xav accepts only `yuv420p` or `yuv420p10le`; anything else (4:2:2, 4:4:4, RGB, 12-bit+) is converted.
 2. **Video Preparation**: Skip HandBrake only when packets prove CFR, MediaInfo is not VFR, and the pixel format is already xav-compatible. Then mkvmerge video-only remuxes (1080p or 4K/HDR; no re-encode; keeps HDR10/DoVi track properties). Otherwise HandBrake: x264 all-intra for ≤1080p SDR 8-bit 4:2:0, `x264_10bit` all-intra for 1080p SDR that needs 10-bit, `x265_10bit` normal GOP for >1080p or HDR. ffmpeg is a fallback if HandBrake produces an empty file.
 3. **Video Encode**: `xav` handles autocrop, scene-detect, and chunking natively (`xav -e svt-av1 -p "--preset <p> --tune <t> --crf <c>" -w 4 -b 1`). No `av1an` or `.vpy` required. CRF is always 30 unless `--crf` is set (same as `svt_opus_encoder.py`), so Essential does not apply `--quality medium` / CRF 35 above 1080p.
 4. **Audio Processing**: Audio is extracted, optionally downmixed (with multiple filter fallbacks), normalized with a two-pass linear constant-gain loudnorm (sample rate restored after loudnorm), and encoded to Opus. AAC/Opus tracks are remuxed directly.
-5. **Remuxing**: Combines using `mkvmerge` (xav video + processed/remuxed audio + source subs/attachments/chapters). Track metadata (flags, titles, languages) is restored from the source. Failed files move the source MKV to `failed/` while keeping video intermediates for easy retry resuming.
+5. **Remuxing**: Combines using `mkvmerge` (xav video + processed/remuxed audio + source subs/chapters). Font attachments are filtered as described under Subtitle font cleanup; other attachments are copied. The `FONT_CLEAN` lines are written to that file’s log. Track metadata (flags, titles, languages) is restored from the source. Failed files move the source MKV to `failed/` while keeping video intermediates for easy retry resuming.
 
 ## Process workflow
 
@@ -130,7 +142,7 @@ xav_automation.py [options]
 4.  **Audio Processing**:
     *   Remuxes AAC/Opus.
     *   Normalizes, downmixes (if applicable), and encodes other formats to Opus.
-5.  **Muxing**: Combines the newly encoded video and audio tracks using `mkvmerge`, copying source subtitles, attachments, and chapters, and preserving synchronization delays, metadata, and languages.
+5.  **Muxing**: Combines the newly encoded video and audio tracks using `mkvmerge`, copying source subtitles, non-font attachments, and chapters. Font attachments are kept only when a remaining ASS/SSA track names them, unless `--nofontsclean` is set. The encode log records `FONT_CLEAN kept`, `dropped`, and `missing` (one line each, names separated by `; `). Synchronization delays, metadata, and languages are preserved.
 6.  **Cleanup**: Moves files to respective folders (`completed/`, `original/`) and deletes temporary working files. On failure, the source goes to `failed/` and intermediates are kept.
 
 ## Notes
