@@ -25,7 +25,7 @@ The scripts require several external tools to be installed and available in your
 *   **Vapoursynth**: Required by `av1an` as the frame server via the generated `.vpy` scripts (`svt_opus_encoder.py` and `aom_opus_encoder.py`).
 *   *(Specific to `aom_opus_encoder.py`)*: **aom-psy101** encoder. You must download the correct version from [Damian101's aom-psy101 GitLab](https://gitlab.com/damian101/aom-psy101).
 *   *(Specific to `svt_opus_encoder.py`)*: **SVT-AV1-Essential** encoder. You must download the correct version from [nekotrix's SVT-AV1-Essential GitHub](https://github.com/nekotrix/SVT-AV1-Essential/).
-*   *(Specific to `xav_automation.py`)*: **xav** chunking encoder. You must download the source from [emrakyz's xav GitHub](https://github.com/emrakyz/xav) and build it specifically with the SVT-AV1-Essential encoder. xav does not use `av1an`, `ffmsindex`, or VapourSynth.
+*   *(Specific to `xav_automation.py`)*: **xav** chunking encoder. You must download the source from [emrakyz's xav GitHub](https://github.com/emrakyz/xav) and build it specifically with the SVT-AV1-Essential encoder. xav does not use `av1an`, `ffmsindex`, or VapourSynth. **taskset** (util-linux, already on Arch) pins the `xav` process so the last two logical CPUs stay free for the OS, desktop, and ssh.
 
 ## Features
 
@@ -123,11 +123,15 @@ xav_automation.py [options]
 *   `--norm-i <float>`: Target integrated loudness in LUFS (default: -18.0).
 *   `--norm-tp <float>`: True-peak ceiling in dBTP (default: -1.5).
 *   `--nofontsclean`, `-nfc`: Keep every font attachment. Default: drop fonts that remaining ASS/SSA tracks do not name.
+*   `--workers <N>`: Override xav `-w`. Default is `allowed_cpus // 2` after reserving the last two logical CPUs (15 on a 32-thread CPU such as a 7950X3D).
+*   `--reserve-threads <N>`: How many logical CPUs at the high end xav must not use (default: 2). On 32 threads that is `taskset -c 0-29`.
+*   `--no-taskset`: Do not pin xav. Worker count still follows the reserved-CPU formula unless `--workers` is set.
+*   `--lp <N>`: SVT-AV1-Essential `--lp` (LevelOfParallelism 0–6) for each xav worker. Default: 2, same density as `svt_opus_encoder.py`.
 
 **Workflow specific to `xav_automation.py`:**
 1. **CFR / pixel-format gate**: ffprobe packet PTS must prove CFR (fail-closed). MediaInfo `FrameRate_Mode` is not treated as proof of CFR. If MediaInfo reports VFR, HandBrake always runs. A few GOP-start or probe-window duration outliers are allowed so real CFR MKVs are not sent to HandBrake. xav accepts only `yuv420p` or `yuv420p10le`; anything else (4:2:2, 4:4:4, RGB, 12-bit+) is converted.
 2. **Video Preparation**: Skip HandBrake only when packets prove CFR, MediaInfo is not VFR, and the pixel format is already xav-compatible. Then mkvmerge video-only remuxes (1080p or 4K/HDR; no re-encode; keeps HDR10/DoVi track properties). Otherwise HandBrake: x264 all-intra for ≤1080p SDR 8-bit 4:2:0, `x264_10bit` all-intra for 1080p SDR that needs 10-bit, `x265_10bit` normal GOP for >1080p or HDR. ffmpeg is a fallback if HandBrake produces an empty file.
-3. **Video Encode**: `xav` handles autocrop, scene-detect, and chunking natively (`xav -e svt-av1 -p "--preset <p> --tune <t> --crf <c>" -w 4 -b 1`). No `av1an` or `.vpy` required. CRF is always 30 unless `--crf` is set (same as `svt_opus_encoder.py`), so Essential does not apply `--quality medium` / CRF 35 above 1080p.
+3. **Video Encode**: `xav` handles autocrop, scene-detect, and chunking natively. The process is started as `taskset -c 0-(N-3) xav -e svt-av1 -p "--preset <p> --tune <t> --crf <c> --lp 2" -w <allowed/2> -b 1` so the last two logical CPUs stay free (on a 32-thread CPU: cores 0–29 and 15 workers, the same density as av1an `--set-thread-affinity 2` / `-w 15`). `--lp 2` keeps each SVT worker from auto-sizing to the whole CPU. No `av1an` or `.vpy` required. CRF is always 30 unless `--crf` is set (same as `svt_opus_encoder.py`), so Essential does not apply `--quality medium` / CRF 35 above 1080p.
 4. **Audio Processing**: Audio is extracted, optionally downmixed (with multiple filter fallbacks), normalized with a two-pass linear constant-gain loudnorm (sample rate restored after loudnorm), and encoded to Opus. AAC/Opus tracks are remuxed directly.
 5. **Remuxing**: Combines using `mkvmerge` (xav video + processed/remuxed audio + source subs/chapters). Font attachments are filtered as described under Subtitle font cleanup; other attachments are copied. The `FONT_CLEAN` lines are written to that file’s log. Track metadata (flags, titles, languages) is restored from the source. Failed files move the source MKV to `failed/` while keeping video intermediates for easy retry resuming.
 

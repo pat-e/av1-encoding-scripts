@@ -179,6 +179,7 @@ Parameters used for the `svt-av1` encoder when invoked via `xav` (as used in `xa
 | `--preset` | `1` (≤1080p) / `2` (>1080p) | Speed preset. Chosen from video height only (HDR 1080p stays preset 1 unless `--preset` is set). |
 | `--tune` | `2` | SVT-AV1-Essential tune mode: 0=VQ, 1=PSNR, 2=SSIM, 3=IQ, 4=MS_SSIM. |
 | `--crf` | `30` | Constant Rate Factor. Always passed for every resolution so Essential does not apply `--quality medium` (CRF 35) above 1080p. |
+| `--lp` | `2` | LevelOfParallelism per xav worker (0–6). Same value as `svt_opus_encoder.py`. |
 
 *(Note: `--preset`, `--tune`, and `--crf` can be overridden when executing the script. Color primaries/transfer/matrix are not set on the xav command line.)*
 
@@ -226,14 +227,16 @@ The VapourSynth script uses `ffms2.Source`, optional `std.CropAbs` when `--autoc
 ### xav (SVT-AV1)
 Arguments used to start `xav` using the SVT-AV1 encoder (as used in `xav_automation.py`):
 ```text
-xav -e svt-av1 \
-  -p "--preset <preset> --tune <tune> --crf <crf>" \
-  -w 4 \
+taskset -c 0-<last_allowed> xav -e svt-av1 \
+  -p "--preset <preset> --tune <tune> --crf <crf> --lp 2" \
+  -w <allowed_cpus/2> \
   -b 1 \
   <intermediate_file> \
   <encoded_video_file>
 ```
-- `-w 4`: Fixed at 4 workers.
+- `taskset -c`: Pins xav to every logical CPU except the last two (32 threads → `0-29`). Override with `--reserve-threads`. Skip pinning with `--no-taskset`.
+- `-w`: Default `allowed_cpus // 2` (15 on a 32-thread CPU). Same worker density as av1an `(cpu_count // 2) - 1`. Override with `--workers`.
+- `--lp 2`: Passed inside `-p` to every xav worker so SVT does not auto-size each encode to the whole CPU. Override with `--lp`.
 - `-b 1`: Buffer size of 1.
 - `--preset`: Defaults to `1` for ≤1080p, `2` for >1080p (overridable via `--preset`).
 - `--tune`: Defaults to `2` (SSIM) (overridable via `--tune`).

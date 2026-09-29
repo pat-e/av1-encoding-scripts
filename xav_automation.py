@@ -11,10 +11,13 @@
 # Otherwise HandBrake: 1080p SDR → x264 / x264_10bit all-intra; 4K/HDR → x265_10bit.
 # Format convert: 12/16-bit → 10-bit; 4:2:2 / 4:4:4 / RGB → yuv420p10le.
 # ffmpeg is only a fallback if HandBrake produces an empty file.
-# 1080p or lower: -p "--preset 1 --tune 2 --crf 30"  -w 4  -b 1
-# Above 1080p:    -p "--preset 2 --tune 2 --crf 30"  -w 4  -b 1
+# 1080p or lower: -p "--preset 1 --tune 2 --crf 30 --lp 2"  -w <allowed/2>  -b 1
+# Above 1080p:    -p "--preset 2 --tune 2 --crf 30 --lp 2"  -w <allowed/2>  -b 1
 # --tune is SVT-AV1-Essential (default 2 = SSIM). --crf 30 always so Essential
-# does not apply --quality medium (CRF 35) above 1080p. Workers/buff are fixed.
+# does not apply --quality medium (CRF 35) above 1080p. -b is 1.
+# xav is started under taskset so it may only run on all logical CPUs except
+# the last two (32 threads → -c 0-29). Workers are allowed_cpus // 2 with
+# --lp 2 (15 workers on a 7950X3D), same density as av1an.
 # Audio: AAC/Opus remuxed. Else: Nightmode Dialogue pan (`<` so the mix cannot clip)
 # → ffmpeg loudnorm 2-pass linear (I=-18, TP=-1.5, LRA=20) → opusenc.
 # Final mkvmerge: xav video + processed/remuxed audio + source subs/chapters.
@@ -24,6 +27,7 @@
 
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -35,7 +39,7 @@ from pathlib import Path
 
 REQUIRED_TOOLS = [
     "ffmpeg", "ffprobe", "mkvmerge", "mkvextract", "mkvpropedit",
-    "opusenc", "mediainfo", "xav", "HandBrakeCLI",
+    "opusenc", "mediainfo", "xav", "HandBrakeCLI", "taskset",
 ]
 DIR_COMPLETED = Path("completed")
 DIR_ORIGINAL = Path("original")
@@ -45,7 +49,12 @@ REMUX_CODECS = {"aac", "opus"}
 
 XAV_ENCODER = "svt-av1"
 XAV_BUFF = 1
-XAV_WORKERS = 4
+# Leave the last N logical CPUs for the OS / desktop / ssh. xav is pinned to
+# 0..(cpu_count - N - 1) with taskset. On a 32-thread 7950X3D that is 0-29.
+XAV_RESERVED_THREADS = 2
+# SVT-AV1-Essential LevelOfParallelism per xav worker. 0 = auto from core count.
+# 2 with allowed_cpus//2 workers matches svt_opus_encoder.py / av1an density.
+XAV_LP = 2
 PRESET_1080 = 1
 PRESET_4K = 2
 HEIGHT_4K = 1080
@@ -402,8 +411,34 @@ def intermediate_encoder(track):
     return ffmpeg_args, "x264", "libx264 8-bit CRF 0 all-intra yuv420p (1080p SDR)", "keyint=1:bframes=0"
 
 
-def xav_worker_count():
-    return max(1, XAV_WORKERS)
+def logical_cpu_count():
+    try:
+        return len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
+
+
+def xav_cpu_plan(reserved=XAV_RESERVED_THREADS):
+    """Return (taskset CPU list, allowed count, total logical CPUs).
+
+    The last `reserved` logical CPUs stay free. Too few CPUs → use all of them
+    rather than an empty affinity set.
+    """
+    total = max(1, logical_cpu_count())
+    reserved = max(0, int(reserved))
+    allowed = total - reserved
+    if allowed < 1:
+        allowed = total
+    if allowed == 1:
+        cpu_list = "0"
+    else:
+        cpu_list = f"0-{allowed - 1}"
+    return cpu_list, allowed, total
+
+
+def xav_worker_count(allowed_cpus):
+    """One worker per two allowed threads. Same density as av1an (cpu_count//2)-1."""
+    return max(1, int(allowed_cpus) // 2)
 
 
 def xav_preset(track, override=None):
@@ -1485,7 +1520,18 @@ def attachment_merge_args(attachments):
     return args
 
 
-def run_xav(xav_input, xav_output, track, preset_override=None, tune_override=None, crf_override=None):
+def run_xav(
+    xav_input,
+    xav_output,
+    track,
+    preset_override=None,
+    tune_override=None,
+    crf_override=None,
+    workers_override=None,
+    reserved_threads=XAV_RESERVED_THREADS,
+    use_taskset=True,
+    lp_override=None,
+):
     if file_is_usable(xav_output):
         print(f"    - Reusing existing xav output (resume): {xav_output}")
         return
@@ -1493,17 +1539,30 @@ def run_xav(xav_input, xav_output, track, preset_override=None, tune_override=No
     preset = xav_preset(track, preset_override)
     tune = xav_tune(tune_override)
     crf = xav_crf(crf_override)
-    workers = xav_worker_count()
+    cpu_list, allowed_cpus, total_cpus = xav_cpu_plan(reserved_threads)
+    workers = int(workers_override) if workers_override is not None else xav_worker_count(allowed_cpus)
+    workers = max(1, workers)
+    lp = int(lp_override) if lp_override is not None else XAV_LP
+    lp = max(0, min(6, lp))
     buff = XAV_BUFF
     path_label = "4K+" if is_4k_path(track) else "1080p or lower"
     print(f"    - Path: {path_label} (height={video_height(track)})")
+    if use_taskset:
+        print(
+            f"    - CPU affinity: taskset -c {cpu_list}  "
+            f"({total_cpus} logical CPUs, last {total_cpus - allowed_cpus} reserved)"
+        )
+    else:
+        print(f"    - CPU affinity: none ({total_cpus} logical CPUs)")
     print(
-        f"    - Workers: {workers}  preset: {preset}  crf: {crf}  "
+        f"    - Workers: {workers}  --lp {lp}  "
+        f"(allowed CPUs: {allowed_cpus}, default is allowed/2)  "
+        f"preset: {preset}  crf: {crf}  "
         f"tune: {tune} ({TUNE_NAMES.get(tune, '?')})  "
         f"-b {buff}  (no -a: audio is this script)"
     )
 
-    encoder_params = f"--preset {preset} --tune {tune} --crf {crf}"
+    encoder_params = f"--preset {preset} --tune {tune} --crf {crf} --lp {lp}"
     xav_args = [
         "xav",
         "-e", XAV_ENCODER,
@@ -1513,6 +1572,8 @@ def run_xav(xav_input, xav_output, track, preset_override=None, tune_override=No
         str(xav_input),
         str(xav_output),
     ]
+    if use_taskset:
+        xav_args = ["taskset", "-c", cpu_list] + xav_args
     print("    - Starting xav (this will take a long time)...")
     print(f"    - xav command: {' '.join(xav_args)}")
     run_cmd(xav_args)
@@ -1570,8 +1631,31 @@ def video_temp_files(current_dir, file_path, extra):
     return files
 
 
-def main(no_downmix=False, preset=None, tune=None, crf=None, norm_i=None, norm_tp=None, no_font_clean=False, check_only=False):
+def main(
+    no_downmix=False,
+    preset=None,
+    tune=None,
+    crf=None,
+    norm_i=None,
+    norm_tp=None,
+    no_font_clean=False,
+    check_only=False,
+    workers=None,
+    reserved_threads=XAV_RESERVED_THREADS,
+    use_taskset=True,
+    lp=None,
+):
     if check_only:
+        cpu_list, allowed_cpus, total_cpus = xav_cpu_plan(reserved_threads)
+        planned_workers = workers if workers is not None else xav_worker_count(allowed_cpus)
+        planned_lp = max(0, min(6, int(lp))) if lp is not None else XAV_LP
+        print(
+            f"xav CPU plan: {total_cpus} logical CPUs, "
+            f"taskset -c {cpu_list} ({allowed_cpus} allowed, "
+            f"last {total_cpus - allowed_cpus} reserved), "
+            f"-w {max(1, int(planned_workers))}, --lp {planned_lp}"
+            + ("" if use_taskset else " (--no-taskset)")
+        )
         check_tools(report_only=True)
         return
     check_tools()
@@ -1639,6 +1723,10 @@ def main(no_downmix=False, preset=None, tune=None, crf=None, norm_i=None, norm_t
                 preset_override=preset,
                 tune_override=tune,
                 crf_override=crf,
+                workers_override=workers,
+                reserved_threads=reserved_threads,
+                use_taskset=use_taskset,
+                lp_override=lp,
             )
 
             audio_temp_dir = None
@@ -1764,6 +1852,41 @@ if __name__ == "__main__":
         help="Keep every font attachment. Default: drop fonts not used by remaining ASS/SSA tracks.",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Override xav -w. Default: allowed_cpus//2 after reserving the last "
+            f"{XAV_RESERVED_THREADS} logical CPUs (15 on a 32-thread CPU)."
+        ),
+    )
+    parser.add_argument(
+        "--reserve-threads",
+        type=int,
+        default=XAV_RESERVED_THREADS,
+        metavar="N",
+        help=(
+            "Logical CPUs at the high end that xav must not use "
+            f"(default: {XAV_RESERVED_THREADS}; 32 threads → taskset -c 0-29)."
+        ),
+    )
+    parser.add_argument(
+        "--no-taskset",
+        action="store_true",
+        help="Do not pin xav with taskset. Workers still use the reserved-CPU formula unless --workers is set.",
+    )
+    parser.add_argument(
+        "--lp",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "SVT-AV1-Essential --lp (LevelOfParallelism 0-6) per xav worker. "
+            f"Default: {XAV_LP}. 0 lets each worker auto-size to the whole CPU."
+        ),
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
         help="Check required tools and fonttools, then exit. Does not encode.",
@@ -1778,4 +1901,8 @@ if __name__ == "__main__":
         norm_tp=args.norm_tp,
         no_font_clean=args.nofontsclean,
         check_only=args.check,
+        workers=args.workers,
+        reserved_threads=args.reserve_threads,
+        use_taskset=not args.no_taskset,
+        lp=args.lp,
     )
