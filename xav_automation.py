@@ -15,9 +15,11 @@
 # Above 1080p:    -p "--preset 2 --tune 2 --crf 30 --lp 2"  -w <allowed/2>  -b 1
 # --tune is SVT-AV1-Essential (default 2 = SSIM). --crf 30 always so Essential
 # does not apply --quality medium (CRF 35) above 1080p. -b is 1.
-# xav is started under taskset so it may only run on all logical CPUs except
-# the last two (32 threads → -c 0-29). Workers are allowed_cpus // 2 with
-# --lp 2 (15 workers on a 7950X3D), same density as av1an.
+# xav is pinned off the last two logical CPUs (32 threads → 0-29). Linux uses
+# taskset. Windows 11 / Server 2022 sets the same limit with a process
+# affinity mask before xav starts, so SVT workers inherit it. A Windows mask
+# names at most one processor group (64 logical CPUs); any CPU past that stays
+# free. Workers are allowed_cpus // 2 with --lp 2 (15 workers on a 7950X3D).
 # Audio: AAC/Opus remuxed. Else: Nightmode Dialogue pan (`<` so the mix cannot clip)
 # → ffmpeg loudnorm 2-pass linear (I=-18, TP=-1.5, LRA=20) → opusenc.
 # Final mkvmerge: xav video + processed/remuxed audio + source subs/chapters.
@@ -39,7 +41,7 @@ from pathlib import Path
 
 REQUIRED_TOOLS = [
     "ffmpeg", "ffprobe", "mkvmerge", "mkvextract", "mkvpropedit",
-    "opusenc", "mediainfo", "xav", "HandBrakeCLI", "taskset",
+    "opusenc", "mediainfo", "xav", "HandBrakeCLI",
 ]
 DIR_COMPLETED = Path("completed")
 DIR_ORIGINAL = Path("original")
@@ -50,7 +52,8 @@ REMUX_CODECS = {"aac", "opus"}
 XAV_ENCODER = "svt-av1"
 XAV_BUFF = 1
 # Leave the last N logical CPUs for the OS / desktop / ssh. xav is pinned to
-# 0..(cpu_count - N - 1) with taskset. On a 32-thread 7950X3D that is 0-29.
+# 0..(cpu_count - N - 1). On a 32-thread 7950X3D that is 0-29. Windows can only
+# express this for one group of at most 64 logical CPUs.
 XAV_RESERVED_THREADS = 2
 # SVT-AV1-Essential LevelOfParallelism per xav worker. 0 = auto from core count.
 # 2 with allowed_cpus//2 workers matches svt_opus_encoder.py / av1an density.
@@ -129,13 +132,21 @@ def fonttools_available():
         return False
 
 
+def required_tools():
+    """taskset is the Linux pin. Windows sets the mask from Python."""
+    if sys.platform == "win32":
+        return list(REQUIRED_TOOLS)
+    return REQUIRED_TOOLS + ["taskset"]
+
+
 def check_tools(report_only=False):
     """PATH tools are required. fonttools is optional: missing means skip font cleanup."""
-    missing = [tool for tool in REQUIRED_TOOLS if shutil.which(tool) is None]
+    tools = required_tools()
+    missing = [tool for tool in tools if shutil.which(tool) is None]
     has_fonttools = fonttools_available()
     if report_only:
         print("Tool check (no encode)")
-        for tool in REQUIRED_TOOLS:
+        for tool in tools:
             state = "OK" if tool not in missing else "MISSING"
             print(f"  {state:7} {tool}")
         if has_fonttools:
@@ -164,6 +175,57 @@ def run_cmd(cmd, capture_output=False, check=True):
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check, text=True)
         return result.stdout
     subprocess.run(cmd, check=check)
+
+
+def run_pinned_windows(args, mask):
+    """Start xav suspended, pin it, then resume so every SVT worker inherits the mask."""
+    import ctypes
+    import _winapi
+    from ctypes import wintypes
+
+    if not mask:
+        raise RuntimeError("Windows affinity mask is empty.")
+    exe = shutil.which(args[0])
+    if not exe:
+        raise FileNotFoundError(args[0])
+    cmdline = subprocess.list2cmdline([exe, *args[1:]])
+    hp, ht, _pid, _tid = _winapi.CreateProcess(
+        exe,
+        cmdline,
+        None,
+        None,
+        0,
+        0x00000004,  # CREATE_SUSPENDED
+        None,
+        None,
+        subprocess.STARTUPINFO(),
+    )
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.c_size_t]
+    kernel32.SetProcessAffinityMask.restype = wintypes.BOOL
+    kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
+    kernel32.ResumeThread.restype = wintypes.DWORD
+    try:
+        if not kernel32.SetProcessAffinityMask(hp, ctypes.c_size_t(int(mask))):
+            _winapi.TerminateProcess(hp, 1)
+            raise ctypes.WinError(ctypes.get_last_error())
+        if kernel32.ResumeThread(ht) == 0xFFFFFFFF:
+            _winapi.TerminateProcess(hp, 1)
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            waited = _winapi.WaitForSingleObject(hp, _winapi.INFINITE)
+        except KeyboardInterrupt:
+            _winapi.TerminateProcess(hp, 1)
+            raise
+        if waited != _winapi.WAIT_OBJECT_0:
+            _winapi.TerminateProcess(hp, 1)
+            raise OSError(f"waiting for xav failed (status {waited})")
+        code = _winapi.GetExitCodeProcess(hp)
+    finally:
+        _winapi.CloseHandle(ht)
+        _winapi.CloseHandle(hp)
+    if code != 0:
+        raise subprocess.CalledProcessError(code, args)
 
 
 def run_ffmpeg_logged(args):
@@ -415,25 +477,138 @@ def logical_cpu_count():
     try:
         return len(os.sched_getaffinity(0))
     except (AttributeError, OSError):
-        return os.cpu_count() or 1
+        pass
+    if sys.platform == "win32":
+        total = windows_active_processor_count()
+        if total:
+            return total
+    return os.cpu_count() or 1
+
+
+def mask_reserving_high_cpus(system_mask, reserved):
+    """Clear the highest `reserved` set bits. Too large a reserve keeps the mask."""
+    system_mask = int(system_mask)
+    reserved = max(0, int(reserved))
+    if system_mask <= 0 or reserved <= 0:
+        return system_mask
+    bits = [i for i in range(system_mask.bit_length()) if system_mask & (1 << i)]
+    if reserved >= len(bits):
+        return system_mask
+    mask = 0
+    for bit in bits[:-reserved]:
+        mask |= 1 << bit
+    return mask
+
+
+def format_cpu_list(cpus):
+    cpus = sorted(int(cpu) for cpu in cpus)
+    if not cpus:
+        return ""
+    ranges = []
+    start = prev = cpus[0]
+    for cpu in cpus[1:]:
+        if cpu == prev + 1:
+            prev = cpu
+            continue
+        ranges.append(str(start) if start == prev else f"{start}-{prev}")
+        start = prev = cpu
+    ranges.append(str(start) if start == prev else f"{start}-{prev}")
+    return ",".join(ranges)
+
+
+def cpus_from_mask(mask):
+    mask = int(mask)
+    return [i for i in range(mask.bit_length()) if mask & (1 << i)]
+
+
+def windows_active_processor_count():
+    """All logical CPUs, including ones outside this process's processor group."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetActiveProcessorCount.argtypes = [wintypes.WORD]
+    kernel32.GetActiveProcessorCount.restype = wintypes.DWORD
+    count = kernel32.GetActiveProcessorCount(0xFFFF)  # ALL_PROCESSOR_GROUPS
+    return int(count)
+
+
+def windows_process_affinity_mask():
+    """This process's affinity in its primary group. 0 if the query fails.
+
+    One mask is at most 64 bits. On Windows 11 and Server 2022 a machine with
+    more than 64 logical CPUs still reports only that group here.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.GetProcessAffinityMask.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    kernel32.GetProcessAffinityMask.restype = wintypes.BOOL
+    process_mask = ctypes.c_size_t()
+    system_mask = ctypes.c_size_t()
+    if not kernel32.GetProcessAffinityMask(
+        kernel32.GetCurrentProcess(),
+        ctypes.byref(process_mask),
+        ctypes.byref(system_mask),
+    ):
+        return 0
+    return int(process_mask.value or system_mask.value)
 
 
 def xav_cpu_plan(reserved=XAV_RESERVED_THREADS):
-    """Return (taskset CPU list, allowed count, total logical CPUs).
+    """Return cpu list, allowed count, machine total, and the Windows mask.
 
-    The last `reserved` logical CPUs stay free. Too few CPUs → use all of them
-    rather than an empty affinity set.
+    The last `reserved` logical CPUs stay free. Too few CPUs → use all of the
+    pinnable set rather than an empty affinity set. On Windows the pinnable
+    set is one processor group (the process affinity mask).
     """
     total = max(1, logical_cpu_count())
     reserved = max(0, int(reserved))
+    if sys.platform == "win32":
+        visible = windows_process_affinity_mask()
+        if not visible:
+            pinnable = min(total, 64)
+            visible = (1 << pinnable) - 1
+        mask = mask_reserving_high_cpus(visible, reserved)
+        allowed = mask.bit_count() or 1
+        cpu_list = format_cpu_list(cpus_from_mask(mask)) or "0"
+        return {
+            "cpu_list": cpu_list,
+            "allowed": allowed,
+            "total": total,
+            "mask": mask,
+        }
     allowed = total - reserved
     if allowed < 1:
         allowed = total
-    if allowed == 1:
-        cpu_list = "0"
-    else:
-        cpu_list = f"0-{allowed - 1}"
-    return cpu_list, allowed, total
+    cpu_list = "0" if allowed == 1 else f"0-{allowed - 1}"
+    return {
+        "cpu_list": cpu_list,
+        "allowed": allowed,
+        "total": total,
+        "mask": None,
+    }
+
+
+def affinity_log_line(plan):
+    total = plan["total"]
+    allowed = plan["allowed"]
+    left = total - allowed
+    if sys.platform == "win32":
+        return (
+            f"Windows CPUs {plan['cpu_list']} "
+            f"({total} logical CPUs, {allowed} allowed, {left} left free)"
+        )
+    return (
+        f"taskset -c {plan['cpu_list']}  "
+        f"({total} logical CPUs, last {left} reserved)"
+    )
 
 
 def xav_worker_count(allowed_cpus):
@@ -1539,7 +1714,9 @@ def run_xav(
     preset = xav_preset(track, preset_override)
     tune = xav_tune(tune_override)
     crf = xav_crf(crf_override)
-    cpu_list, allowed_cpus, total_cpus = xav_cpu_plan(reserved_threads)
+    plan = xav_cpu_plan(reserved_threads)
+    allowed_cpus = plan["allowed"]
+    total_cpus = plan["total"]
     workers = int(workers_override) if workers_override is not None else xav_worker_count(allowed_cpus)
     workers = max(1, workers)
     lp = int(lp_override) if lp_override is not None else XAV_LP
@@ -1548,10 +1725,7 @@ def run_xav(
     path_label = "4K+" if is_4k_path(track) else "1080p or lower"
     print(f"    - Path: {path_label} (height={video_height(track)})")
     if use_taskset:
-        print(
-            f"    - CPU affinity: taskset -c {cpu_list}  "
-            f"({total_cpus} logical CPUs, last {total_cpus - allowed_cpus} reserved)"
-        )
+        print(f"    - CPU affinity: {affinity_log_line(plan)}")
     else:
         print(f"    - CPU affinity: none ({total_cpus} logical CPUs)")
     print(
@@ -1572,11 +1746,14 @@ def run_xav(
         str(xav_input),
         str(xav_output),
     ]
-    if use_taskset:
-        xav_args = ["taskset", "-c", cpu_list] + xav_args
+    if use_taskset and sys.platform != "win32":
+        xav_args = ["taskset", "-c", plan["cpu_list"]] + xav_args
     print("    - Starting xav (this will take a long time)...")
     print(f"    - xav command: {' '.join(xav_args)}")
-    run_cmd(xav_args)
+    if use_taskset and sys.platform == "win32":
+        run_pinned_windows(xav_args, plan["mask"])
+    else:
+        run_cmd(xav_args)
     if not file_is_usable(xav_output):
         raise RuntimeError(f"xav finished but output is missing or empty: {xav_output}")
 
@@ -1646,13 +1823,23 @@ def main(
     lp=None,
 ):
     if check_only:
-        cpu_list, allowed_cpus, total_cpus = xav_cpu_plan(reserved_threads)
+        plan = xav_cpu_plan(reserved_threads)
+        allowed_cpus = plan["allowed"]
+        total_cpus = plan["total"]
         planned_workers = workers if workers is not None else xav_worker_count(allowed_cpus)
         planned_lp = max(0, min(6, int(lp))) if lp is not None else XAV_LP
+        if sys.platform == "win32":
+            pin = (
+                f"Windows CPUs {plan['cpu_list']} ({allowed_cpus} allowed, "
+                f"{total_cpus - allowed_cpus} of {total_cpus} left free)"
+            )
+        else:
+            pin = (
+                f"taskset -c {plan['cpu_list']} ({allowed_cpus} allowed, "
+                f"last {total_cpus - allowed_cpus} reserved)"
+            )
         print(
-            f"xav CPU plan: {total_cpus} logical CPUs, "
-            f"taskset -c {cpu_list} ({allowed_cpus} allowed, "
-            f"last {total_cpus - allowed_cpus} reserved), "
+            f"xav CPU plan: {total_cpus} logical CPUs, {pin}, "
             f"-w {max(1, int(planned_workers))}, --lp {planned_lp}"
             + ("" if use_taskset else " (--no-taskset)")
         )
@@ -1868,13 +2055,17 @@ if __name__ == "__main__":
         metavar="N",
         help=(
             "Logical CPUs at the high end that xav must not use "
-            f"(default: {XAV_RESERVED_THREADS}; 32 threads → taskset -c 0-29)."
+            f"(default: {XAV_RESERVED_THREADS}; 32 threads → CPUs 0-29). "
+            "On Windows the mask covers one group of at most 64; further CPUs stay free too."
         ),
     )
     parser.add_argument(
         "--no-taskset",
         action="store_true",
-        help="Do not pin xav with taskset. Workers still use the reserved-CPU formula unless --workers is set.",
+        help=(
+            "Do not pin xav (skips taskset on Linux, the affinity mask on Windows). "
+            "Workers still use the reserved-CPU formula unless --workers is set."
+        ),
     )
     parser.add_argument(
         "--lp",

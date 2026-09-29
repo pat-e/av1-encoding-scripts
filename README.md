@@ -17,7 +17,7 @@ svt_opus_encoder.py
 # or: xav_automation.py
 ```
 
-**Requires in `PATH`:** ffmpeg, ffprobe, mkvmerge, mkvextract, mkvpropedit, opusenc, mediainfo, HandBrakeCLI. Av1an scripts also need av1an, ffmsindex, and VapourSynth. xav needs `xav` built with SVT-AV1-Essential, plus `taskset` (util-linux) to pin the encode off the last two logical CPUs. Python [fonttools](https://github.com/fonttools/fonttools) is optional (Arch: `python-fonttools`, otherwise `pip install fonttools`). Without it, unused-font cleanup is skipped and every font stays attached.
+**Requires in `PATH`:** ffmpeg, ffprobe, mkvmerge, mkvextract, mkvpropedit, opusenc, mediainfo, HandBrakeCLI. Av1an scripts also need av1an, ffmsindex, and VapourSynth. xav needs `xav` built with SVT-AV1-Essential. Linux also needs `taskset` (util-linux) to pin the encode off the last two logical CPUs. On Windows 11 and Windows Server 2022 the same pin is a process affinity mask, with no extra tool. That mask names at most 64 logical CPUs; any beyond that stay free. Python [fonttools](https://github.com/fonttools/fonttools) is optional (Arch: `python-fonttools`, otherwise `pip install fonttools`). Without it, unused-font cleanup is skipped and every font stays attached.
 
 Common flags: `--no-downmix`, `--autocrop` (av1an scripts), `--crf` / `--preset` / `--tune` / `--grain` where the encoder supports them, `--norm-i` / `--norm-tp` (defaults −18 LUFS / −1.5 dBTP), `--nofontsclean` / `-nfc` (keep every attached font). `xav_automation.py` also has `--workers`, `--lp`, `--reserve-threads`, and `--no-taskset`.
 

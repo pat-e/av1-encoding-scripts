@@ -234,7 +234,8 @@ taskset -c 0-<last_allowed> xav -e svt-av1 \
   <intermediate_file> \
   <encoded_video_file>
 ```
-- `taskset -c`: Pins xav to every logical CPU except the last two (32 threads → `0-29`). Override with `--reserve-threads`. Skip pinning with `--no-taskset`.
+- `taskset -c`: On Linux, pins xav to every logical CPU except the last two (32 threads → `0-29`). Override with `--reserve-threads`. Skip pinning with `--no-taskset`.
+- Windows 11 and Windows Server 2022 do not use `taskset`. The same CPU list is set with `SetProcessAffinityMask` while `xav` is still suspended, then it is resumed, so each SVT worker inherits the mask. The mask is one processor group, 64 logical CPUs at most. On a larger machine those extra CPUs stay free, and `--reserve-threads` still leaves the top of the group free. `-w` follows the CPUs inside the mask.
 - `-w`: Default `allowed_cpus // 2` (15 on a 32-thread CPU). Same worker density as av1an `(cpu_count // 2) - 1`. Override with `--workers`.
 - `--lp 2`: Passed inside `-p` to every xav worker so SVT does not auto-size each encode to the whole CPU. Override with `--lp`.
 - `-b 1`: Buffer size of 1.
