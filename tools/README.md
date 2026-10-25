@@ -16,7 +16,7 @@ Denoise every MKV in the current folder with MDegrain2 (mvtools). The finished f
 For each `*.mkv`:
 
 1. If packets are not CFR, or MediaInfo says VFR, convert to CFR first. HandBrake `--cfr --rate` uses the same FPS choice as `xav_automation.py`. ffmpeg `-fps_mode cfr` is the fallback. The GOP stays a normal GOP. xav re-encodes this file later, so all-intra is skipped.
-2. MDegrain2, two frames each way. `--thsad` is both luma and chroma strength (default 350). Block size stays 16.
+2. MDegrain2, two frames each way. Strength is both luma and chroma: default thsad 350, `--low` is 150, `--high` is 500, or `--thsad N`. Block size stays 16.
 3. Encode to the pixel format xav accepts. See the table below.
 4. mkvmerge: the new video first, then audio, subtitles, chapters, and attachments from the source.
 5. Check frame count, duration, pixel format, CFR, tracks, and chapters.
@@ -62,12 +62,13 @@ Log out and back in, or reboot, so new sessions inherit it. If the file is alrea
 ```bash
 mdegrain.py --check
 mdegrain.py
-mdegrain.py --thsad 150
-mdegrain.py --thsad 500
+mdegrain.py --low
+mdegrain.py --high
+mdegrain.py --thsad 250
 mdegrain.py --reserve-threads 4
 ```
 
-`--thsad` guide: 150 is light (keeps more grain and detail), 350 is the default, 500 and up is strong.
+`--reserve-threads` defaults to 2. `--thsad` guide: 150 is light (`--low`, keeps more grain and detail), 350 is the default, 500 is strong (`--high`), and higher still is `--thsad`. Use only one of `--low`, `--high`, and `--thsad`. Combining them prints a warning and exits. No file is encoded or moved.
 
 ## `av1grain.py`
 

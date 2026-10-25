@@ -6,7 +6,8 @@
 #   1. If packets are not CFR, or MediaInfo says VFR: HandBrake --cfr --rate
 #      (ffmpeg -fps_mode cfr is the fallback). Same probe and FPS choice as
 #      xav_automation.py. Normal GOP, no all-intra.
-#   2. MDegrain2 (mvtools), same filter as ~/bin/mdegrain.vpy (default thsad 350)
+#   2. MDegrain2 (mvtools), same filter as ~/bin/mdegrain.vpy
+#      Strength: default thsad 350, --low 150, --high 500, or --thsad N.
 #   3. Encode to the only pixel formats xav accepts:
 #        1080p SDR 8-bit 4:2:0  -> libx264 CRF 0 yuv420p
 #        other 1080p SDR        -> libx264 CRF 0 yuv420p10le (Hi10p, 4:2:2, 4:4:4, RGB, 12-bit+)
@@ -54,6 +55,8 @@ PLUGIN_PATH_LINE = (
 )
 
 DEFAULT_THSAD = 350
+THSAD_LOW = 150
+THSAD_HIGH = 500
 # Same reservation as xav_automation.py. 32 threads → CPUs 0-29.
 RESERVED_THREADS = 2
 INTERRUPTED = False  # set by Ctrl+C, so a dying child is never counted as a failure
@@ -1629,7 +1632,8 @@ For each *.mkv:
   1. VFR, or a failed packet-CFR probe, is converted to CFR first
      (HandBrake --cfr --rate, same FPS choice as xav_automation.py;
      ffmpeg is the fallback). Output uses a normal GOP.
-  2. MDegrain2 denoise (mvtools, same filter as ~/bin/mdegrain.vpy)
+  2. MDegrain2 denoise (mvtools, same filter as ~/bin/mdegrain.vpy).
+     Strength is thsad 350, or --low (150), --high (500), or --thsad N.
   3. encode to yuv420p or yuv420p10le, the formats xav accepts
        1080p SDR 8-bit 4:2:0 -> libx264 CRF 0
        other 1080p SDR        -> libx264 10-bit CRF 0
@@ -1670,22 +1674,29 @@ examples:
       denoise all MKVs in the current folder (thsad 350). On a 32-thread CPU
       this pins CPUs 0-29 and leaves CPUs 30-31 free.
 
-  mdegrain.py --thsad 150
-      lighter denoise (keeps more grain/detail)
+  mdegrain.py --low
+      lighter denoise (thsad 150, keeps more grain/detail)
 
-  mdegrain.py --thsad 500
-      stronger denoise
+  mdegrain.py --high
+      stronger denoise (thsad 500)
+
+  mdegrain.py --thsad 250
+      set the strength yourself
 
   mdegrain.py --reserve-threads 4
-      leave the last 4 logical CPUs free (32 threads → CPUs 0-27)
+      leave the last 4 logical CPUs free (default = 2; 32 threads → CPUs 0-27)
 
-  cd ~/video-input/somefolder && mdegrain.py --thsad 250
+  cd ~/video-input/somefolder && mdegrain.py
       typical run inside a GNU screen session
 
-thsad guide: 150 = light, 350 = default (Mission: Impossible), 500+ = strong""",
+thsad guide: 150 = light, 350 = default, 500+ = strong""",
     )
-    parser.add_argument("--thsad", type=int, default=DEFAULT_THSAD, metavar="N",
+    parser.add_argument("--thsad", type=int, default=None, metavar="N",
                         help=f"MDegrain2 thsad/thsadc strength (default: {DEFAULT_THSAD}).")
+    parser.add_argument("--low", action="store_true",
+                        help=f"Light denoise. Same as --thsad {THSAD_LOW}.")
+    parser.add_argument("--high", action="store_true",
+                        help=f"Strong denoise. Same as --thsad {THSAD_HIGH}.")
     parser.add_argument(
         "--reserve-threads",
         type=int,
@@ -1701,8 +1712,34 @@ thsad guide: 150 = light, 350 = default (Mission: Impossible), 500+ = strong""",
     parser.add_argument("--check", action="store_true",
                         help="Show the CPU plan and check required programs and VapourSynth plugins, then exit. Does not encode.")
     args = parser.parse_args()
+    chosen = []
+    if args.low:
+        chosen.append("--low")
+    if args.high:
+        chosen.append("--high")
+    if args.thsad is not None:
+        chosen.append("--thsad")
+    if len(chosen) > 1:
+        print(
+            "Warning: " + " and ".join(chosen) + " cannot be combined. "
+            "Nothing was done.\n"
+            "Use one of these:\n"
+            "  mdegrain.py\n"
+            "  mdegrain.py --low\n"
+            "  mdegrain.py --high\n"
+            "  mdegrain.py --thsad N"
+        )
+        sys.exit(0)
+    if args.low:
+        thsad = THSAD_LOW
+    elif args.high:
+        thsad = THSAD_HIGH
+    elif args.thsad is not None:
+        thsad = args.thsad
+    else:
+        thsad = DEFAULT_THSAD
     if args.check:
         print(f"CPU plan: {affinity_log_line(cpu_plan(args.reserve_threads))}")
         check_environment(report_only=True)
         sys.exit(0)
-    main(args.thsad, args.reserve_threads)
+    main(thsad, args.reserve_threads)

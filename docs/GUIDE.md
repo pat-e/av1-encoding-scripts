@@ -10,7 +10,7 @@ How the batch AV1 scripts run, and why they take the paths they do. Encoder flag
 
 A standalone crop detector lives in [`../cropdetect/`](../cropdetect/). The same logic is still embedded in `svt_opus_encoder.py` and `aom_opus_encoder.py` via `--autocrop` (an older copy; not imported from that folder yet).
 
-Standalone helpers live in [`../tools/`](../tools/). `mdegrain.py` denoises a folder of MKVs, including VFR and 4K/HDR, into CFR `yuv420p` or `yuv420p10le` files that `xav_automation.py` can take. `av1grain.py` adds grav1synth film grain to finished AV1 MKVs. The grain is signalled in the AV1 headers, so the video is not re-encoded.
+Standalone helpers live in [`../tools/`](../tools/). `mdegrain.py` denoises a folder of MKVs, including VFR and 4K/HDR, into CFR `yuv420p` or `yuv420p10le` files that `xav_automation.py` can take. No flag uses thsad 350. `--low` is 150, `--high` is 500, and `--thsad N` sets the strength. Combining those flags prints a warning and exits without encoding. `av1grain.py` adds grav1synth film grain to finished AV1 MKVs. The grain is signalled in the AV1 headers, so the video is not re-encoded.
 
 ## Prerequisites
 
