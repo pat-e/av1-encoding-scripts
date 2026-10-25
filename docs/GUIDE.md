@@ -1,6 +1,6 @@
 # Encoding guide
 
-How the batch AV1 scripts run, and why they take the paths they do. Encoder flag tables live in [`parameters.md`](parameters.md). Crop detection is documented in [`../cropdetect/`](../cropdetect/).
+How the batch AV1 scripts run, and why they take the paths they do. Encoder flag tables live in [`parameters.md`](parameters.md). Crop detection is documented in [`../cropdetect/`](../cropdetect/). Denoise and film grain are documented in [`../tools/`](../tools/).
 
 ## Scripts
 
@@ -9,6 +9,8 @@ How the batch AV1 scripts run, and why they take the paths they do. Encoder flag
 *   **`xav_automation.py`**: Uses the `xav` chunking encoder and `svt-av1` (SVT-AV1-Essential) instead of `av1an`. Features native autocrop, scene-detect, and chunking. A fail-closed packet-PTS CFR probe plus pixel-format checks decide whether to remux video-only or run HandBrake (with format conversion to `yuv420p` / `yuv420p10le` when needed).
 
 A standalone crop detector lives in [`../cropdetect/`](../cropdetect/). The same logic is still embedded in `svt_opus_encoder.py` and `aom_opus_encoder.py` via `--autocrop` (an older copy; not imported from that folder yet).
+
+Standalone helpers live in [`../tools/`](../tools/). `mdegrain.py` denoises a folder of MKVs, including VFR and 4K/HDR, into CFR `yuv420p` or `yuv420p10le` files that `xav_automation.py` can take. `av1grain.py` adds grav1synth film grain to finished AV1 MKVs. The grain is signalled in the AV1 headers, so the video is not re-encoded.
 
 ## Prerequisites
 

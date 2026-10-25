@@ -8,6 +8,8 @@ Batch-encode `.mkv` files to **AV1** video and **Opus** audio. Drop the MKVs in 
 | [`aom_opus_encoder.py`](aom_opus_encoder.py) | [aom-psy101](https://gitlab.com/damian101/aom-psy101) via av1an | Same prep path as SVT. Default cq-level 25, two-pass. |
 | [`xav_automation.py`](xav_automation.py) | [xav](https://github.com/emrakyz/xav) + SVT-AV1-Essential | Native autocrop/chunking. Packet-CFR probe before HandBrake. CRF 30 always (not Essential’s 35 above 1080p). |
 | [`cropdetect/cropdetect.py`](cropdetect/cropdetect.py) | ffmpeg cropdetect | Safe crop for mixed AR (flashbacks, IMAX). Own [readme](cropdetect/). |
+| [`tools/mdegrain.py`](tools/mdegrain.py) | MDegrain2 (mvtools) | Denoise before the xav queue. VFR and 4K/HDR. Own [readme](tools/). |
+| [`tools/av1grain.py`](tools/av1grain.py) | [grav1synth](https://github.com/rust-av/grav1synth) | Film grain on finished AV1 MKVs, no re-encode. Own [readme](tools/). |
 
 Put the scripts (or symlinks) on your `PATH`, `cd` to a directory of `.mkv` files, and run the script you want:
 
@@ -18,6 +20,8 @@ svt_opus_encoder.py
 ```
 
 **Requires in `PATH`:** ffmpeg, ffprobe, mkvmerge, mkvextract, mkvpropedit, opusenc, mediainfo, HandBrakeCLI. Av1an scripts also need av1an, ffmsindex, and VapourSynth. xav needs `xav` built with SVT-AV1-Essential. Linux also needs `taskset` (util-linux) to pin the encode off the last two logical CPUs. On Windows 11 and Windows Server 2022 the same pin is a process affinity mask, with no extra tool. That mask names at most 64 logical CPUs; any beyond that stay free. Python [fonttools](https://github.com/fonttools/fonttools) is optional (Arch: `python-fonttools`, otherwise `pip install fonttools`). Without it, unused-font cleanup is skipped and every font stays attached.
+
+[`tools/`](tools/) has its own programs. `mdegrain.py` needs VapourSynth with ffms2, mvtools, and zsmooth. `av1grain.py` needs [grav1synth](https://github.com/rust-av/grav1synth). The list and the `--check` command are in that readme.
 
 Common flags: `--no-downmix`, `--autocrop` (av1an scripts), `--crf` / `--preset` / `--tune` / `--grain` where the encoder supports them, `--norm-i` / `--norm-tp` (defaults −18 LUFS / −1.5 dBTP), `--nofontsclean` / `-nfc` (keep every attached font). `xav_automation.py` also has `--workers`, `--lp`, `--reserve-threads`, and `--no-taskset`.
 
