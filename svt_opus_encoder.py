@@ -75,7 +75,6 @@ SVT_AV1_BASE = {
     "scm": 0,
     "keyint": 0,
     "lp": DEFAULT_LP,
-    "auto-tiling": 1,
     "tune": DEFAULT_TUNE,
     "progress": 2,
 }
