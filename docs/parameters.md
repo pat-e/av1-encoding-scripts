@@ -164,7 +164,6 @@ Parameters initialized for the `svt-av1` encoder (as used in `svt_opus_encoder.p
 | `--scm` | `0` | `0` | `0` | Screen content detection OFF (0: off, 1: on, 2: content adaptive). |
 | `--keyint` | `0` | `0` | `0` | Keyframe interval OFF (av1an inserts keyframes). |
 | `--lp` | `2` | `2` | `2` | Logical processors per av1an worker (matches `--set-thread-affinity 2`). |
-| `--auto-tiling` | `1` | `1` | `1` | Automatically determine the number of tiles based on resolution. |
 | `--tune` | `2` | `2` | `2` | SVT-AV1-Essential tune: 0=VQ, 1=PSNR, 2=SSIM, 3=IQ, 4=MS_SSIM. |
 | `--progress` | `2` | `2` | `2` | Detailed progress output. |
 
