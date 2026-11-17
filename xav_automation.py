@@ -24,9 +24,13 @@
 # → ffmpeg loudnorm 2-pass linear (I=-18, TP=-1.5, LRA=20) → opusenc.
 # Final mkvmerge: xav video + processed/remuxed audio + source subs/chapters.
 # Font attachments: only those referenced by remaining ASS/SSA (skip with --nofontsclean / -nfc).
+# Matching ignores case, spaces, hyphens, and underscores, and one leading @. Every face
+# in a .ttf/.otf/.ttc is checked, including variable-font instances. A font that cannot
+# be read is kept. Byte-identical font attachments are kept once.
 # Encode log lines FONT_CLEAN kept/dropped/missing use the font's full name, not the attachment filename.
 # Non-font attachments are always kept. The untouched source stays in original/.
 
+import hashlib
 import json
 import math
 import os
@@ -1370,7 +1374,9 @@ def mux_final(dest, xav_output, source_file, audio_plan, clean_fonts=True, work_
     """xav video only + audio in source order + source subs/chapters.
 
     Default: drop font attachments not referenced by remaining ASS/SSA.
-    Non-font attachments stay. --nofontsclean copies every attachment.
+    Matching ignores case, spaces, hyphens, and underscores. Every face in a
+    collection is checked, including variable-font instances. Unreadable fonts
+    stay. Non-font attachments stay. --nofontsclean copies every attachment.
     """
     extra = [
         "--no-video", "--no-subtitles", "--no-attachments",
@@ -1407,15 +1413,16 @@ def mux_final(dest, xav_output, source_file, audio_plan, clean_fonts=True, work_
         raise RuntimeError(f"mkvmerge produced an empty file: {dest}")
 
 
-FONT_MIME_MARKERS = ("font", "truetype", "opentype", "sfnt", "application/x-truetype-font")
+FONT_MIME_MARKERS = ("font", "truetype", "opentype", "sfnt")
+FONT_EXTENSIONS = {".ttf", ".otf", ".ttc", ".otc", ".tte", ".dfont", ".woff", ".woff2"}
 
 
 def is_font_attachment(att):
     mime = str(att.get("content_type") or "").lower()
-    name = str(att.get("file_name") or "").lower()
     if any(marker in mime for marker in FONT_MIME_MARKERS):
         return True
-    return name.endswith((".ttf", ".otf", ".ttc", ".otc"))
+    suffix = Path(str(att.get("file_name") or "")).suffix.lower()
+    return suffix in FONT_EXTENSIONS
 
 
 def safe_font_filename(name):
@@ -1438,100 +1445,478 @@ def log_font_clean(kept, dropped, missing):
         print(f"    - FONT_CLEAN {label}: {shown}")
 
 
-def get_ass_font_names(ass_path):
-    """Style Fontname plus \\fn overrides. V4 and V4+.
+_FONT_NAME_IDS = (1, 2, 4, 6, 16, 17)
+_ASS_STYLE_SECTIONS = {"[v4+ styles]", "[v4 styles]"}
+_ASS_FN_TAG = re.compile(r"\\fn([^\\}]+)")
 
-    Returns {lowercase: first spelling} so the log can show the name as written.
+
+def normalize_font_key(name):
+    """Compare font names ignoring case, spaces, hyphens, and underscores.
+
+    A leading @ is the ASS marker for vertical text and is not part of the
+    family name. Only one leading marker is removed.
     """
-    fonts = {}
+    text = name.strip().replace("\ufeff", "").replace("\x00", "")
+    if text.startswith("@") or text.startswith("\uff20"):
+        text = text[1:].strip()
+    return "".join(ch for ch in text.casefold() if not ch.isspace() and ch not in "-_")
+
+
+def _read_text(path):
+    raw = Path(path).read_bytes()
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        return raw.decode("utf-16", errors="ignore")
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw.decode("utf-8-sig", errors="ignore")
+    return raw.decode("utf-8", errors="ignore")
+
+
+def read_ass_font_names(ass_path):
+    """Fonts requested by Style lines and inline \\fn tags, in original spelling.
+
+    Names come from every [V4 Styles] / [V4+ Styles] line and from every \\fn
+    override in [Events], including Comment lines. The caller strips a leading
+    @ when matching.
+    """
+    fonts = set()
     in_styles = False
     in_events = False
     fontname_idx = -1
 
-    def add(name):
-        name = name.strip()
-        if name:
-            fonts.setdefault(name.lower(), name)
-
-    with open(ass_path, "r", encoding="utf-8", errors="ignore") as handle:
-        for raw in handle:
-            line = raw.strip()
-            if not line:
-                continue
-            if line.startswith("["):
-                section = line.lower()
-                in_styles = section in ("[v4+ styles]", "[v4 styles]")
-                in_events = section == "[events]"
-                continue
-            if in_styles:
-                if line.lower().startswith("format:"):
-                    cols = [col.strip().lower() for col in line.split(":", 1)[1].split(",")]
-                    fontname_idx = cols.index("fontname") if "fontname" in cols else -1
-                elif line.lower().startswith("style:") and fontname_idx != -1:
-                    cols = [col.strip() for col in line.split(":", 1)[1].split(",")]
-                    if len(cols) > fontname_idx and cols[fontname_idx]:
-                        add(cols[fontname_idx])
-            if in_events and line.lower().startswith("dialogue:"):
-                for match in re.findall(r"\\fn([^\\}]+)", line):
-                    add(match)
+    for raw_line in _read_text(ass_path).splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(";"):
+            continue
+        if line.startswith("["):
+            header = line.lower()
+            in_styles = header in _ASS_STYLE_SECTIONS
+            in_events = header == "[events]"
+            fontname_idx = -1
+            continue
+        if in_styles:
+            lowered = line.lower()
+            if lowered.startswith("format:"):
+                columns = [part.strip().lower() for part in line.split(":", 1)[1].split(",")]
+                fontname_idx = columns.index("fontname") if "fontname" in columns else -1
+            elif lowered.startswith("style:") and fontname_idx != -1:
+                columns = [part.strip() for part in line.split(":", 1)[1].split(",")]
+                if len(columns) > fontname_idx and columns[fontname_idx]:
+                    fonts.add(columns[fontname_idx])
+        elif in_events:
+            for match in _ASS_FN_TAG.findall(line):
+                name = match.strip()
+                if name:
+                    fonts.add(name)
     return fonts
 
 
-def read_font_names(font_path):
-    """Return (full name or None, lowercase names used for matching).
+def _clean_font_name(text):
+    if not text:
+        return None
+    cleaned = text.replace("\x00", "").replace("\ufeff", "").strip()
+    if not cleaned or len(cleaned) > 512:
+        return None
+    if "\n" in cleaned or "\r" in cleaned:
+        return None
+    return cleaned
 
-    The logged name prefers the English full name (nameID 4), then typographic
-    family (16), then family (1). Matching still uses all three, lowercased.
-    """
-    from fontTools.ttLib import TTFont
-    names = set()
-    display = None
-    best_score = -1
-    try:
-        font = TTFont(str(font_path), fontNumber=0)
+
+def _name_strings(font, name_id):
+    if not isinstance(name_id, int) or name_id <= 0 or name_id == 0xFFFF:
+        return []
+    if "name" not in font:
+        return []
+    found = []
+    seen = set()
+    for record in font["name"].names:
+        if record.nameID != name_id:
+            continue
         try:
-            for record in font["name"].names:
-                if record.nameID not in (1, 4, 16):
-                    continue
-                try:
-                    text = record.toUnicode().strip()
-                except Exception:
-                    continue
-                if not text:
-                    continue
-                names.add(text.lower())
-                score = {4: 300, 16: 200, 1: 100}[record.nameID]
-                if record.platformID == 3 and record.langID == 0x409:
-                    score += 30
-                elif record.platformID == 3:
-                    score += 20
-                elif record.platformID == 1 and record.langID in (0, 0x409):
-                    score += 10
-                if score > best_score:
-                    best_score = score
-                    display = text
-        finally:
-            font.close()
-    except Exception as exc:
-        print(f"      Warning: could not read font metadata for {font_path.name}: {exc}")
-    return display, names
+            text = _clean_font_name(record.toUnicode())
+        except Exception:
+            continue
+        if text and text not in seen:
+            seen.add(text)
+            found.append(text)
+    return found
 
 
-def classify_attached_font(file_name, display, internal, required):
-    """Return (status, logged_name, satisfied required keys).
+def _combine_font_names(names, families, subfamilies):
+    for family in families:
+        for subfamily in subfamilies:
+            if family.casefold() == subfamily.casefold():
+                continue
+            names.add(f"{family} {subfamily}")
 
-    status is 'kept' or 'dropped'. logged_name is the font's full name, not the
-    attachment filename. required is the lowercase set of subtitle font names.
+
+def _display_name_score(record):
+    """Prefer the English full name, then typographic family, then family."""
+    if record.nameID not in (1, 4, 16):
+        return None
+    score = {4: 300, 16: 200, 1: 100}[record.nameID]
+    platform = getattr(record, "platformID", None)
+    lang = getattr(record, "langID", None)
+    if platform == 3 and lang == 0x409:
+        score += 30
+    elif platform == 3:
+        score += 20
+    elif platform == 1 and lang in (0, 0x409):
+        score += 10
+    return score
+
+
+def _face_match_names(font):
+    """Names one face can be requested by, plus the best log name and its score.
+
+    Matching uses the family, subfamily, full name, PostScript name, and
+    typographic family/subfamily in every language, plus family + subfamily
+    and each variable-font named instance.
     """
-    file_label = file_name or "font"
-    logged = display or f"(unreadable: {file_label})"
-    filename_stem = Path(file_name or "").stem.lower()
-    internal_hit = set(internal or ()) & set(required)
-    satisfied = set(internal_hit)
-    if filename_stem and filename_stem in required:
-        satisfied.add(filename_stem)
-    status = "kept" if satisfied else "dropped"
-    return status, logged, satisfied
+    by_id = {name_id: _name_strings(font, name_id) for name_id in _FONT_NAME_IDS}
+    names = set()
+    for values in by_id.values():
+        names.update(values)
+
+    legacy_family = by_id[1]
+    legacy_sub = by_id[2]
+    typo_family = by_id[16]
+    typo_sub = by_id[17]
+    _combine_font_names(names, legacy_family, legacy_sub)
+    _combine_font_names(names, typo_family, typo_sub)
+    _combine_font_names(names, legacy_family, typo_sub)
+    _combine_font_names(names, typo_family, legacy_sub)
+
+    families = []
+    for family in legacy_family + typo_family:
+        if family not in families:
+            families.append(family)
+
+    if "fvar" in font:
+        for instance in font["fvar"].instances:
+            styles = _name_strings(font, instance.subfamilyNameID)
+            for style in styles:
+                names.add(style)
+                for family in families:
+                    names.add(f"{family} {style}")
+            ps_id = getattr(instance, "postscriptNameID", 0xFFFF)
+            for ps_name in _name_strings(font, ps_id):
+                names.add(ps_name)
+
+    display = None
+    best = -1
+    if "name" in font:
+        for record in font["name"].names:
+            score = _display_name_score(record)
+            if score is None or score <= best:
+                continue
+            try:
+                text = _clean_font_name(record.toUnicode())
+            except Exception:
+                continue
+            if text:
+                best = score
+                display = text
+    return {name for name in names if name.strip()}, display, best
+
+
+def _open_font_faces(path):
+    """Return (closable, faces) for a single font or a collection.
+
+    .ttc/.otc files start with 'ttcf' and hold more than one face. Reading
+    only face 0 drops later faces that the subtitles actually use.
+    """
+    from fontTools.ttLib import TTCollection, TTFont
+
+    with Path(path).open("rb") as handle:
+        header = handle.read(4)
+    if header == b"ttcf":
+        collection = TTCollection(str(path), lazy=True)
+        return collection, list(collection.fonts)
+    font = TTFont(str(path), lazy=True)
+    return font, [font]
+
+
+def _short_error(exc):
+    text = str(exc).strip().splitlines()
+    message = text[0] if text else exc.__class__.__name__
+    if len(message) > 200:
+        return message[:197] + "..."
+    return message
+
+
+def _collect_font_names(path):
+    """Read every face. Raise if the file yields no names at all.
+
+    Returns (names, display name or None, partial error or None).
+    """
+    opener, faces = _open_font_faces(path)
+    try:
+        if not faces:
+            raise RuntimeError("no faces in font file")
+        names = set()
+        failures = []
+        display = None
+        best = -1
+        for index, face in enumerate(faces):
+            try:
+                face_names, face_display, face_score = _face_match_names(face)
+            except Exception as exc:
+                failures.append(f"face {index}: {_short_error(exc)}")
+                continue
+            names.update(face_names)
+            if face_display and face_score > best:
+                best = face_score
+                display = face_display
+        if not names:
+            detail = "; ".join(failures) if failures else "no readable font names"
+            raise RuntimeError(detail)
+        partial = "; ".join(failures) if failures else None
+        return names, display, partial
+    finally:
+        close = getattr(opener, "close", None)
+        if close is not None:
+            close()
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+class _FontInfo:
+    def __init__(self, file_name, attachment_id, order, attachment):
+        self.file_name = file_name
+        self.attachment_id = attachment_id
+        self.order = order
+        self.attachment = attachment
+        self.names = set()
+        self.display = None
+        self.content_hash = None
+        self.problem = None
+        self.partial_error = None
+
+
+class _FontPlan:
+    def __init__(self, decisions, warnings, unmatched):
+        self.decisions = decisions
+        self.warnings = warnings
+        self.unmatched = unmatched
+
+    @property
+    def keep_count(self):
+        return sum(1 for _order, action, _reason in self.decisions if action == "keep")
+
+    @property
+    def remove_count(self):
+        return sum(1 for _order, action, _reason in self.decisions if action == "remove")
+
+
+def _unique_requested(requested):
+    seen = set()
+    ordered = []
+    for raw in requested:
+        text = raw.strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        ordered.append(text)
+    ordered.sort(key=lambda item: (normalize_font_key(item), item.casefold(), item))
+    return ordered
+
+
+def _match_labels(keys, requested_by_key):
+    labels = []
+    seen = set()
+    for key in sorted(keys & requested_by_key.keys()):
+        for label in requested_by_key[key]:
+            if label not in seen:
+                seen.add(label)
+                labels.append(label)
+    return labels
+
+
+def _display_font_name(name):
+    """Drop one leading ASS vertical-text marker for the match reason."""
+    text = name.strip()
+    if text.startswith("@") or text.startswith("\uff20"):
+        return text[1:].strip()
+    return text
+
+
+def _format_match_reason(labels):
+    shown_labels = []
+    seen = set()
+    for label in labels:
+        display = _display_font_name(label)
+        if display and display not in seen:
+            seen.add(display)
+            shown_labels.append(display)
+    shown = ", ".join(f'"{label}"' for label in shown_labels[:4])
+    extra = len(shown_labels) - 4
+    if extra > 0:
+        shown += f" and {extra} more"
+    noun = "font" if len(shown_labels) == 1 else "fonts"
+    return f"matches requested {noun} {shown}"
+
+
+def _decide_fonts(fonts, requested, keep_unused=False, unused_reason="not used by any subtitle"):
+    """Choose keep or remove for each font.
+
+    A font is kept when any face matches a requested name, when its file name
+    matches, or when its contents could not be read. Byte-identical fonts are
+    collapsed to the earliest attachment. Files whose names differ only by
+    case but whose bytes differ are both kept and reported.
+
+    Each decision is (order, action, reason).
+    """
+    unique_requested = _unique_requested(requested)
+    requested_by_key = {}
+    for label in unique_requested:
+        key = normalize_font_key(label)
+        if not key:
+            continue
+        requested_by_key.setdefault(key, [])
+        if label not in requested_by_key[key]:
+            requested_by_key[key].append(label)
+
+    font_keys = {}
+    for font in fonts:
+        keys = set()
+        candidates = set(font.names)
+        # The file name is only a hint after the font itself was readable.
+        if not font.problem:
+            stem = Path(font.file_name).stem
+            if stem:
+                candidates.add(stem)
+        for name in candidates:
+            key = normalize_font_key(name)
+            if key:
+                keys.add(key)
+        font_keys[font.order] = keys
+
+    actions = {}
+    warnings = []
+    for font in fonts:
+        labels = _match_labels(font_keys[font.order], requested_by_key)
+        # An unreadable file is kept even when its name looks like a match.
+        if font.problem:
+            actions[font.order] = (
+                "keep",
+                f"WARNING: could not read font ({font.problem}); keeping it",
+            )
+        elif labels:
+            actions[font.order] = ("keep", _format_match_reason(labels))
+            if font.partial_error:
+                warnings.append(
+                    f'"{font.file_name}" matched a subtitle font, but face '
+                    f"reading was incomplete ({font.partial_error})"
+                )
+        elif font.partial_error:
+            actions[font.order] = (
+                "keep",
+                "WARNING: could not read every face "
+                f"({font.partial_error}); keeping it",
+            )
+        elif keep_unused:
+            actions[font.order] = ("keep", unused_reason)
+        else:
+            actions[font.order] = ("remove", unused_reason)
+
+    by_filename = {}
+    for font in fonts:
+        by_filename.setdefault(font.file_name.casefold(), []).append(font)
+    for group in by_filename.values():
+        if len(group) < 2:
+            continue
+        hashes = {font.content_hash for font in group if font.content_hash}
+        if len(hashes) > 1:
+            quoted = " and ".join(f'"{font.file_name}"' for font in group)
+            warnings.append(
+                f"{quoted} differ only by case but their contents differ; "
+                "not treating them as duplicates"
+            )
+
+    by_hash = {}
+    for font in fonts:
+        action, _reason = actions[font.order]
+        if action == "keep" and font.content_hash:
+            by_hash.setdefault(font.content_hash, []).append(font)
+    for group in by_hash.values():
+        if len(group) < 2:
+            continue
+        group.sort(key=lambda font: font.order)
+        primary = group[0]
+        for duplicate in group[1:]:
+            actions[duplicate.order] = (
+                "remove",
+                f'duplicate of "{primary.file_name}" (identical content)',
+            )
+
+    covered = set()
+    for font in fonts:
+        covered.update(font_keys[font.order] & requested_by_key.keys())
+    unmatched = [
+        label
+        for label in unique_requested
+        if normalize_font_key(label) and normalize_font_key(label) not in covered
+    ]
+    decisions = [
+        (font.order, actions[font.order][0], actions[font.order][1]) for font in fonts
+    ]
+    return _FontPlan(decisions, warnings, unmatched)
+
+
+def _font_log_name(font):
+    """Encode-log name: full name, not the attachment filename."""
+    if font.display:
+        return font.display
+    if font.names:
+        return sorted(font.names, key=str.casefold)[0]
+    return f"(unreadable: {font.file_name or 'font'})"
+
+
+def _extract_attachment(source_file, attachment_id, dest):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        ["mkvextract", "attachments", str(source_file), f"{attachment_id}:{dest}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode > 1 or not dest.is_file():
+        detail = (result.stderr or result.stdout or "mkvextract failed").strip().splitlines()
+        message = detail[-1] if detail else "mkvextract failed"
+        raise RuntimeError(message)
+
+
+def _inspect_attached_font(info, dest):
+    try:
+        info.content_hash = _file_sha256(dest)
+    except OSError as exc:
+        info.problem = _short_error(exc)
+        return info
+    try:
+        names, display, partial = _collect_font_names(dest)
+    except Exception as exc:
+        info.problem = _short_error(exc)
+        return info
+    info.names = names
+    info.display = display
+    info.partial_error = partial
+    return info
+
+
+def _mkv_option_value(value):
+    """A value that starts with @ would be read as an mkvmerge options file."""
+    text = str(value)
+    if text.startswith("@"):
+        return "@" + text
+    return text
 
 
 def _ass_tracks(info):
@@ -1555,11 +1940,14 @@ def _ensure_work_dir(work_dir):
 
 
 def collect_referenced_fonts(source_file, info, work_dir):
-    """ASS/SSA font names. Returns ({lowercase: spelling}, has_ass_tracks)."""
+    """ASS/SSA font names.
+
+    Returns (spellings, error or None, has_ass_tracks). On error the spelling
+    list is empty and the caller keeps every font.
+    """
     ass_tracks = _ass_tracks(info)
-    required = {}
     if not ass_tracks:
-        return required, False
+        return [], None, False
     temp_dir = _ensure_work_dir(work_dir)
     extract = ["mkvextract", "tracks", str(source_file)]
     ass_files = []
@@ -1568,36 +1956,74 @@ def collect_referenced_fonts(source_file, info, work_dir):
         extract.append(f"{track['id']}:{out_ass}")
         ass_files.append(out_ass)
     print(f"    - Font cleaner: reading {len(ass_tracks)} ASS/SSA track(s)...")
-    run_cmd(extract)
+    result = subprocess.run(
+        extract,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode > 1 or any(not path.is_file() for path in ass_files):
+        detail = (result.stderr or result.stdout or "mkvextract failed").strip().splitlines()
+        message = detail[-1] if detail else "could not extract subtitles"
+        print(f"      Warning: {message}")
+        return [], message, True
+    requested = []
     for ass_file in ass_files:
-        found = get_ass_font_names(ass_file)
+        try:
+            found = read_ass_font_names(ass_file)
+        except OSError as exc:
+            message = _short_error(exc)
+            print(f"      Warning: {message}")
+            return [], message, True
         print(f"      - {ass_file.name}: {len(found)} font name(s)")
-        for key, spelling in found.items():
-            required.setdefault(key, spelling)
-    shown = sorted(required.values(), key=str.casefold)
+        requested.extend(found)
+    shown = _unique_requested(requested)
     print(f"    - Fonts referenced by subtitles: {'; '.join(shown) if shown else '(none)'}")
-    return required, True
+    return requested, None, True
+
+
+def _missing_font_names(labels):
+    missing = {}
+    for label in labels:
+        _remember_font_name(missing, label)
+    return missing
 
 
 def fonts_to_keep(source_file, work_dir):
-    """Attachments to re-add, or None if the source has no font attachments.
+    """Attachments to re-add, or None when every attachment should be copied.
 
-    Fonts are kept only when an ASS/SSA style or \\fn names them (filename or
-    internal family / full / typographic name). Other attachments are always kept.
+    A font stays when any face matches a subtitle name, when its filename
+    matches, or when the file cannot be read. Names match with case, spaces,
+    hyphens, and underscores ignored, and one leading @ removed. Every face
+    in a collection is read, including variable-font instances. Byte-identical
+    copies are kept once. Other attachments are always kept.
+
+    None means the caller copies the source attachments unchanged. That happens
+    when there is nothing to filter, fonttools is missing, or a kept attachment
+    could not be extracted.
 
     Prints FONT_CLEAN lines for the encode log: kept and dropped use the font's
     full name, missing uses the name written in the subtitles.
     """
     info = mkvmerge_identify(source_file)
     attachments = info.get("attachments") or []
-    font_atts = [a for a in attachments if is_font_attachment(a)]
-    other_atts = [a for a in attachments if a not in font_atts]
+    font_atts = [item for item in attachments if is_font_attachment(item)]
+    font_ids = {id(item) for item in font_atts}
+    other_atts = [item for item in attachments if id(item) not in font_ids]
     if not font_atts:
         print("    - Font cleaner: no font attachments.")
         temp_dir = _ensure_work_dir(work_dir) if _ass_tracks(info) else None
         try:
-            required, _has_ass = collect_referenced_fonts(source_file, info, temp_dir)
-            log_font_clean({}, {}, required)
+            requested, subtitle_error, _has_ass = collect_referenced_fonts(
+                source_file, info, temp_dir,
+            )
+            if subtitle_error:
+                print(f"    - Font cleaner: subtitles could not be read ({subtitle_error}).")
+                log_font_clean({}, {}, {})
+            else:
+                log_font_clean({}, {}, _missing_font_names(_unique_requested(requested)))
         finally:
             if temp_dir is not None and work_dir is None:
                 shutil.rmtree(temp_dir, ignore_errors=True)
@@ -1612,70 +2038,105 @@ def fonts_to_keep(source_file, work_dir):
         return None
 
     temp_dir = _ensure_work_dir(work_dir)
-    required, has_ass = collect_referenced_fonts(source_file, info, temp_dir)
-    if not has_ass:
+    requested, subtitle_error, has_ass = collect_referenced_fonts(source_file, info, temp_dir)
+    keep_unused = subtitle_error is not None
+    if subtitle_error:
+        unused_reason = (
+            f"WARNING: subtitles could not be read ({subtitle_error}); keeping it"
+        )
+        print(f"    - Font cleaner: subtitles could not be read ({subtitle_error}); keeping every font.")
+    elif not has_ass:
+        unused_reason = "not used by any subtitle"
         print("    - Font cleaner: no ASS/SSA tracks; dropping every font attachment.")
-    elif not required:
-        print(f"    - Font cleaner: subtitles name no fonts; dropping all {len(font_atts)} font attachment(s).")
+    elif not requested:
+        unused_reason = "not used by any subtitle"
+        print(
+            f"    - Font cleaner: subtitles name no fonts; "
+            f"dropping all {len(font_atts)} font attachment(s)."
+        )
+    else:
+        unused_reason = "not used by any subtitle"
+
+    print(f"    - Font cleaner: checking {len(font_atts)} font attachment(s)...")
+    fonts = []
+    for order, att in enumerate(font_atts):
+        file_name = str(att.get("file_name") or f"id {att.get('id')}")
+        dest = temp_dir / f"att_{att['id']}_{safe_font_filename(file_name)}"
+        att["temp_path"] = dest
+        font = _FontInfo(file_name, att.get("id"), order, att)
+        try:
+            _extract_attachment(source_file, att["id"], dest)
+        except RuntimeError as exc:
+            font.problem = _short_error(exc)
+            fonts.append(font)
+            continue
+        fonts.append(_inspect_attached_font(font, dest))
+
+    plan = _decide_fonts(
+        fonts,
+        [] if subtitle_error else requested,
+        keep_unused=keep_unused,
+        unused_reason=unused_reason,
+    )
+    by_order = {font.order: font for font in fonts}
 
     kept = []
-    kept_names = {}
-    dropped_names = {}
-    satisfied = set()
-    extract_fonts = ["mkvextract", "attachments", str(source_file)]
-    for att in font_atts:
-        out_font = temp_dir / f"att_{att['id']}_{safe_font_filename(att.get('file_name') or 'font')}"
-        extract_fonts.append(f"{att['id']}:{out_font}")
-        att["temp_path"] = out_font
-    print(f"    - Font cleaner: checking {len(font_atts)} font attachment(s)...")
-    run_cmd(extract_fonts)
-    for att in font_atts:
-        path = att.get("temp_path")
-        file_label = att.get("file_name") or f"id {att.get('id')}"
-        if not path or not Path(path).exists():
-            logged = f"(unreadable: {file_label})"
-            print(f"      [SKIP]  {logged} did not extract")
-            _remember_font_name(dropped_names, logged)
+    missing_files = []
+    for order, action, _reason in plan.decisions:
+        if action != "keep":
             continue
-        display, internal = read_font_names(path)
-        status, logged, hit = classify_attached_font(
-            att.get("file_name") or "", display, internal, required,
-        )
-        if status == "kept":
-            satisfied |= hit
-            internal_hit = sorted(set(internal) & set(required))
-            if internal_hit:
-                print(f"      [MATCH] {logged} (file '{file_label}') via internal names: {internal_hit}")
-            else:
-                print(f"      [MATCH] {logged} (file '{file_label}') via filename")
-            _remember_font_name(kept_names, logged)
-            kept.append(att)
-        else:
-            print(f"      [SKIP]  {logged} (file '{file_label}') unused")
-            _remember_font_name(dropped_names, logged)
+        font = by_order[order]
+        path = font.attachment.get("temp_path")
+        if not path or not Path(path).is_file():
+            missing_files.append(font.file_name)
+            continue
+        kept.append(font.attachment)
 
-    font_kept = len(kept)
-    missing = {
-        key: spelling
-        for key, spelling in required.items()
-        if key not in satisfied
-    }
+    for att in other_atts:
+        file_name = str(att.get("file_name") or "att")
+        dest = temp_dir / f"other_{att['id']}_{safe_font_filename(file_name)}"
+        att["temp_path"] = dest
+        try:
+            _extract_attachment(source_file, att["id"], dest)
+        except RuntimeError as exc:
+            missing_files.append(f"{file_name} ({_short_error(exc)})")
+            continue
+        kept.append(att)
+
+    if missing_files:
+        print(
+            "    - Font cleaner: could not extract attachments that must be kept "
+            f"({'; '.join(missing_files)}). Leaving every attachment in place."
+        )
+        print("    - FONT_CLEAN skipped: extract failed")
+        return None
 
     if other_atts:
-        extract_other = ["mkvextract", "attachments", str(source_file)]
-        for att in other_atts:
-            out_other = temp_dir / f"other_{att['id']}_{safe_font_filename(att.get('file_name') or 'att')}"
-            extract_other.append(f"{att['id']}:{out_other}")
-            att["temp_path"] = out_other
         print(f"    - Font cleaner: keeping {len(other_atts)} non-font attachment(s).")
-        run_cmd(extract_other)
-        kept.extend(a for a in other_atts if a.get("temp_path") and Path(a["temp_path"]).exists())
+    kept_names = {}
+    dropped_names = {}
+    for order, action, reason in plan.decisions:
+        font = by_order[order]
+        logged = _font_log_name(font)
+        if action == "keep" and reason.startswith("WARNING"):
+            tag = "[KEEP]"
+        elif action == "keep":
+            tag = "[MATCH]"
+        else:
+            tag = "[SKIP]"
+        print(f"      {tag:7} {logged} (file '{font.file_name}') {reason}")
+        if action == "keep":
+            _remember_font_name(kept_names, logged)
+        else:
+            _remember_font_name(dropped_names, logged)
+    for warning in plan.warnings:
+        print(f"      Warning: {warning}")
 
     print(
-        f"    - Font cleaner: keeping {font_kept} font(s), "
-        f"dropping {len(font_atts) - font_kept}."
+        f"    - Font cleaner: keeping {plan.keep_count} font(s), "
+        f"dropping {plan.remove_count}."
     )
-    log_font_clean(kept_names, dropped_names, missing)
+    log_font_clean(kept_names, dropped_names, _missing_font_names(plan.unmatched))
     return kept
 
 
@@ -1688,7 +2149,7 @@ def attachment_merge_args(attachments):
         mime = att.get("content_type") or "application/octet-stream"
         name = att.get("file_name") or Path(path).name
         args += [
-            "--attachment-name", name,
+            "--attachment-name", _mkv_option_value(name),
             "--attachment-mime-type", mime,
             "--attach-file", str(path),
         ]
@@ -2036,7 +2497,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--nofontsclean", "-nfc",
         action="store_true",
-        help="Keep every font attachment. Default: drop fonts not used by remaining ASS/SSA tracks.",
+        help="Keep every font attachment. Default: drop fonts not used by remaining ASS/SSA tracks. A font that cannot be read is kept.",
     )
     parser.add_argument(
         "--workers",

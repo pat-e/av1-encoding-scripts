@@ -45,8 +45,8 @@ The scripts require several external tools to be installed and available in your
     *   `svt_opus_encoder.py` and `aom_opus_encoder.py` use MediaInfo `FrameRate_Mode`. ≤1080p SDR always gets a HandBrake x264 all-intra intermediate. 4K/HDR CFR is an mkvmerge video-only remux (keeps HDR/DoVi metadata). VFR 4K/HDR uses HandBrake `x265_10bit`. ffmpeg is a fallback.
     *   `xav_automation.py` does not trust MediaInfo/ffprobe "CFR" flags. A packet-PTS probe must prove CFR, MediaInfo must not report VFR, and the pixel format must already be `yuv420p` or `yuv420p10le` before HandBrake is skipped. Then mkvmerge video-only remuxes (1080p or 4K/HDR). Otherwise HandBrake converts to CFR and to an xav-compatible 4:2:0 8-bit or 10-bit format. ffmpeg is a fallback.
 *   **Automatic Cropping**: Optional `--autocrop` flag detects black bars and applies the crop in VapourSynth before encoding (in `svt_opus_encoder.py` and `aom_opus_encoder.py`). `xav_automation.py` relies on xav's native autocrop (no CLI flag).
-*   **Subtitle font cleanup**: On the final mux, a font attachment is kept only when a remaining ASS/SSA style or `\fn` override names it (the attachment’s filename, or the font’s family, full, or typographic name). Every non-font attachment is kept. Names the subtitles ask for but no attachment provides are not in the output; they are logged as missing. With no ASS/SSA tracks, every font attachment is dropped. `--nofontsclean` / `-nfc` copies every font instead.
-    The per-file log in `conv_logs/` has one line for kept, one for dropped, and one for missing. Kept and dropped use the font’s full name, not the attachment filename, so the same font can be tracked across MKVs that use different file names. Names are separated with `; ` because a comma can be part of a font name (`Arial, Bold`). An empty list is `(none)`.
+*   **Subtitle font cleanup**: On the final mux, a font attachment is kept when a remaining ASS/SSA style or `\fn` override names it. That includes `[V4 Styles]`, `[V4+ Styles]`, and `\fn` on Dialogue and Comment lines. The match can be the attachment’s filename or a name inside the font: family, subfamily, full name, PostScript name, typographic family or subfamily, or a variable-font instance. Matching ignores case, spaces, hyphens, and underscores, and one leading `@` (the ASS vertical-text marker). Every face in a `.ttf`, `.otf`, `.ttc`, or `.otc` is checked, so a later face in a collection is not missed. A font that cannot be read is kept. Byte-identical copies are kept once. Every non-font attachment is kept. Names the subtitles ask for but no attachment provides are not in the output; they are logged as missing. With no ASS/SSA tracks, every font attachment is dropped. If the subtitles cannot be read, every font stays. `--nofontsclean` / `-nfc` copies every font instead.
+    The per-file log in `conv_logs/` has one line for kept, one for dropped, and one for missing. Kept and dropped use the font’s full name, not the attachment filename, so the same font can be tracked across MKVs that use different file names. A font that cannot be read is logged as `(unreadable: filename)`. Names are separated with `; ` because a comma can be part of a font name (`Arial, Bold`). An empty list is `(none)`.
 
     ```
         - FONT_CLEAN kept: Arial Bold; Noto Sans CJK JP
@@ -80,7 +80,7 @@ aom_opus_encoder.py [options]
 *   `--crf <int>`: Override aom `cq-level`. Default: 25 for all resolutions (SDR and HDR).
 *   `--norm-i <float>`: Target integrated loudness in LUFS (default: -18.0).
 *   `--norm-tp <float>`: True-peak ceiling in dBTP (default: -1.5).
-*   `--nofontsclean`, `-nfc`: Keep every font attachment. Default: drop fonts that remaining ASS/SSA tracks do not name.
+*   `--nofontsclean`, `-nfc`: Keep every font attachment. Default: drop fonts that remaining ASS/SSA tracks do not name. A font that cannot be read is kept.
 
 **Workflow specific to `aom_opus_encoder.py`:**
 1. **Detection**: Same MediaInfo HDR/4K rules as `svt_opus_encoder.py`. 10-bit BT.709 Hi10p stays SDR.
@@ -103,7 +103,7 @@ svt_opus_encoder.py [options]
 *   `--tune <int>`: SVT-AV1-Essential `--tune` mode: 0=VQ, 1=PSNR, 2=SSIM, 3=IQ, 4=MS_SSIM (default: 2 = SSIM).
 *   `--norm-i <float>`: Target integrated loudness in LUFS (default: -18.0).
 *   `--norm-tp <float>`: True-peak ceiling in dBTP (default: -1.5).
-*   `--nofontsclean`, `-nfc`: Keep every font attachment. Default: drop fonts that remaining ASS/SSA tracks do not name.
+*   `--nofontsclean`, `-nfc`: Keep every font attachment. Default: drop fonts that remaining ASS/SSA tracks do not name. A font that cannot be read is kept.
 
 **Workflow specific to `svt_opus_encoder.py`:**
 1. **Detection**: MediaInfo HDR format/transfer (PQ/HLG/DoVi) and height `>1080` choose the encode path. 10-bit BT.709 Hi10p stays SDR.
@@ -124,7 +124,7 @@ xav_automation.py [options]
 *   `--crf <int>`: Override SVT-AV1 CRF. Default: 30 for all resolutions (SDR and HDR). Always passed so Essential does not use CRF 35 above 1080p.
 *   `--norm-i <float>`: Target integrated loudness in LUFS (default: -18.0).
 *   `--norm-tp <float>`: True-peak ceiling in dBTP (default: -1.5).
-*   `--nofontsclean`, `-nfc`: Keep every font attachment. Default: drop fonts that remaining ASS/SSA tracks do not name.
+*   `--nofontsclean`, `-nfc`: Keep every font attachment. Default: drop fonts that remaining ASS/SSA tracks do not name. A font that cannot be read is kept.
 *   `--workers <N>`: Override xav `-w`. Default is `allowed_cpus // 2` after reserving the last two logical CPUs (15 on a 32-thread CPU such as a 7950X3D).
 *   `--reserve-threads <N>`: How many logical CPUs at the high end xav must not use (default: 2). On 32 threads that is CPUs `0-29`. On Windows this is one group of at most 64; every logical CPU past that stays free too.
 *   `--no-taskset`: Do not pin xav (`taskset` on Linux, the affinity mask on Windows). Worker count still follows the reserved-CPU formula unless `--workers` is set.
@@ -148,7 +148,7 @@ xav_automation.py [options]
 4.  **Audio Processing**:
     *   Remuxes AAC/Opus.
     *   Normalizes, downmixes (if applicable), and encodes other formats to Opus.
-5.  **Muxing**: Combines the newly encoded video and audio tracks using `mkvmerge`, copying source subtitles, non-font attachments, and chapters. Font attachments are kept only when a remaining ASS/SSA track names them, unless `--nofontsclean` is set. The encode log records `FONT_CLEAN kept`, `dropped`, and `missing` (one line each, names separated by `; `). Synchronization delays, metadata, and languages are preserved.
+5.  **Muxing**: Combines the newly encoded video and audio tracks using `mkvmerge`, copying source subtitles, non-font attachments, and chapters. Font attachments are kept when a remaining ASS/SSA track names them. A font that cannot be read is also kept. `--nofontsclean` copies every font. The encode log records `FONT_CLEAN kept`, `dropped`, and `missing` (one line each, names separated by `; `). Synchronization delays, metadata, and languages are preserved.
 6.  **Cleanup**: Moves files to respective folders (`completed/`, `original/`) and deletes temporary working files. On failure, the source goes to `failed/` and intermediates are kept.
 
 ## Notes
