@@ -11,7 +11,7 @@
 # ffmpeg is only a fallback if HandBrake produces an empty 1080p SDR file.
 # ≤1080p SDR: --preset 1. Above 1080p or HDR: --preset 2.
 # --crf 30 always (overrides Essential --quality medium, which would be CRF 35 above 1080p).
-# Av1an workers: (cpu_count // 2) - 1, not a fixed count.
+# Av1an workers: cpu_count - 2 with --lp 1 (--set-thread-affinity 1), else (cpu_count // 2) - 1 (--set-thread-affinity 2).
 # Audio: AAC/Opus remuxed. Else: Nightmode Dialogue pan (`<` so the mix cannot clip)
 # → ffmpeg loudnorm 2-pass linear (I=-18, TP=-1.5, LRA=20) → opusenc.
 # Final mkvmerge: av1an video + processed/remuxed audio + source subs/chapters.
@@ -56,7 +56,7 @@ PRESET_1080 = 1
 PRESET_4K = 2
 DEFAULT_CRF = 30
 DEFAULT_TUNE = 2
-DEFAULT_LP = 2
+DEFAULT_LP = 1
 TUNE_NAMES = {
     0: "VQ",
     1: "PSNR",
@@ -283,11 +283,13 @@ def svt_preset(track, override=None):
     return PRESET_4K if is_4k_path(track) or is_hdr(track) else PRESET_1080
 
 
-def svt_params_for_track(track, preset_override=None, crf_override=None, grain=None, tune_override=None):
+def svt_params_for_track(track, preset_override=None, crf_override=None, grain=None, tune_override=None, lp_override=None):
     params = dict(SVT_AV1_BASE)
     params["preset"] = svt_preset(track, preset_override)
     params["crf"] = int(crf_override) if crf_override is not None else DEFAULT_CRF
     params["tune"] = int(tune_override) if tune_override is not None else DEFAULT_TUNE
+    lp = int(lp_override) if lp_override is not None else DEFAULT_LP
+    params["lp"] = max(0, min(6, lp))
     if is_hdr(track):
         params["color-primaries"] = 9
         params["matrix-coefficients"] = 9
@@ -305,9 +307,13 @@ def av1an_svt_param_string(params):
     return " ".join(f"--{key} {value}" for key, value in params.items())
 
 
-def av1an_worker_count():
+def av1an_worker_count(lp=DEFAULT_LP):
     total_cores = os.cpu_count() or 4
-    workers = max(1, (total_cores // 2) - 1)
+    resolved_lp = DEFAULT_LP if lp is None else int(lp)
+    if resolved_lp == 1:
+        workers = max(1, total_cores - 2)
+    else:
+        workers = max(1, (total_cores // 2) - 1)
     return workers, total_cores
 
 
@@ -2063,6 +2069,7 @@ def convert_video(
     crf_override=None,
     grain=None,
     tune_override=None,
+    lp_override=None,
 ):
     print("  --- Starting Video Processing ---")
     vpy_file = Path(f"{file_path.stem}.vpy")
@@ -2106,14 +2113,18 @@ def convert_video(
         crf_override=crf_override,
         grain=grain,
         tune_override=tune_override,
+        lp_override=lp_override,
     )
     av1an_video_params_str = av1an_svt_param_string(params)
-    workers, total_cores = av1an_worker_count()
+    lp = params["lp"]
+    workers, total_cores = av1an_worker_count(lp)
+    thread_affinity = 1 if lp == 1 else 2
+    worker_logic = "Cores-2" if lp == 1 else "(Cores/2)-1"
     tune = params["tune"]
     print(f"    - Path: {path_label(track)}")
     print(
         f"    - Using {workers} workers for av1an "
-        f"(Total Cores: {total_cores}, Logic: (Cores/2)-1)."
+        f"(Total Cores: {total_cores}, --lp {lp}, --set-thread-affinity {thread_affinity}, Logic: {worker_logic})."
     )
     print(
         f"    - preset: {params['preset']}  crf: {params['crf']}  "
@@ -2131,7 +2142,7 @@ def convert_video(
     av1an_enc_args = [
         "av1an", "-i", str(vpy_file), "-o", str(encoded_video_file), "-n",
         "-e", "svt-av1", "--resume", "--sc-pix-format", "yuv420p", "-c", "mkvmerge",
-        "--set-thread-affinity", "2", "--pix-format", "yuv420p10le", "--force", "--no-defaults",
+        "--set-thread-affinity", str(thread_affinity), "--pix-format", "yuv420p10le", "--force", "--no-defaults",
         "-w", str(workers),
         "-v", av1an_video_params_str,
     ]
@@ -2196,7 +2207,7 @@ def video_temp_files(current_dir, file_path, extra):
     return files
 
 
-def main(no_downmix=False, autocrop=False, preset=None, crf=None, grain=None, tune=None, norm_i=None, norm_tp=None, no_font_clean=False):
+def main(no_downmix=False, autocrop=False, preset=None, crf=None, grain=None, tune=None, norm_i=None, norm_tp=None, no_font_clean=False, lp=None):
     check_tools()
     global LOUDNESS_I, LOUDNESS_TP
     if norm_i is not None:
@@ -2272,6 +2283,7 @@ def main(no_downmix=False, autocrop=False, preset=None, crf=None, grain=None, tu
                 crf_override=crf,
                 grain=grain,
                 tune_override=tune,
+                lp_override=lp,
             )
 
             muxed = Path(f"output-{file_path.name}")
@@ -2393,6 +2405,18 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--lp",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "SVT-AV1-Essential --lp (LevelOfParallelism 0-6) per av1an worker. "
+            f"Default: {DEFAULT_LP} (uses Cores-2 workers and --set-thread-affinity 1 when --lp 1; "
+            "otherwise (Cores/2)-1 workers and --set-thread-affinity 2). "
+            "0 lets each worker auto-size to the whole CPU."
+        ),
+    )
+    parser.add_argument(
         "--norm-i",
         type=float,
         default=None,
@@ -2420,4 +2444,5 @@ if __name__ == "__main__":
         norm_i=args.norm_i,
         norm_tp=args.norm_tp,
         no_font_clean=args.nofontsclean,
+        lp=args.lp,
     )
