@@ -60,8 +60,7 @@ XAV_BUFF = 1
 # express this for one group of at most 64 logical CPUs.
 XAV_RESERVED_THREADS = 2
 # SVT-AV1-Essential LevelOfParallelism per xav worker. 0 = auto from core count.
-# 2 with allowed_cpus//2 workers matches svt_opus_encoder.py / av1an density.
-XAV_LP = 2
+XAV_LP = 1
 PRESET_1080 = 1
 PRESET_4K = 2
 HEIGHT_4K = 1080
