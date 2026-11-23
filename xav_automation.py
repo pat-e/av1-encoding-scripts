@@ -11,15 +11,16 @@
 # Otherwise HandBrake: 1080p SDR → x264 / x264_10bit all-intra; 4K/HDR → x265_10bit.
 # Format convert: 12/16-bit → 10-bit; 4:2:2 / 4:4:4 / RGB → yuv420p10le.
 # ffmpeg is only a fallback if HandBrake produces an empty file.
-# 1080p or lower: -p "--preset 1 --tune 2 --crf 30 --lp 2"  -w <allowed/2>  -b 1
-# Above 1080p:    -p "--preset 2 --tune 2 --crf 30 --lp 2"  -w <allowed/2>  -b 1
+# 1080p or lower: -p "--preset 1 --tune 2 --crf 30 --lp 1"  -w <allowed>  -b 1
+# Above 1080p:    -p "--preset 2 --tune 2 --crf 30 --lp 1"  -w <allowed>  -b 1
 # --tune is SVT-AV1-Essential (default 2 = SSIM). --crf 30 always so Essential
 # does not apply --quality medium (CRF 35) above 1080p. -b is 1.
 # xav is pinned off the last two logical CPUs (32 threads → 0-29). Linux uses
 # taskset. Windows 11 / Server 2022 sets the same limit with a process
 # affinity mask before xav starts, so SVT workers inherit it. A Windows mask
 # names at most one processor group (64 logical CPUs); any CPU past that stays
-# free. Workers are allowed_cpus // 2 with --lp 2 (15 workers on a 7950X3D).
+# free. Workers are allowed_cpus with --lp 1 (30 workers on a 7950X3D) and
+# allowed_cpus // 2 for other --lp values (15 workers on a 7950X3D).
 # Audio: AAC/Opus remuxed. Else: Nightmode Dialogue pan (`<` so the mix cannot clip)
 # → ffmpeg loudnorm 2-pass linear (I=-18, TP=-1.5, LRA=20) → opusenc.
 # Final mkvmerge: xav video + processed/remuxed audio + source subs/chapters.
@@ -614,8 +615,11 @@ def affinity_log_line(plan):
     )
 
 
-def xav_worker_count(allowed_cpus):
-    """One worker per two allowed threads. Same density as av1an (cpu_count//2)-1."""
+def xav_worker_count(allowed_cpus, lp=XAV_LP):
+    """Use 1 worker per allowed CPU when --lp 1; otherwise allowed_cpus // 2."""
+    resolved_lp = XAV_LP if lp is None else int(lp)
+    if resolved_lp == 1:
+        return max(1, int(allowed_cpus))
     return max(1, int(allowed_cpus) // 2)
 
 
@@ -2177,10 +2181,10 @@ def run_xav(
     plan = xav_cpu_plan(reserved_threads)
     allowed_cpus = plan["allowed"]
     total_cpus = plan["total"]
-    workers = int(workers_override) if workers_override is not None else xav_worker_count(allowed_cpus)
-    workers = max(1, workers)
     lp = int(lp_override) if lp_override is not None else XAV_LP
     lp = max(0, min(6, lp))
+    workers = int(workers_override) if workers_override is not None else xav_worker_count(allowed_cpus, lp)
+    workers = max(1, workers)
     buff = XAV_BUFF
     path_label = "4K+" if is_4k_path(track) else "1080p or lower"
     print(f"    - Path: {path_label} (height={video_height(track)})")
@@ -2188,9 +2192,10 @@ def run_xav(
         print(f"    - CPU affinity: {affinity_log_line(plan)}")
     else:
         print(f"    - CPU affinity: none ({total_cpus} logical CPUs)")
+    default_worker_formula = "allowed" if lp == 1 else "allowed/2"
     print(
         f"    - Workers: {workers}  --lp {lp}  "
-        f"(allowed CPUs: {allowed_cpus}, default is allowed/2)  "
+        f"(allowed CPUs: {allowed_cpus}, default is {default_worker_formula})  "
         f"preset: {preset}  crf: {crf}  "
         f"tune: {tune} ({TUNE_NAMES.get(tune, '?')})  "
         f"-b {buff}  (no -a: audio is this script)"
@@ -2286,8 +2291,8 @@ def main(
         plan = xav_cpu_plan(reserved_threads)
         allowed_cpus = plan["allowed"]
         total_cpus = plan["total"]
-        planned_workers = workers if workers is not None else xav_worker_count(allowed_cpus)
         planned_lp = max(0, min(6, int(lp))) if lp is not None else XAV_LP
+        planned_workers = workers if workers is not None else xav_worker_count(allowed_cpus, planned_lp)
         if sys.platform == "win32":
             pin = (
                 f"Windows CPUs {plan['cpu_list']} ({allowed_cpus} allowed, "
@@ -2504,8 +2509,9 @@ if __name__ == "__main__":
         default=None,
         metavar="N",
         help=(
-            "Override xav -w. Default: allowed_cpus//2 after reserving the last "
-            f"{XAV_RESERVED_THREADS} logical CPUs (15 on a 32-thread CPU)."
+            "Override xav -w. Default: allowed_cpus when --lp 1, else allowed_cpus//2, "
+            f"after reserving the last {XAV_RESERVED_THREADS} logical CPUs "
+            "(30 with --lp 1, 15 otherwise on a 32-thread CPU)."
         ),
     )
     parser.add_argument(
