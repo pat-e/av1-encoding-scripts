@@ -25,7 +25,6 @@ import argparse
 import hashlib
 import json
 import math
-import multiprocessing as _multiprocessing_cropdetect
 import os
 import re
 import shutil
@@ -33,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 from collections import Counter as _Counter_cropdetect
+from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor_cropdetect
 from datetime import datetime
 from pathlib import Path
 
@@ -1728,14 +1728,29 @@ def attachment_merge_args(attachments):
     return args
 
 
-# --- CROPDETECT LOGIC FROM cropdetect.py ---
+# --- CROPDETECT LOGIC FROM cropdetect/cropdetect.py ---
 
-COLOR_GREEN = "\033[92m"
-COLOR_RED = "\033[91m"
-COLOR_YELLOW = "\033[93m"
-COLOR_RESET = "\033[0m"
+_CROPDETECT_LIMIT = 24.0 / 255.0
+_CROPDETECT_FILTER = f"cropdetect=limit={_CROPDETECT_LIMIT:.7f}:round=4:reset=1:skip=0"
+_CROPDETECT_LUMA_MIN = 16.0
+_CROPDETECT_BAR_DELTA = 12.0
+_CROPDETECT_EDGE_FRAC = 0.05
+_CROPDETECT_MIN_INSERT = 6.0
+_CROPDETECT_AUTO_KEYFRAME_MAX_BYTES = 20 * 1024 * 1024 * 1024  # 20 GiB
+_CROPDETECT_INTRA_ONLY_CODECS = frozenset({
+    "prores", "dnxhd", "mjpeg", "ffv1", "rawvideo", "utvideo",
+    "huffyuv", "ffvhuff", "magicyuv", "cfhd", "v210", "v410",
+})
+_CROPDETECT_TARGET_AUTO_SEEKS = 360
+_CROPDETECT_MAX_KEYFRAME_SPAN = 12.0
+_CROPDETECT_MAX_BAR_LUMA_SAMPLES = 24
+_CROPDETECT_XY_TOL = 8
+_CROPDETECT_SIZE_TOL = 16
+_CROPDETECT_AR_TOLERANCE = 0.03
+_CROPDETECT_LINE_RE = re.compile(r"\bt:([0-9.-]+).*?\bcrop=(\d+):(\d+):(\d+):(\d+)")
+_CROPDETECT_YAVG_RE = re.compile(r"lavfi\.signalstats\.YAVG=([0-9.]+)")
 
-KNOWN_ASPECT_RATIOS = [
+KNOWN_ASPECT_RATIOS = (
     {"name": "HDTV (16:9)", "ratio": 16 / 9},
     {"name": "Widescreen (Scope)", "ratio": 2.39},
     {"name": "Widescreen (CinemaScope)", "ratio": 2.35},
@@ -1743,7 +1758,7 @@ KNOWN_ASPECT_RATIOS = [
     {"name": "IMAX Digital (1.90:1)", "ratio": 1.90},
     {"name": "Fullscreen (4:3)", "ratio": 4 / 3},
     {"name": "IMAX 70mm (1.43:1)", "ratio": 1.43},
-]
+)
 
 
 def _check_prerequisites_cropdetect():
@@ -1754,26 +1769,331 @@ def _check_prerequisites_cropdetect():
     return True
 
 
-def _analyze_segment_cropdetect(task_args):
-    seek_time, input_file, width, height = task_args
+def _parse_crop_string_cropdetect(crop_str):
+    try:
+        _, values = crop_str.split("=")
+        w, h, x, y = map(int, values.split(":"))
+        return {"w": w, "h": h, "x": x, "y": y}
+    except (ValueError, IndexError, AttributeError):
+        return None
+
+
+def _round_up_mod4_cropdetect(value):
+    return value if value % 4 == 0 else value + (4 - (value % 4))
+
+
+def _even_offset_cropdetect(value):
+    return value - 1 if value % 2 else value
+
+
+def _crops_similar_cropdetect(a, b, xy_tol=_CROPDETECT_XY_TOL, size_tol=_CROPDETECT_SIZE_TOL):
+    return (
+        abs(a["x"] - b["x"]) <= xy_tol
+        and abs(a["y"] - b["y"]) <= xy_tol
+        and abs(a["w"] - b["w"]) <= size_tol
+        and abs(a["h"] - b["h"]) <= size_tol
+    )
+
+
+def _crop_contained_in_cropdetect(inner, outer, margin=0):
+    return (
+        inner["x"] >= outer["x"] - margin
+        and inner["y"] >= outer["y"] - margin
+        and inner["x"] + inner["w"] <= outer["x"] + outer["w"] + margin
+        and inner["y"] + inner["h"] <= outer["y"] + outer["h"] + margin
+    )
+
+
+def _median_cropdetect(values):
+    vals = sorted(v for v in values if v is not None and math.isfinite(v))
+    if not vals:
+        return None
+    mid = len(vals) // 2
+    if len(vals) % 2:
+        return vals[mid]
+    return 0.5 * (vals[mid - 1] + vals[mid])
+
+
+def _pick_evenly_cropdetect(items, max_count):
+    if len(items) <= max_count:
+        return list(items)
+    if max_count <= 1:
+        return [items[len(items) // 2]]
+    step = (len(items) - 1) / (max_count - 1)
+    return [items[round(i * step)] for i in range(max_count)]
+
+
+def _expanding_bar_regions_cropdetect(majority, candidate, video_w, video_h, min_side=2):
+    bars = []
+    top = majority["y"]
+    bottom = video_h - (majority["y"] + majority["h"])
+    left = majority["x"]
+    right = video_w - (majority["x"] + majority["w"])
+
+    if top >= min_side and (candidate is None or candidate["y"] < majority["y"]):
+        bars.append((video_w, top, 0, 0))
+    if bottom >= min_side and (
+        candidate is None
+        or (candidate["y"] + candidate["h"]) > (majority["y"] + majority["h"])
+    ):
+        bars.append((video_w, bottom, 0, majority["y"] + majority["h"]))
+    if left >= min_side and (candidate is None or candidate["x"] < majority["x"]):
+        bars.append((left, video_h, 0, 0))
+    if right >= min_side and (
+        candidate is None
+        or (candidate["x"] + candidate["w"]) > (majority["x"] + majority["w"])
+    ):
+        bars.append((right, video_h, majority["x"] + majority["w"], 0))
+    return bars
+
+
+def _is_major_crop_cropdetect(crop_str, video_w, video_h, min_crop_size):
+    parsed = _parse_crop_string_cropdetect(crop_str)
+    if not parsed:
+        return False
+    top = parsed["y"]
+    bottom = video_h - (parsed["y"] + parsed["h"])
+    left = parsed["x"]
+    right = video_w - (parsed["x"] + parsed["w"])
+    return max(top, bottom, left, right) >= min_crop_size
+
+
+def _is_full_frame_cropdetect(crop_str, video_w, video_h):
+    parsed = _parse_crop_string_cropdetect(crop_str)
+    return bool(parsed and parsed["w"] == video_w and parsed["h"] == video_h)
+
+
+def _is_edge_timestamp_cropdetect(ts, duration, edge_frac):
+    if duration <= 0 or edge_frac <= 0:
+        return False
+    edge = duration * edge_frac
+    return ts < edge or ts > duration - edge
+
+
+def _sample_times_cropdetect(duration, interval, offset=0.0):
+    if duration <= 0:
+        return [0.0]
+    end = max(0.0, duration - 0.20)
+    times = []
+    t = offset
+    while t <= end + 1e-9:
+        times.append(round(t, 3))
+        t += interval
+    if not times:
+        times = [min(offset, end)]
+    return times
+
+
+def _parse_crop_and_luma_cropdetect(stderr_text, base_ts=0.0):
+    samples = []
+    pending_crop = None
+    pending_ts = None
+    for line in stderr_text.splitlines():
+        m_crop = _CROPDETECT_LINE_RE.search(line)
+        if m_crop:
+            if pending_crop is not None:
+                samples.append({"ts": pending_ts, "crop": pending_crop, "luma": None})
+            raw_t = float(m_crop.group(1))
+            w, h, x, y = map(int, m_crop.groups()[1:])
+            pending_ts = max(0.0, base_ts + raw_t)
+            pending_crop = f"crop={w}:{h}:{x}:{y}"
+            continue
+        if pending_crop is not None:
+            m_yavg = _CROPDETECT_YAVG_RE.search(line)
+            if m_yavg:
+                try:
+                    luma = float(m_yavg.group(1))
+                except ValueError:
+                    luma = None
+                samples.append({"ts": pending_ts, "crop": pending_crop, "luma": luma})
+                pending_crop = None
+                pending_ts = None
+    if pending_crop is not None:
+        samples.append({"ts": pending_ts, "crop": pending_crop, "luma": None})
+    return samples
+
+
+def _build_sample_vf_cropdetect():
+    return (
+        f"{_CROPDETECT_FILTER},"
+        "scale=w='min(iw,160)':h=-2:flags=fast_bilinear,"
+        "format=gray,signalstats,metadata=mode=print:key=lavfi.signalstats.YAVG"
+    )
+
+
+def _scan_keyframe_chunk_cropdetect(task_args):
+    start, length, input_file, video_stream_idx = task_args
     ffmpeg_args = [
-        "ffmpeg", "-hide_banner",
-        "-ss", str(seek_time),
-        "-i", input_file, "-t", "1", "-vf", "cropdetect",
+        "ffmpeg", "-hide_banner", "-nostdin",
+        "-threads", "1",
+        "-skip_frame", "nokey",
+        "-ss", f"{start:.3f}",
+        "-t", f"{length:.3f}",
+        "-i", input_file,
+        "-map", f"0:{video_stream_idx}",
+        "-an", "-sn", "-dn",
+        "-vf", _build_sample_vf_cropdetect(),
         "-f", "null", "-",
     ]
-    result = subprocess.run(ffmpeg_args, capture_output=True, text=True, encoding="utf-8")
+    result = subprocess.run(
+        ffmpeg_args,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
     if result.returncode != 0:
         return []
-    crop_detections = re.findall(r"crop=(\d+):(\d+):(\d+):(\d+)", result.stderr)
-    significant_crops = []
-    for w_str, h_str, x_str, y_str in crop_detections:
-        w, h, x, y = map(int, [w_str, h_str, x_str, y_str])
-        significant_crops.append((f"crop={w}:{h}:{x}:{y}", seek_time))
-    return significant_crops
+    samples = _parse_crop_and_luma_cropdetect(result.stderr, base_ts=start)
+    end = start + length
+    return [s for s in samples if s["ts"] <= end + 0.5]
 
 
-def _snap_to_known_ar_cropdetect(w, h, x, y, video_w, video_h, tolerance=0.03):
+def _run_keyframe_scan_cropdetect(input_file, duration, video_stream_idx, num_workers):
+    num_chunks = max(1, min(num_workers * 2, max(1, int(duration // 15))))
+    if duration < 30:
+        num_chunks = 1
+    chunk_len = duration / num_chunks
+    tasks = [
+        (round(i * chunk_len, 3), round(chunk_len, 3), input_file, video_stream_idx)
+        for i in range(num_chunks)
+    ]
+    workers = max(1, min(num_workers, len(tasks)))
+    raw_samples = []
+    with _ThreadPoolExecutor_cropdetect(max_workers=workers) as pool:
+        for chunk_samples in pool.map(_scan_keyframe_chunk_cropdetect, tasks):
+            raw_samples.extend(chunk_samples)
+    raw_samples.sort(key=lambda s: s["ts"])
+    deduped = []
+    seen = set()
+    for sample in raw_samples:
+        key = round(sample["ts"], 1)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(sample)
+    return deduped
+
+
+def _analyze_seek_sample_cropdetect(task_args):
+    seek_time, input_file, video_stream_idx = task_args
+    ffmpeg_args = [
+        "ffmpeg", "-hide_banner", "-nostdin",
+        "-threads", "1",
+        "-noaccurate_seek",
+        "-ss", f"{seek_time:.3f}",
+        "-i", input_file,
+        "-map", f"0:{video_stream_idx}",
+        "-frames:v", "1",
+        "-an", "-sn", "-dn",
+        "-vf", _build_sample_vf_cropdetect(),
+        "-f", "null", "-",
+    ]
+    result = subprocess.run(
+        ffmpeg_args,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        return {"ts": seek_time, "crop": None, "luma": None}
+    parsed = _parse_crop_and_luma_cropdetect(result.stderr, base_ts=seek_time)
+    if not parsed:
+        return {"ts": seek_time, "crop": None, "luma": None}
+    sample = parsed[-1]
+    sample["ts"] = seek_time
+    return sample
+
+
+def _run_seek_samples_cropdetect(input_file, times, video_stream_idx, num_workers):
+    if not times:
+        return []
+    tasks = [(t, input_file, video_stream_idx) for t in times]
+    workers = max(1, min(num_workers, len(tasks)))
+    with _ThreadPoolExecutor_cropdetect(max_workers=workers) as pool:
+        results = list(pool.map(_analyze_seek_sample_cropdetect, tasks))
+    results.sort(key=lambda s: s["ts"])
+    return results
+
+
+def _attach_sample_durations_cropdetect(samples, duration, fixed_interval=None):
+    ordered = sorted(samples, key=lambda s: s["ts"])
+    if fixed_interval is not None:
+        for s in ordered:
+            s["dt"] = float(fixed_interval)
+        return ordered
+    n = len(ordered)
+    for i, s in enumerate(ordered):
+        if i + 1 < n:
+            span = max(0.1, ordered[i + 1]["ts"] - s["ts"])
+        else:
+            span = max(0.1, duration - s["ts"])
+        s["dt"] = min(span, _CROPDETECT_MAX_KEYFRAME_SPAN)
+    return ordered
+
+
+def _analyze_bar_luma_cropdetect(task_args):
+    seek_time, input_file, video_stream_idx, crops, accurate = task_args
+    if not crops:
+        return {"ts": seek_time, "bar_luma": None}
+    n = len(crops)
+    scale_chain = (
+        "scale=w='min(iw,160)':h='min(ih,160)':flags=fast_bilinear,"
+        "format=gray,signalstats,metadata=mode=print:key=lavfi.signalstats.YAVG"
+    )
+    if n == 1:
+        w, h, x, y = crops[0]
+        filter_args = ["-map", f"0:{video_stream_idx}", "-vf", f"crop={w}:{h}:{x}:{y},{scale_chain}"]
+    else:
+        labels = "".join(f"[s{i}]" for i in range(n))
+        parts = [f"[0:{video_stream_idx}]split={n}{labels}"]
+        maps = []
+        for i, (w, h, x, y) in enumerate(crops):
+            parts.append(f"[s{i}]crop={w}:{h}:{x}:{y},{scale_chain}[o{i}]")
+            maps.extend(["-map", f"[o{i}]"])
+        filter_args = ["-filter_complex", ";".join(parts), *maps]
+
+    seek_flags = [] if accurate else ["-noaccurate_seek"]
+    ffmpeg_args = [
+        "ffmpeg", "-hide_banner", "-nostdin",
+        "-threads", "1",
+        *seek_flags,
+        "-ss", f"{seek_time:.3f}",
+        "-i", input_file,
+        "-frames:v", "1",
+        "-an", "-sn", "-dn",
+        *filter_args,
+        "-f", "null", "-",
+    ]
+    result = subprocess.run(
+        ffmpeg_args,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        return {"ts": seek_time, "bar_luma": None}
+    yavgs = []
+    for raw in _CROPDETECT_YAVG_RE.findall(result.stderr):
+        try:
+            yavgs.append(float(raw))
+        except ValueError:
+            pass
+    return {"ts": seek_time, "bar_luma": max(yavgs) if yavgs else None}
+
+
+def _run_bar_luma_cropdetect(input_file, video_stream_idx, times, crops, num_workers, accurate=False):
+    if not times or not crops:
+        return []
+    tasks = [(t, input_file, video_stream_idx, crops, accurate) for t in times]
+    workers = max(1, min(num_workers, len(tasks)))
+    with _ThreadPoolExecutor_cropdetect(max_workers=workers) as pool:
+        return list(pool.map(_analyze_bar_luma_cropdetect, tasks))
+
+
+def _snap_to_known_ar_cropdetect(w, h, x, y, video_w, video_h, tolerance=_CROPDETECT_AR_TOLERANCE):
     if h == 0:
         return f"crop={w}:{h}:{x}:{y}", None
     detected_ratio = w / h
@@ -1786,231 +2106,326 @@ def _snap_to_known_ar_cropdetect(w, h, x, y, video_w, video_h, tolerance=0.03):
             best_match = ar
     if not best_match or (smallest_diff / best_match["ratio"]) >= tolerance:
         return f"crop={w}:{h}:{x}:{y}", None
+
+    ar_name = best_match["name"]
     if abs(w - video_w) < 16:
-        new_h = round(video_w / best_match["ratio"])
-        if new_h % 4 != 0:
-            new_h = new_h + (4 - (new_h % 4))
+        new_h = _round_up_mod4_cropdetect(round(video_w / best_match["ratio"]))
         if new_h < h:
-            new_h = h
-            if new_h % 4 != 0:
-                new_h = new_h + (4 - (new_h % 4))
-            best_match["name"] = f"Custom AR (Near {best_match['name']})"
+            new_h = _round_up_mod4_cropdetect(h)
+            ar_name = f"Custom AR (Near {best_match['name']})"
+        new_h = min(new_h, video_h)
         new_y = y + round((h - new_h) / 2)
         new_y = max(0, min(new_y, video_h - new_h))
-        if new_y % 2 != 0:
-            new_y -= 1
-        return f"crop={video_w}:{new_h}:0:{new_y}", best_match["name"]
+        new_y = max(0, _even_offset_cropdetect(new_y))
+        return f"crop={video_w}:{new_h}:0:{new_y}", ar_name
+
     if abs(h - video_h) < 16:
-        new_w = round(video_h * best_match["ratio"])
-        if new_w % 4 != 0:
-            new_w = new_w + (4 - (new_w % 4))
+        new_w = _round_up_mod4_cropdetect(round(video_h * best_match["ratio"]))
         if new_w < w:
-            new_w = w
-            if new_w % 4 != 0:
-                new_w = new_w + (4 - (new_w % 4))
-            best_match["name"] = f"Custom AR (Near {best_match['name']})"
+            new_w = _round_up_mod4_cropdetect(w)
+            ar_name = f"Custom AR (Near {best_match['name']})"
+        new_w = min(new_w, video_w)
         new_x = x + round((w - new_w) / 2)
         new_x = max(0, min(new_x, video_w - new_w))
-        if new_x % 2 != 0:
-            new_x -= 1
-        return f"crop={new_w}:{video_h}:{new_x}:0", best_match["name"]
-    return f"crop={w}:{h}:{x}:{y}", None
-    detected_ratio = w / h
-    best_match = None
-    smallest_diff = float("inf")
-    for ar in KNOWN_ASPECT_RATIOS:
-        diff = abs(detected_ratio - ar["ratio"])
-        if diff < smallest_diff:
-            smallest_diff = diff
-            best_match = ar
-    if not best_match or (smallest_diff / best_match["ratio"]) >= tolerance:
-        return f"crop={w}:{h}:{x}:{y}", None
-    if abs(w - video_w) < 16:
-        new_h = round(video_w / best_match["ratio"])
-        if new_h % 8 != 0:
-            new_h = new_h + (8 - (new_h % 8))
-        new_h = min(new_h, video_h)
-        new_y = round((video_h - new_h) / 2)
-        if new_y % 2 != 0:
-            new_y -= 1
-        new_y = max(0, new_y)
-        return f"crop={video_w}:{new_h}:0:{new_y}", best_match["name"]
-    if abs(h - video_h) < 16:
-        new_w = round(video_h * best_match["ratio"])
-        if new_w % 8 != 0:
-            new_w = new_w + (8 - (new_w % 8))
-        new_w = min(new_w, video_w)
-        new_x = round((video_w - new_w) / 2)
-        if new_x % 2 != 0:
-            new_x -= 1
-        new_x = max(0, new_x)
-        return f"crop={new_w}:{video_h}:{new_x}:0", best_match["name"]
+        new_x = max(0, _even_offset_cropdetect(new_x))
+        return f"crop={new_w}:{video_h}:{new_x}:0", ar_name
+
     return f"crop={w}:{h}:{x}:{y}", None
 
 
-def _cluster_crop_values_cropdetect(crop_counts, tolerance=8):
-    clusters = []
-    temp_counts = crop_counts.copy()
-    while temp_counts:
-        center_str, _ = temp_counts.most_common(1)[0]
-        try:
-            _, values = center_str.split("=")
-            cw, ch, cx, cy = map(int, values.split(":"))
-        except (ValueError, IndexError):
-            del temp_counts[center_str]
-            continue
-        cluster_total_count = 0
-        crops_to_remove = []
-        for crop_str, count in temp_counts.items():
-            try:
-                _, values = crop_str.split("=")
-                w, h, x, y = map(int, values.split(":"))
-                if abs(x - cx) <= tolerance and abs(y - cy) <= tolerance:
-                    cluster_total_count += count
-                    crops_to_remove.append(crop_str)
-            except (ValueError, IndexError):
-                continue
-        if cluster_total_count > 0:
-            clusters.append({"center": center_str, "count": cluster_total_count})
-        for crop_str in crops_to_remove:
-            del temp_counts[crop_str]
-    clusters.sort(key=lambda c: c["count"], reverse=True)
-    return clusters
-
-
-def _parse_crop_string_cropdetect(crop_str):
-    try:
-        _, values = crop_str.split("=")
-        w, h, x, y = map(int, values.split(":"))
-        return {"w": w, "h": h, "x": x, "y": y}
-    except (ValueError, IndexError):
-        return None
-
-
-def _calculate_bounding_box_cropdetect(crop_keys):
+def _calculate_bounding_box_cropdetect(rects):
     min_x = min_y = float("inf")
     max_x = max_y = float("-inf")
-    for key in crop_keys:
-        parsed = _parse_crop_string_cropdetect(key)
-        if not parsed:
+    valid = 0
+    for rect in rects:
+        if not rect:
             continue
-        w, h, x, y = parsed["w"], parsed["h"], parsed["x"], parsed["y"]
-        min_x = min(min_x, x)
-        min_y = min(min_y, y)
-        max_x = max(max_x, x + w)
-        max_y = max(max_y, y + h)
-    if (max_x - min_x) <= 2 and (max_y - min_y) <= 2:
+        min_x = min(min_x, rect["x"])
+        min_y = min(min_y, rect["y"])
+        max_x = max(max_x, rect["x"] + rect["w"])
+        max_y = max(max_y, rect["y"] + rect["h"])
+        valid += 1
+    if valid == 0:
         return None
     return f"crop={max_x - min_x}:{max_y - min_y}:{min_x}:{min_y}"
 
 
-def _analyze_video_cropdetect(input_file, duration, width, height, num_workers, significant_crop_threshold, min_crop, debug=False):
-    sample_interval = 30
-    num_tasks = max(1, duration // sample_interval)
-    tasks = [(i * sample_interval, input_file, width, height) for i in range(num_tasks)]
-    
-    crop_results = []
-    with _multiprocessing_cropdetect.Pool(processes=num_workers) as pool:
-        results_iterator = pool.imap_unordered(_analyze_segment_cropdetect, tasks)
-        for result in results_iterator:
-            crop_results.append(result)
-            
-    all_crops_with_ts = [crop for sublist in crop_results for crop in sublist]
-    all_crop_strings = [item[0] for item in all_crops_with_ts]
-    if not all_crop_strings:
-        return None
-        
-    crop_counts = _Counter_cropdetect(all_crop_strings)
-    clusters = _cluster_crop_values_cropdetect(crop_counts)
-    total_detections = sum(c["count"] for c in clusters)
-    
-    significant_clusters = []
-    safe_clusters = []
-    min_frames_for_safe_cluster = 10
-    
-    for cluster in clusters:
-        percentage = (cluster["count"] / total_detections) * 100
-        if cluster["count"] >= min_frames_for_safe_cluster:
-            safe_clusters.append(cluster)
-        if percentage >= significant_crop_threshold:
-            significant_clusters.append(cluster)
-            
-    for cluster in safe_clusters:
-        parsed_crop = _parse_crop_string_cropdetect(cluster["center"])
-        if parsed_crop:
-            _, ar_label = _snap_to_known_ar_cropdetect(
-                parsed_crop["w"], parsed_crop["h"], parsed_crop["x"], parsed_crop["y"], width, height
-            )
-            cluster["ar_label"] = ar_label
+def _cluster_samples_cropdetect(samples):
+    remaining = list(samples)
+    clusters = []
+    while remaining:
+        counts = _Counter_cropdetect(s["crop"] for s in remaining)
+        center_str, _ = counts.most_common(1)[0]
+        center = _parse_crop_string_cropdetect(center_str)
+        members = []
+        rest = []
+        for sample in remaining:
+            parsed = _parse_crop_string_cropdetect(sample["crop"])
+            if center and parsed and _crops_similar_cropdetect(parsed, center):
+                members.append(sample)
+            else:
+                rest.append(sample)
+        remaining = rest
+        members.sort(key=lambda s: s["ts"])
+        clusters.append({
+            "center": center_str,
+            "members": members,
+            "timestamps": [s["ts"] for s in members],
+            "count": len(members),
+        })
+    clusters.sort(key=lambda c: c["count"], reverse=True)
+    return clusters
+
+
+def _max_contiguous_run_cropdetect(body_members, max_gap):
+    if not body_members:
+        return 0.0
+    ordered = sorted(body_members, key=lambda s: s["ts"])
+    best = 0.0
+    run_dur = ordered[0].get("dt", 0.0)
+    prev_end = ordered[0]["ts"] + ordered[0].get("dt", 0.0)
+    for s in ordered[1:]:
+        if s["ts"] - prev_end <= max_gap:
+            run_dur += s.get("dt", 0.0)
         else:
-            cluster["ar_label"] = None
-            
-    if not safe_clusters:
-        return None
-    elif len(safe_clusters) == 1:
-        dominant_cluster = safe_clusters[0]
-        parsed_crop = _parse_crop_string_cropdetect(dominant_cluster["center"])
-        snapped_crop, ar_label = _snap_to_known_ar_cropdetect(
-            parsed_crop["w"], parsed_crop["h"], parsed_crop["x"], parsed_crop["y"], width, height
+            best = max(best, run_dur)
+            run_dur = s.get("dt", 0.0)
+        prev_end = s["ts"] + s.get("dt", 0.0)
+    return max(best, run_dur)
+
+
+def _classify_clusters_cropdetect(
+    clusters, duration, edge_frac, significant_crop_threshold, min_insert, seek_interval=None
+):
+    total = sum(c["count"] for c in clusters) or 1
+    needed_hits = max(2, math.ceil(min_insert / max(float(seek_interval), 1e-6))) if seek_interval else 1
+    max_gap = max(_CROPDETECT_MAX_KEYFRAME_SPAN, min_insert * 1.5)
+    if seek_interval:
+        max_gap = max(max_gap, seek_interval * 2.5)
+
+    body_clusters = []
+    for cluster in clusters:
+        body_members = [
+            m for m in cluster["members"]
+            if not _is_edge_timestamp_cropdetect(m["ts"], duration, edge_frac)
+        ]
+        body_ts = [m["ts"] for m in body_members]
+        body_dur = sum(m.get("dt", 0.0) for m in body_members)
+        longest_run = _max_contiguous_run_cropdetect(body_members, max_gap)
+        cluster["body_timestamps"] = body_ts
+        cluster["percentage"] = (cluster["count"] / total) * 100
+        if not body_ts:
+            continue
+        if seek_interval is not None:
+            sustained = len(body_ts) >= needed_hits and body_dur >= min_insert - 1e-6
+        else:
+            sustained = (longest_run >= min_insert - 1e-6) or (
+                len(body_ts) >= 2 and body_dur >= min_insert - 1e-6
+            )
+        if sustained:
+            body_clusters.append(cluster)
+    return body_clusters
+
+
+def _verify_expanding_clusters_cropdetect(
+    body_clusters,
+    input_file,
+    video_stream_idx,
+    video_w,
+    video_h,
+    duration,
+    num_workers,
+    bar_delta,
+    min_insert,
+    significant_crop_threshold,
+    debug=False,
+):
+    if len(body_clusters) <= 1:
+        return body_clusters
+    majority = max(body_clusters, key=lambda c: c["count"])
+    maj = _parse_crop_string_cropdetect(majority["center"])
+    if not maj:
+        return body_clusters
+
+    expanding = []
+    kept = [majority]
+    for cluster in body_clusters:
+        if cluster is majority:
+            continue
+        cand = _parse_crop_string_cropdetect(cluster["center"])
+        if not cand:
+            continue
+        if not _crop_contained_in_cropdetect(cand, maj, margin=4):
+            expanding.append(cluster)
+        elif cluster["percentage"] >= significant_crop_threshold:
+            kept.append(cluster)
+
+    if not expanding:
+        return kept
+
+    all_maj_bars = _expanding_bar_regions_cropdetect(maj, None, video_w, video_h)
+    if not all_maj_bars:
+        return kept
+
+    base_times = _pick_evenly_cropdetect(majority.get("body_timestamps") or majority["timestamps"], 8)
+    baseline_hits = _run_bar_luma_cropdetect(
+        input_file, video_stream_idx, base_times, all_maj_bars, num_workers, accurate=False
+    )
+    baseline = _median_cropdetect([h["bar_luma"] for h in baseline_hits])
+    if baseline is None:
+        baseline = 0.0
+    threshold = max(8.0, baseline + bar_delta)
+
+    still_body = list(kept)
+    for cluster in expanding:
+        cand = _parse_crop_string_cropdetect(cluster["center"])
+        bars = _expanding_bar_regions_cropdetect(maj, cand, video_w, video_h) or all_maj_bars
+        raw_times = cluster.get("body_timestamps") or cluster["timestamps"]
+        check_times = _pick_evenly_cropdetect(raw_times, _CROPDETECT_MAX_BAR_LUMA_SAMPLES)
+        single_hit_probe = len(check_times) == 1
+        if single_hit_probe:
+            t0 = check_times[0]
+            probe_end = min(duration - 0.2, t0 + min_insert)
+            extra = [
+                round(t0 + (probe_end - t0) * frac, 3)
+                for frac in (0.4, 0.8)
+                if t0 + (probe_end - t0) * frac < duration - 0.2
+            ]
+            check_times = [t0] + extra
+
+        hits = _run_bar_luma_cropdetect(
+            input_file, video_stream_idx, check_times, bars, num_workers, accurate=single_hit_probe
         )
-        parsed_snapped = _parse_crop_string_cropdetect(snapped_crop)
-        if parsed_snapped and parsed_snapped["w"] == width and parsed_snapped["h"] == height:
-            return None
-        return snapped_crop
+        valid_hits = [h for h in hits if h.get("bar_luma") is not None]
+        picture = [h for h in valid_hits if h["bar_luma"] >= threshold]
+        needed_picture = max(2, math.ceil(len(check_times) * 0.5)) if len(check_times) >= 2 else 1
+        if len(picture) >= needed_picture:
+            still_body.append(cluster)
+            if debug:
+                med = _median_cropdetect([h["bar_luma"] for h in valid_hits])
+                print(f"    - Expanding AR kept ({cluster['center']}, bar YAVG={med:.1f} vs {baseline:.1f})")
+    return still_body
+
+
+def _recommend_from_clusters_cropdetect(body_clusters, video_w, video_h, min_crop):
+    if not body_clusters:
+        return None, None, "none"
+    rects = [_parse_crop_string_cropdetect(c["center"]) for c in body_clusters]
+    raw = _calculate_bounding_box_cropdetect(rects)
+    if not raw:
+        return None, None, "none"
+    parsed = _parse_crop_string_cropdetect(raw)
+    snapped, ar_label = _snap_to_known_ar_cropdetect(
+        parsed["w"], parsed["h"], parsed["x"], parsed["y"], video_w, video_h
+    )
+    if _is_full_frame_cropdetect(snapped, video_w, video_h):
+        return snapped, ar_label, "full"
+    if not _is_major_crop_cropdetect(snapped, video_w, video_h, min_crop):
+        return snapped, ar_label, "tiny"
+    kind = "single" if len(body_clusters) == 1 else "mixed"
+    return snapped, ar_label, kind
+
+
+def _analyze_video_cropdetect(
+    input_file,
+    duration,
+    width,
+    height,
+    video_stream_idx,
+    codec_name,
+    file_size,
+    num_workers,
+    significant_crop_threshold,
+    min_crop,
+    debug=False,
+):
+    use_seek = (
+        (codec_name and codec_name.lower() in _CROPDETECT_INTRA_ONLY_CODECS)
+        or file_size > _CROPDETECT_AUTO_KEYFRAME_MAX_BYTES
+    )
+    if use_seek:
+        effective_interval = round(max(2.0, min(10.0, duration / _CROPDETECT_TARGET_AUTO_SEEKS)), 2)
+        print(f"    - Autocrop scan: seek every {effective_interval}s across {num_workers} worker(s)...")
+        times = _sample_times_cropdetect(duration, effective_interval, offset=0.0)
+        samples = _run_seek_samples_cropdetect(input_file, times, video_stream_idx, num_workers)
+        scan_mode = "seek"
     else:
-        crop_keys = [c["center"] for c in safe_clusters]
-        bounding_box_crop = _calculate_bounding_box_cropdetect(crop_keys)
-        if bounding_box_crop:
-            parsed_bb = _parse_crop_string_cropdetect(bounding_box_crop)
-            snapped_crop, ar_label = _snap_to_known_ar_cropdetect(
-                parsed_bb["w"], parsed_bb["h"], parsed_bb["x"], parsed_bb["y"], width, height
-            )
-            parsed_snapped = _parse_crop_string_cropdetect(snapped_crop)
-            if parsed_snapped and parsed_snapped["w"] == width and parsed_snapped["h"] == height:
-                return None
-            return snapped_crop
-        else:
-            return None
-    crop_counts = _Counter_cropdetect(all_crop_strings)
-    clusters = _cluster_crop_values_cropdetect(crop_counts)
-    total_detections = sum(c["count"] for c in clusters)
-    significant_clusters = []
-    for cluster in clusters:
-        percentage = (cluster["count"] / total_detections) * 100
-        if percentage >= significant_crop_threshold:
-            significant_clusters.append(cluster)
-    for cluster in significant_clusters:
-        parsed_crop = _parse_crop_string_cropdetect(cluster["center"])
-        if parsed_crop:
-            _, ar_label = _snap_to_known_ar_cropdetect(
-                parsed_crop["w"], parsed_crop["h"], parsed_crop["x"], parsed_crop["y"], width, height
-            )
-            cluster["ar_label"] = ar_label
-        else:
-            cluster["ar_label"] = None
-    if not significant_clusters:
+        print(f"    - Autocrop scan: keyframes across {num_workers} worker(s)...")
+        samples = _run_keyframe_scan_cropdetect(input_file, duration, video_stream_idx, num_workers)
+        scan_mode = "keyframes"
+        effective_interval = None
+        if len(samples) < 5 and duration > 10:
+            effective_interval = round(max(2.0, min(10.0, duration / _CROPDETECT_TARGET_AUTO_SEEKS)), 2)
+            times = _sample_times_cropdetect(duration, effective_interval, offset=0.0)
+            samples = _run_seek_samples_cropdetect(input_file, times, video_stream_idx, num_workers)
+            scan_mode = "seek"
+
+    _attach_sample_durations_cropdetect(
+        samples, duration, fixed_interval=effective_interval if scan_mode == "seek" else None
+    )
+
+    def usable(sample):
+        if not sample.get("crop"):
+            return False
+        luma = sample.get("luma")
+        return True if luma is None else luma >= _CROPDETECT_LUMA_MIN
+
+    valid = [s for s in samples if usable(s)]
+    if not valid:
         return None
-    if len(significant_clusters) == 1:
-        dominant_cluster = significant_clusters[0]
-        parsed_crop = _parse_crop_string_cropdetect(dominant_cluster["center"])
-        snapped_crop, ar_label = _snap_to_known_ar_cropdetect(
-            parsed_crop["w"], parsed_crop["h"], parsed_crop["x"], parsed_crop["y"], width, height
+
+    def decide(valid_samples, cur_interval):
+        clusters = _cluster_samples_cropdetect(valid_samples)
+        body = _classify_clusters_cropdetect(
+            clusters,
+            duration,
+            _CROPDETECT_EDGE_FRAC,
+            significant_crop_threshold,
+            _CROPDETECT_MIN_INSERT,
+            seek_interval=cur_interval,
         )
-        parsed_snapped = _parse_crop_string_cropdetect(snapped_crop)
-        if parsed_snapped and parsed_snapped["w"] == width and parsed_snapped["h"] == height:
-            return None
-        return snapped_crop
-    crop_keys = [c["center"] for c in significant_clusters]
-    bounding_box_crop = _calculate_bounding_box_cropdetect(crop_keys)
-    if bounding_box_crop:
-        parsed_bb = _parse_crop_string_cropdetect(bounding_box_crop)
-        snapped_crop, ar_label = _snap_to_known_ar_cropdetect(
-            parsed_bb["w"], parsed_bb["h"], parsed_bb["x"], parsed_bb["y"], width, height
+        body = _verify_expanding_clusters_cropdetect(
+            body,
+            input_file,
+            video_stream_idx,
+            width,
+            height,
+            duration,
+            num_workers,
+            _CROPDETECT_BAR_DELTA,
+            _CROPDETECT_MIN_INSERT,
+            significant_crop_threshold,
+            debug=debug,
         )
-        parsed_snapped = _parse_crop_string_cropdetect(snapped_crop)
-        if parsed_snapped and parsed_snapped["w"] == width and parsed_snapped["h"] == height:
-            return None
-        return snapped_crop
+        return _recommend_from_clusters_cropdetect(body, width, height, min_crop)
+
+    cur_interval = effective_interval if scan_mode == "seek" else None
+    snapped, ar_label, kind = decide(valid, cur_interval)
+
+    if (
+        scan_mode == "seek"
+        and kind in ("single", "mixed")
+        and effective_interval is not None
+        and effective_interval > max(1.0, _CROPDETECT_MIN_INSERT / 2.0)
+    ):
+        already = {round(s["ts"], 3) for s in samples}
+        gap_times = [
+            t for t in _sample_times_cropdetect(duration, effective_interval, offset=effective_interval / 2.0)
+            if round(t, 3) not in already
+        ]
+        if gap_times:
+            extra = _run_seek_samples_cropdetect(input_file, gap_times, video_stream_idx, num_workers)
+            extra_valid = [s for s in extra if usable(s)]
+            if extra_valid:
+                valid = _attach_sample_durations_cropdetect(
+                    valid + extra_valid, duration, fixed_interval=effective_interval / 2.0
+                )
+                snapped, ar_label, kind = decide(valid, effective_interval / 2.0)
+
+    if kind in ("single", "mixed") and snapped:
+        if debug and ar_label:
+            print(f"    - Autocrop snapped to '{ar_label}' ({kind})")
+        return snapped
     return None
 
 
@@ -2024,11 +2439,13 @@ def detect_autocrop_filter(input_file, significant_crop_threshold=5.0, min_crop=
             input_file,
         ]
         duration_str = subprocess.check_output(probe_duration_args, stderr=subprocess.STDOUT, text=True)
-        duration = int(float(duration_str))
+        duration = float(duration_str.strip())
+        if not math.isfinite(duration) or duration <= 0:
+            return None
         probe_res_args = [
             "ffprobe", "-v", "error",
             "-select_streams", "v",
-            "-show_entries", "stream=width,height,disposition",
+            "-show_entries", "stream=index,codec_name,width,height,disposition",
             "-of", "json",
             input_file,
         ]
@@ -2043,11 +2460,23 @@ def detect_autocrop_filter(input_file, significant_crop_threshold=5.0, min_crop=
             return None
         width = int(video_stream["width"])
         height = int(video_stream["height"])
+        stream_idx = int(video_stream.get("index", 0))
+        codec_name = video_stream.get("codec_name", "")
+        file_size = os.path.getsize(input_file)
     except Exception:
         return None
     return _analyze_video_cropdetect(
-        input_file, duration, width, height, max(1, os.cpu_count() // 2),
-        significant_crop_threshold, min_crop, debug,
+        input_file,
+        duration,
+        width,
+        height,
+        stream_idx,
+        codec_name,
+        file_size,
+        max(1, (os.cpu_count() or 2) // 2),
+        significant_crop_threshold,
+        min_crop,
+        debug,
     )
 
 

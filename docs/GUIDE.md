@@ -8,7 +8,7 @@ How the batch AV1 scripts run, and why they take the paths they do. Encoder flag
 *   **`svt_opus_encoder.py`**: Uses the `svt-av1` encoder (specifically designed for the `SVT-AV1-Essential` fork) via `av1an`. Auto-detects SDR vs HDR and 1080p vs 4K, then selects the matching intermediate, VapourSynth matrix, and SVT color/preset settings. Av1an worker count is `(cpu_count // 2) - 1`.
 *   **`xav_automation.py`**: Uses the `xav` chunking encoder and `svt-av1` (SVT-AV1-Essential) instead of `av1an`. Features native autocrop, scene-detect, and chunking. A fail-closed packet-PTS CFR probe plus pixel-format checks decide whether to remux video-only or run HandBrake (with format conversion to `yuv420p` / `yuv420p10le` when needed).
 
-A standalone crop detector lives in [`../cropdetect/`](../cropdetect/). The same logic is still embedded in `svt_opus_encoder.py` and `aom_opus_encoder.py` via `--autocrop` (an older copy; not imported from that folder yet).
+A standalone crop detector lives in [`../cropdetect/`](../cropdetect/). The same logic is embedded directly in `svt_opus_encoder.py` and `aom_opus_encoder.py` via `--autocrop` so each encoder script stays self-contained.
 
 Standalone helpers live in [`../tools/`](../tools/). `mdegrain.py` denoises a folder of MKVs, including VFR and 4K/HDR, into CFR `yuv420p` or `yuv420p10le` files that `xav_automation.py` can take. No flag uses thsad 350. `--low` is 150, `--high` is 500, and `--thsad N` sets the strength. Combining those flags prints a warning and exits without encoding. `av1grain.py` adds grav1synth film grain to finished AV1 MKVs. The grain is signalled in the AV1 headers, so the video is not re-encoded.
 
