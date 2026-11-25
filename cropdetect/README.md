@@ -124,3 +124,5 @@ If both ratios still share a smaller outer box (for example Scope + IMAX 1.90), 
 ## Integration with Other Scripts
 
 [`svt_opus_encoder.py`](../svt_opus_encoder.py) and [`aom_opus_encoder.py`](../aom_opus_encoder.py) embed this same crop detection logic behind `--autocrop` so each script stays self-contained. [`xav_automation.py`](../xav_automation.py) uses xav's native autocrop and does not call this tool.
+
+[`cropdetect_old.py`](cropdetect_old.py) is a legacy version kept in this folder only as a reference.
