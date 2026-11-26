@@ -3,16 +3,18 @@
 # mdegrain.py - standalone denoise. Output goes straight into the xav_automation.py queue.
 #
 # cd into a folder of MKVs and run `mdegrain.py`. For every *.mkv in that folder:
-#   1. If packets are not CFR, or MediaInfo says VFR: HandBrake --cfr --rate
-#      (ffmpeg -fps_mode cfr is the fallback). Same probe and FPS choice as
-#      xav_automation.py. Normal GOP, no all-intra.
-#   2. MDegrain2 (mvtools), same filter as ~/bin/mdegrain.vpy
-#      Strength: default thsad 350, --low 150, --high 500, or --thsad N.
-#   3. Encode to the only pixel formats xav accepts:
-#        1080p SDR 8-bit 4:2:0  -> libx264 CRF 0 yuv420p
-#        other 1080p SDR        -> libx264 CRF 0 yuv420p10le (Hi10p, 4:2:2, 4:4:4, RGB, 12-bit+)
-#        above 1080p or HDR     -> libx265 CRF 0 yuv420p10le
-#      x265 CRF 0 is not bit-exact. xav only accepts 4:2:0, so that is the intermediate.
+#   1. If packets are not CFR, or MediaInfo says VFR: convert to CFR in-memory via
+#      ffms2 (fpsnum/fpsden) when possible; fall back to HandBrake --cfr --rate or
+#      ffmpeg -fps_mode cfr if timestamps are negative or FPS cannot be parsed.
+#   2. Promote to 16-bit 4:2:0 (Spline36 for RGB/4:2:2/4:4:4; lossless bit-shift
+#      for 8/10/12-bit 4:2:0), run resolution-adaptive MDegrain2 (mvtools), then
+#      error-diffusion dither to yuv420p10le (the format xav always encodes).
+#      Strength: default thsad 250, --low 150, --high 350, or --thsad N (thsadc = thsad // 2).
+#   3. Encode to visually transparent yuv420p10le (normal GOP, no fastdecode bloat):
+#        <=1080p SDR        -> libx264 10-bit CRF 0 veryfast yuv420p10le
+#        above 1080p or HDR -> libx265 10-bit CRF 0 superfast yuv420p10le
+#      Neither 10-bit x264 CRF 0 (QP 12) nor x265 CRF 0 is bit-exact, avoiding
+#      2.5-3.5x lossless filesize bloat while staying visually transparent for xav.
 #   4. mkvmerge: new video first, then everything from the source except its video
 #   5. Result -> completed/<same name>, source -> original/<same name>,
 #      on error the source -> failed/<same name>. One log per file in conv_logs/.
@@ -22,6 +24,7 @@
 # ffmpeg, HandBrake, and mkvmerge inherit that mask.
 
 import argparse
+from fractions import Fraction
 import json
 import math
 import os
@@ -54,14 +57,17 @@ PLUGIN_PATH_LINE = (
     "| sudo tee /etc/profile.d/vapoursynth-plugins.sh"
 )
 
-DEFAULT_THSAD = 350
+DEFAULT_THSAD = 250
 THSAD_LOW = 150
-THSAD_HIGH = 500
+THSAD_HIGH = 350
+# Cap VapourSynth framebuffer cache so 30 threads at 4K cannot balloon RAM.
+MAX_VS_CACHE_MIB = 8192
 # Same reservation as xav_automation.py. 32 threads → CPUs 0-29.
 RESERVED_THREADS = 2
 INTERRUPTED = False  # set by Ctrl+C, so a dying child is never counted as a failure
 
-# Height above 1080 uses the 4K/HDR codec. Same cutoff as xav_automation.py.
+# Resolution tiers for codec selection and MDegrain2 block size.
+HEIGHT_SD = 576
 HEIGHT_4K = 1080
 XAV_PIX_FMTS = {"yuv420p", "yuv420p10le"}
 
@@ -108,19 +114,23 @@ ISO_PRIMARIES = {v: k for k, v in PRIMARIES_ISO.items()}
 ISO_TRANSFER = {v: k for k, v in TRANSFER_ISO.items()}
 ISO_MATRIX = {v: k for k, v in MATRIX_ISO.items() if k != "rgb"}
 
-# mkvmerge -J property -> mkvmerge output flag. Applied to the new video track.
-CONTAINER_COLOR = (
-    ("color_matrix_coefficients", "--color-matrix-coefficients"),
-    ("color_primaries", "--color-primaries"),
-    ("color_transfer_characteristics", "--color-transfer-characteristics"),
-    ("color_range", "--color-range"),
-    ("color_bits_per_channel", "--color-bits-per-channel"),
-    ("max_content_light", "--max-content-light"),
-    ("max_frame_light", "--max-frame-light"),
-    ("chromaticity_coordinates", "--chromaticity-coordinates"),
-    ("white_color_coordinates", "--white-color-coordinates"),
-    ("max_luminance", "--max-luminance"),
-    ("min_luminance", "--min-luminance"),
+# ffprobe chroma_location -> (x264/x265 chromaloc, mkvmerge --chroma-siting or None, zimg chromaloc_s)
+CHROMA_LOC_INFO = {
+    "left": (0, "1,2", "left"),
+    "center": (1, "2,2", "center"),
+    "topleft": (2, "1,1", "top_left"),
+    "top": (3, "2,1", "top"),
+    "bottomleft": (4, None, "bottom_left"),
+    "bottom": (5, None, "bottom"),
+}
+
+# Common NTSC decimal FPS -> exact rational (ffms2 CFR needs integer num/den).
+COMMON_NTSC_FPS = (
+    (24000 / 1001, (24000, 1001)),
+    (30000 / 1001, (30000, 1001)),
+    (48000 / 1001, (48000, 1001)),
+    (60000 / 1001, (60000, 1001)),
+    (120000 / 1001, (120000, 1001)),
 )
 
 _X264_10BIT = None
@@ -543,51 +553,42 @@ def x264_supports_10bit():
 
 
 def codec_plan(track):
-    """xav-compatible 4:2:0. Normal GOP (all-intra is omitted on purpose).
+    """xav-compatible yuv420p10le, normal GOP, visually transparent (no fastdecode bloat).
 
-    xav re-encodes this file, so intra-only frames only cost space.
-    Above 1080p or HDR uses libx265 10-bit CRF 0, which is not bit-exact.
+    MDegrain2 runs in 16-bit and dithers to yuv420p10le (what xav always encodes).
+    <=1080p SDR uses libx264 10-bit CRF 0 veryfast (QP 12, fast encode, ~2.6x smaller
+    than -qp 0). Above 1080p or HDR uses libx265 10-bit CRF 0 superfast (~3x smaller
+    than lossless, native HDR10 SEI).
     """
-    depth = video_bit_depth(track)
-    chroma = video_chroma(track)
-    space = video_color_space(track)
-    already_8bit_420 = (
-        depth == 8
-        and (not chroma or chroma == "4:2:0")
-        and (not space or space in ("YUV", "YCBCR", "Y'UV"))
-    )
-    need_10 = (not already_8bit_420) or is_4k_or_hdr(track) or depth >= 10
     if is_4k_or_hdr(track):
         kind = "HDR" if is_hdr(track) else "above 1080p"
         return {
             "codec": "libx265",
+            "preset": "superfast",
             "pix_fmt": "yuv420p10le",
+            "bit_depth": 10,
             "hb_encoder": "x265_10bit",
-            "label": f"libx265 10-bit CRF 0 yuv420p10le, normal GOP ({kind})",
+            "label": f"libx265 10-bit CRF 0 superfast yuv420p10le, normal GOP ({kind})",
             "bit_exact": False,
         }
-    if need_10:
-        why = "Hi10p" if depth >= 10 else f"convert {space or 'YUV'} {chroma or '?'} {depth}-bit"
-        codec = "libx264"
-        bit_exact = True
-        note = ""
-        if not x264_supports_10bit():
-            codec = "libx265"
-            bit_exact = False
-            note = "; ffmpeg libx264 has no yuv420p10le, so libx265 CRF 0"
+    if not x264_supports_10bit():
         return {
-            "codec": codec,
+            "codec": "libx265",
+            "preset": "superfast",
             "pix_fmt": "yuv420p10le",
-            "hb_encoder": "x264_10bit",
-            "label": f"{codec} 10-bit CRF 0 yuv420p10le, normal GOP ({why}{note})",
-            "bit_exact": bit_exact,
+            "bit_depth": 10,
+            "hb_encoder": "x265_10bit",
+            "label": "libx265 10-bit CRF 0 superfast yuv420p10le, normal GOP (ffmpeg libx264 has no yuv420p10le)",
+            "bit_exact": False,
         }
     return {
         "codec": "libx264",
-        "pix_fmt": "yuv420p",
-        "hb_encoder": "x264",
-        "label": "libx264 8-bit CRF 0 yuv420p, normal GOP (1080p SDR)",
-        "bit_exact": True,
+        "preset": "veryfast",
+        "pix_fmt": "yuv420p10le",
+        "bit_depth": 10,
+        "hb_encoder": "x264_10bit",
+        "label": "libx264 10-bit CRF 0 veryfast yuv420p10le, normal GOP (<=1080p SDR)",
+        "bit_exact": False,
     }
 
 
@@ -781,8 +782,35 @@ def intermediate_cfr_ok(path):
     return False, reason
 
 
+def fps_rational(raw):
+    """Parse an FPS string ('24000/1001', '23.976', '25') into (num, den) ints, or None."""
+    if not raw:
+        return None
+    text = str(raw).split()[0]
+    try:
+        if "/" in text:
+            num_s, den_s = text.split("/", 1)
+            num, den = int(round(float(num_s))), int(round(float(den_s)))
+            if num > 0 and den > 0:
+                frac = Fraction(num, den)
+                return frac.numerator, frac.denominator
+            return None
+        val = float(text)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(val) or val <= 0:
+        return None
+    for ntsc_val, pair in COMMON_NTSC_FPS:
+        if abs(val - ntsc_val) < 0.002:
+            return pair
+    if abs(val - round(val)) < 1e-4:
+        return int(round(val)), 1
+    frac = Fraction(val).limit_denominator(100000)
+    return frac.numerator, frac.denominator
+
+
 def run_handbrake_cfr(source_file, output_file, plan, target_fps):
-    """Video-only CFR. Same HandBrake flags as xav, without all-intra --encopts."""
+    """Video-only CFR fallback. Normal GOP, no fastdecode."""
     if not shutil.which("HandBrakeCLI"):
         print("    - HandBrakeCLI is not in PATH.")
         return False
@@ -795,8 +823,7 @@ def run_handbrake_cfr(source_file, output_file, plan, target_fps):
         "--rate", str(target_fps),
         "--encoder", plan["hb_encoder"],
         "--quality", "0",
-        "--encoder-preset", "superfast",
-        "--encoder-tune", "fastdecode",
+        "--encoder-preset", plan["preset"],
         "--audio", "none",
         "--subtitle", "none",
         "--crop-mode", "none",
@@ -839,23 +866,8 @@ def run_ffmpeg_cfr(source_file, output_file, plan, track, color):
     return file_is_usable(output_file)
 
 
-def prepare_cfr_source(file_path, track, is_vfr, target_cfr_fps, plan, color):
-    """Return the file MDegrain should read.
-
-    Packet-CFR and MediaInfo not VFR: the source itself.
-    Otherwise a video-only CFR intermediate. Raises if that cannot be made.
-    """
-    true_cfr, cfr_reason, _nominal = probe_true_cfr(file_path, track)
-    if true_cfr:
-        print(f"    - Packet CFR probe: PASS ({cfr_reason})")
-    else:
-        print(f"    - Packet CFR probe: FAIL ({cfr_reason}) → CFR conversion")
-    if is_vfr:
-        print("    - MediaInfo VFR: HandBrake CFR hammer (probe cannot skip)")
-    if true_cfr and not is_vfr:
-        print("    - Denoise source is the original file.")
-        return file_path
-
+def make_cfr_intermediate(file_path, track, is_vfr, target_cfr_fps, plan, color):
+    """Write a video-only CFR intermediate via HandBrakeCLI (or ffmpeg fallback)."""
     cfr_file = file_path.with_name(f".{file_path.stem}{CFR_TMP_SUFFIX}")
     cfr_file.unlink(missing_ok=True)
     fps = handbrake_rate(track, file_path, target_cfr_fps if is_vfr else None)
@@ -880,6 +892,35 @@ def prepare_cfr_source(file_path, track, is_vfr, target_cfr_fps, plan, color):
             raise RuntimeError(f"CFR conversion output is not CFR ({why})")
     print(f"    - Denoise source is the CFR intermediate: {cfr_file.name}")
     return cfr_file
+
+
+def prepare_cfr_source(file_path, track, is_vfr, target_cfr_fps, plan, color):
+    """Decide how MDegrain reads the source. Returns (denoise_path, ffms2_fps, cfr_converted).
+
+    Packet-CFR and MediaInfo not VFR: read source directly without resampling.
+    VFR / failed CFR probe: prefer in-memory ffms2 CFR (fpsnum/fpsden, zero extra
+    temp file or generation loss). Fall back to HandBrake/ffmpeg temp CFR when
+    timestamps are negative or target FPS cannot be parsed.
+    """
+    true_cfr, cfr_reason, _nominal = probe_true_cfr(file_path, track)
+    if true_cfr:
+        print(f"    - Packet CFR probe: PASS ({cfr_reason})")
+    else:
+        print(f"    - Packet CFR probe: FAIL ({cfr_reason}) → CFR conversion")
+    if is_vfr:
+        print("    - MediaInfo VFR: CFR conversion required (probe cannot skip)")
+    if true_cfr and not is_vfr:
+        print("    - Denoise source is the original file.")
+        return file_path, None, False
+
+    raw_fps = video_fps(track, file_path) or target_cfr_fps
+    rat = fps_rational(raw_fps)
+    if rat and cfr_reason != "negative timestamp":
+        print(f"    - Converting to CFR in-memory via ffms2 at {rat[0]}/{rat[1]} fps (no extra intermediate).")
+        return file_path, rat, True
+
+    cfr_file = make_cfr_intermediate(file_path, track, is_vfr, target_cfr_fps, plan, color)
+    return cfr_file, None, True
 
 
 def _known_color(value):
@@ -967,10 +1008,10 @@ def _cll_from_side(item):
 
 
 def ffprobe_color(path):
-    """Stream color tags, plus mastering-display / CLL from the first frame."""
+    """Stream color tags, chroma_location, plus mastering-display / CLL from the first frame."""
     info = run_json([
         "ffprobe", "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=color_range,color_space,color_transfer,color_primaries,pix_fmt",
+        "-show_entries", "stream=color_range,color_space,color_transfer,color_primaries,chroma_location,pix_fmt",
         "-of", "json", str(path),
     ])
     stream = (info.get("streams") or [{}])[0]
@@ -979,12 +1020,14 @@ def ffprobe_color(path):
         frames = run_json([
             "ffprobe", "-v", "error", "-select_streams", "v:0",
             "-read_intervals", "%+#1",
-            "-show_frames", "-show_entries", "frame_side_data",
+            "-show_frames", "-show_entries", "frame=chroma_location:frame_side_data",
             "-of", "json", str(path),
         ])
     except (subprocess.CalledProcessError, json.JSONDecodeError, TypeError, ValueError):
         frames = {}
     for frame in frames.get("frames") or []:
+        if not _known_color(stream.get("chroma_location")) and _known_color(frame.get("chroma_location")):
+            stream["chroma_location"] = frame["chroma_location"]
         for item in frame.get("side_data_list") or []:
             kind = item.get("side_data_type") or ""
             if "Mastering display" in kind and "master" not in side:
@@ -1007,12 +1050,12 @@ def _decimal_text(value):
     return text or "0"
 
 
-def resolve_color(src_props, probed, side, track):
+def resolve_color(src_props, probed, side, track, output_bits=10):
     """One color description for the encoder VUI and the MKV Colour elements.
 
     libx264 / libx265 ignore ffmpeg -color_primaries and -color_trc. The VUI
     has to be set with encoder params. Container Colour is set again in
-    mkvmerge so a later video-only remux still carries HDR10 metadata.
+    mkvmerge so a later video-only remux still carries HDR10 and chroma siting.
     """
     props = src_props or {}
     names = {
@@ -1020,6 +1063,7 @@ def resolve_color(src_props, probed, side, track):
         "color_transfer": None,
         "color_space": None,
         "color_range": None,
+        "chroma_location": None,
     }
     iso = {
         "primaries": _as_int(props.get("color_primaries")),
@@ -1043,6 +1087,7 @@ def resolve_color(src_props, probed, side, track):
         "color_transfer": _known_color(probed.get("color_transfer")),
         "color_space": _known_color(probed.get("color_space")),
         "color_range": _known_color(probed.get("color_range")),
+        "chroma_location": _known_color(probed.get("chroma_location")),
     }
     if probed_names["color_range"] in ("mpeg", "limited"):
         probed_names["color_range"] = "tv"
@@ -1071,6 +1116,8 @@ def resolve_color(src_props, probed, side, track):
         names["color_transfer"] = None
     if names["color_space"] not in MATRIX_ISO:
         names["color_space"] = None
+    if names["chroma_location"] not in CHROMA_LOC_INFO:
+        names["chroma_location"] = None
 
     mux = {}
     if names["color_primaries"]:
@@ -1083,9 +1130,12 @@ def resolve_color(src_props, probed, side, track):
         _put_mux(mux, "--color-range", 1)
     elif names["color_range"] == "pc":
         _put_mux(mux, "--color-range", 2)
-    bits = props.get("color_bits_per_channel")
-    if bits is not None:
-        _put_mux(mux, "--color-bits-per-channel", bits)
+    if names["chroma_location"]:
+        mkv_siting = CHROMA_LOC_INFO[names["chroma_location"]][1]
+        if mkv_siting:
+            _put_mux(mux, "--chroma-siting", mkv_siting)
+    if output_bits:
+        _put_mux(mux, "--color-bits-per-channel", int(output_bits))
 
     master = _master_from_side(side.get("master")) or _master_from_container(props)
     cll = _cll_from_side(side.get("cll"))
@@ -1145,17 +1195,19 @@ def vui_parts(color, codec):
             parts.append("range=full")
     elif codec == "libx264" and rng in ("tv", "pc"):
         parts.append(f"range={rng}")
+    cloc = names.get("chroma_location")
+    if cloc in CHROMA_LOC_INFO:
+        parts.append(f"chromaloc={CHROMA_LOC_INFO[cloc][0]}")
     return parts
 
 
 def ffmpeg_codec_args(plan, color):
-    """CRF 0, superfast, fastdecode. No -g 1 / -bf 0."""
+    """CRF 0, normal GOP, no fastdecode (keeps CABAC, avoids 12-20% size bloat)."""
     codec = plan["codec"]
     args = [
         "-c:v", codec,
         "-crf", "0",
-        "-preset", "superfast",
-        "-tune", "fastdecode",
+        "-preset", plan["preset"],
         "-pix_fmt", plan["pix_fmt"],
     ]
     if codec == "libx265":
@@ -1193,41 +1245,106 @@ def mkv_video_track(identify):
     raise RuntimeError("no video track found")
 
 
-def conform_format(clip, pix_fmt, track):
-    """4:2:2 / 4:4:4 / RGB / 12-bit+ become the xav pixel format. Matching clips pass through."""
+def _zimg_matrix(color, track):
+    space = (color or {}).get("names", {}).get("color_space")
+    if space == "bt2020nc":
+        return "2020ncl"
+    if space == "smpte170m":
+        return "170m"
+    if space == "bt470bg":
+        return "470bg"
+    return "2020ncl" if is_hdr(track) else "709"
+
+
+def conform_work_format(clip, track, color):
+    """Convert any input to 16-bit YUV 4:2:0 before MDegrain2.
+
+    8/10/12-bit 4:2:0 YUV uses a lossless bit-shift (Point). RGB, GRAY, and
+    non-4:2:0 subsampling (4:2:2 / 4:4:4) use Spline36 to avoid nearest-neighbor
+    chroma aliasing and preserve chroma siting.
+    """
     import vapoursynth as vs
     core = vs.core
-    target = vs.YUV420P8 if pix_fmt == "yuv420p" else vs.YUV420P10
-    if clip.format.id == target:
+    if clip.format.id == vs.YUV420P16:
         return clip
     family = clip.format.color_family
-    kwargs = {"format": target}
-    if family in (vs.RGB, vs.GRAY):
-        kwargs["matrix_s"] = "2020ncl" if is_hdr(track) else "709"
-    elif family != vs.YUV:
+    if family == vs.YUV and clip.format.subsampling_w == 1 and clip.format.subsampling_h == 1:
+        if clip.format.sample_type == vs.INTEGER and clip.format.bits_per_sample <= 16:
+            return core.resize.Point(clip, format=vs.YUV420P16)
+        return core.resize.Spline36(clip, format=vs.YUV420P16)
+    kwargs = {"format": vs.YUV420P16}
+    if family == vs.RGB:
+        kwargs["matrix_s"] = _zimg_matrix(color, track)
+    elif family not in (vs.YUV, vs.GRAY):
         raise RuntimeError(f"unsupported color family {clip.format.name}")
-    print(f"    - Converting {clip.format.name} -> {pix_fmt}")
-    return core.resize.Point(clip, **kwargs)
+    cloc = (color or {}).get("names", {}).get("chroma_location")
+    if cloc in CHROMA_LOC_INFO:
+        kwargs["chromaloc_s"] = CHROMA_LOC_INFO[cloc][2]
+    print(f"    - Converting {clip.format.name} -> YUV420P16 (Spline36) before denoise")
+    return core.resize.Spline36(clip, **kwargs)
 
 
-def build_degrain(path, cachefile, thsad, threads):
-    """Same filter chain as ~/bin/mdegrain.vpy."""
+def degrain_params(height, thsad):
+    """Resolution-adaptive MDegrain2 parameters."""
+    if height > HEIGHT_4K:
+        pel, blksize, overlap = 1, 32, 16
+    elif height <= HEIGHT_SD:
+        pel, blksize, overlap = 2, 8, 4
+    else:
+        pel, blksize, overlap = 2, 16, 8
+    thsadc = max(1, thsad // 2) if thsad > 0 else 0
+    prefilter_passes = 2 if (thsad >= THSAD_HIGH or height > HEIGHT_4K) else 1
+    return {
+        "pel": pel,
+        "blksize": blksize,
+        "overlap": overlap,
+        "thsad": thsad,
+        "thsadc": thsadc,
+        "prefilter_passes": prefilter_passes,
+    }
+
+
+def build_degrain(path, cachefile, thsad, threads, track, color, ffms2_fps=None):
+    """Load source, promote to 16-bit 4:2:0, run MDegrain2, error-diffusion dither to 10-bit."""
     import vapoursynth as vs
     core = vs.core
     core.num_threads = threads
+    if core.max_cache_size > MAX_VS_CACHE_MIB:
+        core.max_cache_size = MAX_VS_CACHE_MIB
 
-    clip = core.ffms2.Source(str(path), cachefile=str(cachefile))
-    pre = core.zsmooth.RemoveGrain(clip, mode=12)
-    sup_search = core.mv.Super(pre, pel=2, sharp=2, hpad=16, vpad=16)
-    sup_render = core.mv.Super(clip, pel=2, sharp=2, hpad=16, vpad=16, levels=1)
-    common = dict(blksize=16, overlap=8, search=4, searchparam=2, truemotion=1, chroma=1)
+    src_kwargs = {"cachefile": str(cachefile)}
+    if ffms2_fps is not None:
+        src_kwargs["fpsnum"] = int(ffms2_fps[0])
+        src_kwargs["fpsden"] = int(ffms2_fps[1])
+    clip = core.ffms2.Source(str(path), **src_kwargs)
+    work = conform_work_format(clip, track, color)
+
+    params = degrain_params(work.height, thsad)
+    pre = core.zsmooth.RemoveGrain(work, mode=12)
+    for _ in range(params["prefilter_passes"] - 1):
+        pre = core.zsmooth.RemoveGrain(pre, mode=12)
+
+    pad = params["blksize"]
+    sup_search = core.mv.Super(pre, pel=params["pel"], sharp=2, rfilter=4, hpad=pad, vpad=pad)
+    sup_render = core.mv.Super(work, pel=params["pel"], sharp=2, hpad=pad, vpad=pad, levels=1)
+    common = dict(
+        blksize=params["blksize"],
+        overlap=params["overlap"],
+        search=4,
+        searchparam=2,
+        truemotion=0,
+        chroma=1,
+    )
     bv1 = core.mv.Analyse(sup_search, isb=True, delta=1, **common)
     fv1 = core.mv.Analyse(sup_search, isb=False, delta=1, **common)
     bv2 = core.mv.Analyse(sup_search, isb=True, delta=2, **common)
     fv2 = core.mv.Analyse(sup_search, isb=False, delta=2, **common)
-    out = core.mv.Degrain2(clip, sup_render, bv1, fv1, bv2, fv2,
-                           thsad=thsad, thsadc=thsad, thscd1=400, thscd2=130)
-    return clip, out
+    denoised = core.mv.Degrain2(
+        work, sup_render, bv1, fv1, bv2, fv2,
+        thsad=params["thsad"], thsadc=params["thsadc"], thscd1=400, thscd2=130,
+    )
+    out = core.resize.Point(denoised, format=vs.YUV420P10, dither_type="error_diffusion")
+    return clip, out, params
 
 
 def encode(out, tmp_video, plan, color):
@@ -1382,34 +1499,42 @@ def process_file(file_path, thsad, threads):
 
         plan = codec_plan(track)
         print(f"    - Encoder: {plan['label']}")
-        if not plan["bit_exact"]:
-            print("    - x265 CRF 0 is the intermediate xav accepts. It is not bit-exact.")
         is_vfr, target_cfr_fps = detect_vfr(media_info)
         probed, side = ffprobe_color(file_path)
         src_id = run_json(["mkvmerge", "-J", str(file_path)])
         src_vtrack = mkv_video_track(src_id)
-        color = resolve_color(src_vtrack.get("properties") or {}, probed, side, track)
+        color = resolve_color(src_vtrack.get("properties") or {}, probed, side, track, output_bits=plan["bit_depth"])
         src_fmt = (probed.get("pix_fmt") or ffprobe_pix_fmt(file_path) or "unknown").lower()
         if src_fmt not in XAV_PIX_FMTS:
-            print(f"    - Source pixels {src_fmt} are not yuv420p / yuv420p10le. Converting during denoise.")
+            print(f"    - Source pixels {src_fmt} are not yuv420p / yuv420p10le. Converting to 16-bit 4:2:0 before denoise.")
 
-        denoise_path = prepare_cfr_source(
+        denoise_path, ffms2_fps, cfr_converted = prepare_cfr_source(
             file_path, track, is_vfr, target_cfr_fps, plan, color,
         )
 
-        print(f"    - Indexing (ffms2) and building MDegrain2 (thsad={thsad}, threads={threads})...")
-        clip, out = build_degrain(denoise_path, ffindex, thsad, threads)
-        out = conform_format(out, plan["pix_fmt"], track)
+        print(f"    - Indexing (ffms2) and building 16-bit MDegrain2 (thsad={thsad}, threads={threads})...")
+        try:
+            clip, out, deg = build_degrain(denoise_path, ffindex, thsad, threads, track, color, ffms2_fps=ffms2_fps)
+        except Exception as exc:
+            if ffms2_fps is None:
+                raise
+            print(f"    - Warning: in-memory ffms2 CFR failed ({exc}). Falling back to HandBrake/ffmpeg CFR.")
+            ffindex.unlink(missing_ok=True)
+            denoise_path = make_cfr_intermediate(file_path, track, is_vfr, target_cfr_fps, plan, color)
+            ffms2_fps = None
+            clip, out, deg = build_degrain(denoise_path, ffindex, thsad, threads, track, color)
         print(
-            f"    - Denoise clip: {clip.width}x{clip.height} {clip.format.name} -> {plan['pix_fmt']}, "
-            f"{clip.fps_num}/{clip.fps_den} fps, {clip.num_frames} frames, scan={scan}"
+            f"    - Denoise clip: {clip.width}x{clip.height} {clip.format.name} -> YUV420P16 -> {plan['pix_fmt']}, "
+            f"pel={deg['pel']}, blksize={deg['blksize']}/{deg['overlap']}, "
+            f"thsad={deg['thsad']}/{deg['thsadc']}, prefilter={deg['prefilter_passes']}x, "
+            f"{out.fps_num}/{out.fps_den} fps, {out.num_frames} frames, scan={scan}"
         )
 
         print("    - Denoise encode...")
         elapsed = encode(out, tmp_video, plan, color)
         print(
-            f"    - Denoise speed: {clip.num_frames / elapsed:.1f} fps "
-            f"({clip.num_frames} frames in {elapsed:.0f} s)"
+            f"    - Denoise speed: {out.num_frames / elapsed:.1f} fps "
+            f"({out.num_frames} frames in {elapsed:.0f} s)"
         )
 
         print("Remuxing with mkvmerge...")
@@ -1418,16 +1543,22 @@ def process_file(file_path, thsad, threads):
         print("Checking output...")
         out_id = run_json(["mkvmerge", "-J", str(muxed)])
         out_frames = count_video_packets(muxed)
-        denoise_frames = count_video_packets(denoise_path)
-        print(f"    - Frames: denoise source {denoise_frames}, ffms2 {clip.num_frames}, output {out_frames}")
-        if not (out_frames == denoise_frames == clip.num_frames):
-            raise RuntimeError("frame count mismatch against the denoise source")
-        if denoise_path != file_path:
+        if ffms2_fps is not None:
             src_frames = count_video_packets(file_path)
-            print(f"    - VFR/CFR frame counts differ as expected: source {src_frames}, CFR {denoise_frames}")
+            print(f"    - Frames: source {src_frames}, ffms2 CFR {out.num_frames}, output {out_frames}")
+            if out_frames != out.num_frames:
+                raise RuntimeError("frame count mismatch against ffms2 CFR clip")
+        else:
+            denoise_frames = count_video_packets(denoise_path)
+            print(f"    - Frames: denoise source {denoise_frames}, ffms2 {out.num_frames}, output {out_frames}")
+            if not (out_frames == denoise_frames == out.num_frames):
+                raise RuntimeError("frame count mismatch against the denoise source")
+            if cfr_converted and denoise_path != file_path:
+                src_frames = count_video_packets(file_path)
+                print(f"    - VFR/CFR frame counts differ as expected: source {src_frames}, CFR {denoise_frames}")
         src_dur = container_duration(src_id)
         out_dur = container_duration(out_id)
-        frame_dur = clip.fps_den / clip.fps_num if clip.fps_num else 0.04
+        frame_dur = out.fps_den / out.fps_num if out.fps_num else 0.04
         print(f"    - Duration: source {src_dur:.3f} s, output {out_dur:.3f} s")
         if abs(src_dur - out_dur) > max(frame_dur * 3, 0.15):
             raise RuntimeError("duration mismatch")
@@ -1522,7 +1653,7 @@ def check_environment(report_only=False):
         state = "MISSING" if tool in tool_missing else "OK"
         print(f"  {state:7} {tool}")
     hb_state = "OK" if handbrake else "MISSING"
-    print(f"  {hb_state:7} HandBrakeCLI (optional; VFR uses ffmpeg without it)")
+    print(f"  {hb_state:7} HandBrakeCLI (optional; fallback if ffms2 CFR fails)")
     if loaded is None:
         print("  MISSING vapoursynth (Python package)")
     else:
@@ -1541,7 +1672,7 @@ def check_environment(report_only=False):
     if x264_supports_10bit():
         print("  OK      libx264 yuv420p10le")
     else:
-        print("  note    libx264 has no yuv420p10le; 1080p 10-bit uses libx265 CRF 0")
+        print("  note    libx264 has no yuv420p10le; <=1080p SDR uses libx265 CRF 0")
     failed = bool(tool_missing or loaded is None or plugin_missing)
     if loaded is None:
         print("Required Python package 'vapoursynth' is not installed.")
@@ -1629,15 +1760,16 @@ if __name__ == "__main__":
 Denoise every MKV in the current folder, one file at a time.
 
 For each *.mkv:
-  1. VFR, or a failed packet-CFR probe, is converted to CFR first
-     (HandBrake --cfr --rate, same FPS choice as xav_automation.py;
-     ffmpeg is the fallback). Output uses a normal GOP.
-  2. MDegrain2 denoise (mvtools, same filter as ~/bin/mdegrain.vpy).
-     Strength is thsad 350, or --low (150), --high (500), or --thsad N.
-  3. encode to yuv420p or yuv420p10le, the formats xav accepts
-       1080p SDR 8-bit 4:2:0 -> libx264 CRF 0
-       other 1080p SDR        -> libx264 10-bit CRF 0
-       above 1080p or HDR     -> libx265 10-bit CRF 0 (not bit-exact)
+  1. VFR, or a failed packet-CFR probe, is converted to CFR in-memory via
+     ffms2 (fpsnum/fpsden). HandBrake --cfr --rate and ffmpeg are fallbacks
+     when timestamps are negative or FPS cannot be parsed.
+  2. Sources are promoted to 16-bit 4:2:0 (Spline36 for RGB/4:2:2/4:4:4),
+     denoised with resolution-adaptive MDegrain2 (mvtools, truemotion=0,
+     thsadc = thsad // 2), and error-diffusion dithered to yuv420p10le.
+     Strength is thsad 250, or --low (150), --high (350), or --thsad N.
+  3. encode to visually transparent yuv420p10le (normal GOP, no fastdecode)
+       <=1080p SDR        -> libx264 10-bit CRF 0 veryfast (QP 12)
+       above 1080p or HDR -> libx265 10-bit CRF 0 superfast
   4. remux: new video + all audio, subs, chapters, attachments from the source
   5. checks frames, duration, pixel format, CFR, tracks and chapters
 
@@ -1647,9 +1779,10 @@ Folders (created in the current folder, like xav_automation.py):
   failed/      sources that failed
   conv_logs/   one log per file
 
-HDR10 static metadata (primaries, PQ/HLG, mastering display, MaxCLL) is
-copied onto the new video. Dolby Vision RPU and HDR10+ dynamic metadata
-are not kept. x265 CRF 0 above 1080p or for HDR is not bit-exact.
+HDR10 static metadata (primaries, PQ/HLG, chroma siting, mastering display,
+MaxCLL) is copied onto the new video. Dolby Vision RPU and HDR10+ dynamic
+metadata are not kept. Intermediates are visually transparent near-lossless
+(~57-61 dB PSNR) to avoid 2.5-3.5x lossless filesize bloat before xav.
 
 Needs ffmpeg, ffprobe, mkvmerge, mediainfo, and the VapourSynth plugins
 ffms2, mvtools, and zsmooth. If a plugin does not load, the script names
@@ -1671,16 +1804,16 @@ examples:
       show the CPU plan and check programs and plugins, then exit. Does not encode.
 
   mdegrain.py
-      denoise all MKVs in the current folder (thsad 350). On a 32-thread CPU
+      denoise all MKVs in the current folder (thsad 250). On a 32-thread CPU
       this pins CPUs 0-29 and leaves CPUs 30-31 free.
 
   mdegrain.py --low
       lighter denoise (thsad 150, keeps more grain/detail)
 
   mdegrain.py --high
-      stronger denoise (thsad 500)
+      stronger denoise (thsad 350)
 
-  mdegrain.py --thsad 250
+  mdegrain.py --thsad 200
       set the strength yourself
 
   mdegrain.py --reserve-threads 4
@@ -1689,10 +1822,10 @@ examples:
   cd ~/video-input/somefolder && mdegrain.py
       typical run inside a GNU screen session
 
-thsad guide: 150 = light, 350 = default, 500+ = strong""",
+thsad guide: 150 = light, 250 = default, 350 = strong (thsadc is thsad // 2)""",
     )
     parser.add_argument("--thsad", type=int, default=None, metavar="N",
-                        help=f"MDegrain2 thsad/thsadc strength (default: {DEFAULT_THSAD}).")
+                        help=f"MDegrain2 luma thsad strength; thsadc is half (default: {DEFAULT_THSAD}).")
     parser.add_argument("--low", action="store_true",
                         help=f"Light denoise. Same as --thsad {THSAD_LOW}.")
     parser.add_argument("--high", action="store_true",
@@ -1735,6 +1868,8 @@ thsad guide: 150 = light, 350 = default, 500+ = strong""",
     elif args.high:
         thsad = THSAD_HIGH
     elif args.thsad is not None:
+        if args.thsad < 0:
+            parser.error("--thsad must be >= 0")
         thsad = args.thsad
     else:
         thsad = DEFAULT_THSAD

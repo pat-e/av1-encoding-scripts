@@ -11,25 +11,24 @@ Both start with `#!/usr/bin/env python3`. Copy them (or a symlink) onto your `PA
 
 ## `mdegrain.py`
 
-Denoise every MKV in the current folder with MDegrain2 (mvtools). The finished file is CFR `yuv420p` or `yuv420p10le`, which is what `xav_automation.py` accepts. Put `completed/` on the xav queue afterwards.
+Denoise every MKV in the current folder with 16-bit MDegrain2 (mvtools) and error-diffusion dither to CFR `yuv420p10le`, which is what `xav_automation.py` and `xav` encode. Put `completed/` on the xav queue afterwards.
 
 For each `*.mkv`:
 
-1. If packets are not CFR, or MediaInfo says VFR, convert to CFR first. HandBrake `--cfr --rate` uses the same FPS choice as `xav_automation.py`. ffmpeg `-fps_mode cfr` is the fallback. The GOP stays a normal GOP. xav re-encodes this file later, so all-intra is skipped.
-2. MDegrain2, two frames each way. Strength is both luma and chroma: default thsad 350, `--low` is 150, `--high` is 500, or `--thsad N`. Block size stays 16.
-3. Encode to the pixel format xav accepts. See the table below.
+1. If packets are not CFR, or MediaInfo says VFR, convert to CFR in-memory via `ffms2` (`fpsnum`/`fpsden`, avoiding an extra temp file and generation loss). HandBrake `--cfr --rate` and ffmpeg `-fps_mode cfr` are fallbacks when timestamps are negative or FPS cannot be parsed.
+2. Promote to 16-bit 4:2:0 (`Spline36` for RGB/GRAY/4:2:2/4:4:4; lossless bit-shift for 8/10/12-bit 4:2:0), run resolution-adaptive MDegrain2 (`pel=2, blksize=8/4` for SD ≤576p; `pel=2, blksize=16/8` for 720p/1080p; `pel=1, blksize=32/16` for >1080p; `rfilter=4`, `truemotion=0`, plus a 2-pass `RemoveGrain(mode=12)` search prefilter for `thsad >= 350` or >1080p), then error-diffusion dither to `yuv420p10le`. Output is always 10-bit `yuv420p10le` (never 12-bit/16-bit/4:2:2/4:4:4/RGB). Default luma strength is `thsad` 250 (`--low` is 150, `--high` is 350, or `--thsad N`); chroma strength `thsadc` is half of `thsad`.
+3. Encode to visually transparent `yuv420p10le` (normal GOP, no `-tune fastdecode` bloat). See the table below.
 4. mkvmerge: the new video first, then audio, subtitles, chapters, and attachments from the source.
 5. Check frame count, duration, pixel format, CFR, tracks, and chapters.
 
 | Source | Encode |
 | :--- | :--- |
-| 1080p SDR, already 8-bit 4:2:0 | libx264 CRF 0 `yuv420p` |
-| Other 1080p SDR (Hi10p, 4:2:2, 4:4:4, RGB, 12-bit and up) | libx264 10-bit CRF 0 `yuv420p10le` |
-| Above 1080p, or HDR (PQ, HLG, Dolby Vision) | libx265 10-bit CRF 0 `yuv420p10le` |
+| ≤1080p SDR (any input depth / chroma / RGB) | libx264 10-bit CRF 0 `veryfast` `yuv420p10le` |
+| Above 1080p, or HDR (PQ, HLG, Dolby Vision) | libx265 10-bit CRF 0 `superfast` `yuv420p10le` |
 
-libx265 CRF 0 is the intermediate xav accepts. It is not a bit-exact copy. A 10-bit BT.709 source at 1080p stays on the x264 10-bit path. If this ffmpeg's libx264 has no `yuv420p10le`, that 1080p 10-bit path uses libx265 CRF 0 instead. `--check` says which one you have.
+Both 10-bit libx264 CRF 0 (QP 12) and libx265 CRF 0 are visually transparent near-lossless (~57–61 dB PSNR) rather than bit-exact, avoiding 2.5–3.5× lossless filesize bloat while staying clean for `xav`. A 10-bit BT.709 source at 1080p stays on the fast x264 10-bit path. If this ffmpeg's libx264 has no `yuv420p10le`, ≤1080p SDR falls back to libx265 CRF 0. `--check` says which one you have.
 
-HDR10 static metadata (primaries, PQ/HLG transfer, mastering display, MaxCLL, MaxFALL) is copied onto the new video, including into the encoder VUI, so a later xav video-only remux still carries it. Dolby Vision RPU and HDR10+ dynamic metadata are not kept. The log says so when the source has them.
+HDR10 static metadata (primaries, PQ/HLG transfer, chroma siting, mastering display, MaxCLL, MaxFALL) is copied onto the new video, including into the encoder VUI, so a later xav video-only remux still carries it. Dolby Vision RPU and HDR10+ dynamic metadata are not kept. The log says so when the source has them.
 
 ### CPU
 
@@ -64,11 +63,11 @@ mdegrain.py --check
 mdegrain.py
 mdegrain.py --low
 mdegrain.py --high
-mdegrain.py --thsad 250
+mdegrain.py --thsad 200
 mdegrain.py --reserve-threads 4
 ```
 
-`--reserve-threads` defaults to 2. `--thsad` guide: 150 is light (`--low`, keeps more grain and detail), 350 is the default, 500 is strong (`--high`), and higher still is `--thsad`. Use only one of `--low`, `--high`, and `--thsad`. Combining them prints a warning and exits. No file is encoded or moved.
+`--reserve-threads` defaults to 2. `--thsad` guide: 150 is light (`--low`, keeps more grain and detail), 250 is the default, 350 is strong (`--high`), and custom values use `--thsad`. Chroma strength (`thsadc`) is automatically half of `thsad`. Use only one of `--low`, `--high`, and `--thsad`. Combining them prints a warning and exits. No file is encoded or moved.
 
 ## `av1grain.py`
 
@@ -137,3 +136,5 @@ noisy source  →  mdegrain.py  →  completed/  →  xav_automation.py  →  co
 ```
 
 Skip `mdegrain.py` when the source is already clean. Skip `av1grain.py` when you want the encode left grain-free. Do not point `av1grain.py` at an `mdegrain.py` result: that file is still H.264 or H.265.
+
+[`mdegrain_old.py`](mdegrain_old.py) is a legacy version kept in this folder only as a reference.
