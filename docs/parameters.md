@@ -16,7 +16,7 @@ loudnorm true-peak analysis uses 4× oversampling (48 kHz → 192 kHz). After th
 
 ## Audio Demuxing & Downmixing
 
-The audio processing extracts streams using `ffmpeg` (`-drc_scale 0` so decoder DRC is off) and automatically downmixes surround layouts to stereo unless `--no-downmix` is passed (or, in `xav_automation.py`, the filename ends with a case-insensitive `nodownmix` tag right before `.mkv`, such as `Movie.2016-GROUP.nodownmix.mkv`; the tag is preserved on the output file and the per-file decision is logged in `conv_logs/`). Existing `aac` and `opus` tracks are remuxed without re-encoding.
+The audio processing extracts streams using `ffmpeg` (`-drc_scale 0` so decoder DRC is off) and automatically downmixes surround layouts to stereo unless `--no-downmix` is passed or the filename ends with a case-insensitive `nodownmix` tag right before `.mkv` (e.g. `Movie.2016-GROUP.nodownmix.mkv`; the tag is preserved on the output file and the per-file decision is logged in `conv_logs/`). Existing `aac` and `opus` tracks are remuxed without re-encoding.
 
 ### Downmixing Parameters (Nightmode Dialogue)
 

@@ -37,7 +37,7 @@ The scripts require several external tools to be installed and available in your
     *   Extracts audio tracks to FLAC with DRC disabled (`-drc_scale 0`).
     *   Applies a two-pass linear constant-gain loudness normalization (Target: -18.0 LUFS, True Peak: -1.5 dBTP, LRA: 20 LU). Configurable via `--norm-i` and `--norm-tp`.
     *   After loudnorm, the FLAC is pinned back to the source sample rate so `opusenc` tags Input Sample Rate correctly (Opus still encodes at 48 kHz).
-    *   Downmixes 5.1/7.1 surround sound to stereo (unless `--no-downmix` is specified, or in `xav_automation.py` the filename ends with `nodownmix` before `.mkv`, case-insensitive). All scripts use a robust multi-pass downmix filter fallback system to prevent clipping.
+    *   Downmixes 5.1/7.1 surround sound to stereo unless `--no-downmix` is specified, or the filename ends with `nodownmix` right before `.mkv` (e.g. `Movie.2016-GROUP.nodownmix.mkv`, case-insensitive; tag is kept on the output and the decision is logged in `conv_logs/`). All scripts use a robust multi-pass downmix filter fallback system to prevent clipping.
     *   Encodes to Opus with bitrates automatically chosen based on the channel count (e.g., 128k for Stereo, 256k for 5.1).
     *   Directly remuxes existing `aac` or `opus` tracks without re-encoding.
     *   Preserves track languages (including IETF tags), titles, Matroska flags, and delays.
@@ -74,7 +74,7 @@ aom_opus_encoder.py [options]
 ```
 
 **Options:**
-*   `--no-downmix`: Preserve original audio channel layout (do not downmix 5.1/7.1 to stereo). AAC/Opus tracks are always remuxed.
+*   `--no-downmix`: Preserve original audio channel layout (do not downmix 5.1/7.1 to stereo) for the whole batch. Can also be triggered per file without the flag by ending its filename with `nodownmix` right before `.mkv` (case-insensitive; tag is kept in `completed/` and the decision is logged in `conv_logs/`). AAC/Opus tracks are always remuxed.
 *   `--autocrop`: Automatically detect and crop black bars from the video.
 *   `--grain <int>`: Set the `photon-noise` value for grain synthesis. Disabled by default.
 *   `--crf <int>`: Override aom `cq-level`. Default: 25 for all resolutions (SDR and HDR).
@@ -95,7 +95,7 @@ svt_opus_encoder.py [options]
 ```
 
 **Options:**
-*   `--no-downmix`: Preserve original audio channel layout (do not downmix 5.1/7.1 to stereo). AAC/Opus tracks are always remuxed.
+*   `--no-downmix`: Preserve original audio channel layout (do not downmix 5.1/7.1 to stereo) for the whole batch. Can also be triggered per file without the flag by ending its filename with `nodownmix` right before `.mkv` (case-insensitive; tag is kept in `completed/` and the decision is logged in `conv_logs/`). AAC/Opus tracks are always remuxed.
 *   `--autocrop`: Automatically detect and crop black bars from the video.
 *   `--preset <int>`: Override SVT-AV1 preset. Default: 1 if height ≤1080 and SDR, else 2.
 *   `--crf <int>`: Override SVT-AV1 CRF. Default: 30 for all resolutions (SDR and HDR).
