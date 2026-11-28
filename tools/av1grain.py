@@ -18,6 +18,8 @@
 
 import argparse
 import json
+import math
+import os
 import shutil
 import signal
 import subprocess
@@ -106,6 +108,103 @@ def mkv_option_value(value):
     return text
 
 
+def stop_proc(proc):
+    if proc.poll() is not None:
+        return
+    if sys.platform != "win32":
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+    else:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        proc.wait()
+
+
+def run_capture(args):
+    """Run a subprocess in its own session (POSIX) and guarantee termination on interrupt."""
+    kwargs = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "text": True,
+    }
+    if sys.platform != "win32":
+        kwargs["start_new_session"] = True
+    proc = subprocess.Popen(args, **kwargs)
+    try:
+        stdout, _ = proc.communicate()
+    except BaseException:
+        stop_proc(proc)
+        raise
+    return subprocess.CompletedProcess(args, proc.returncode, stdout=stdout, stderr=None)
+
+
+def safe_move(src, dest):
+    """Move src to dest without overwriting an existing file (like mv -n)."""
+    src = Path(src)
+    dest = Path(dest)
+    if dest.exists() or dest.is_symlink():
+        raise FileExistsError(f"destination already exists: {dest}")
+    try:
+        os.link(src, dest)
+    except FileExistsError:
+        raise FileExistsError(f"destination already exists: {dest}") from None
+    except OSError:
+        # Cross-device move or filesystem without hardlinks; check again and fall back.
+        if dest.exists() or dest.is_symlink():
+            raise FileExistsError(f"destination already exists: {dest}") from None
+        shutil.move(str(src), str(dest))
+        return
+    try:
+        src.unlink()
+    except OSError:
+        # Both links exist; remove the new destination link to leave src intact.
+        dest.unlink(missing_ok=True)
+        raise
+
+
+def format_mkv_decimal(value):
+    """Format a float as plain decimal for mkvmerge (which rejects scientific notation)."""
+    if not math.isfinite(value):
+        return None
+    return format(value, ".10f").rstrip("0").rstrip(".") or "0"
+
+
+def format_mkv_color_value(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float):
+        return format_mkv_decimal(value)
+    if isinstance(value, str) and ("e" in value or "E" in value):
+        parts = []
+        for token in value.split(","):
+            s = token.strip()
+            try:
+                num = float(s)
+            except ValueError:
+                parts.append(s)
+                continue
+            formatted = format_mkv_decimal(num)
+            if formatted is None:
+                return None
+            parts.append(formatted)
+        return ",".join(parts)
+    return str(value)
+
+
 def run_json(cmd):
     return json.loads(subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                      check=True, text=True).stdout)
@@ -113,8 +212,7 @@ def run_json(cmd):
 
 def run_mkvmerge(args, label):
     print(f"    - {label}: {' '.join(args)}")
-    res = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                         start_new_session=True)
+    res = run_capture(args)
     for line in res.stdout.splitlines():
         if not line.startswith("Progress:"):
             print(f"      {line}")
@@ -206,8 +304,7 @@ def run_grav1synth(vid_tmp, grained_tmp, grain_args):
         safe_path_arg(vid_tmp),
     ]
     print(f"    - grav1synth: {' '.join(args)}")
-    res = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                         start_new_session=True)
+    res = run_capture(args)
     for line in res.stdout.splitlines():
         print(f"      {line}")
     return res
@@ -242,7 +339,9 @@ def video_restore_args(src_vtrack):
     for json_key, opt_name in VIDEO_COLOR_OPTIONS:
         value = props.get(json_key)
         if value is not None:
-            args += [opt_name, f"0:{value}"]
+            formatted = format_mkv_color_value(value)
+            if formatted is not None:
+                args += [opt_name, f"0:{formatted}"]
 
     return args
 
@@ -312,8 +411,13 @@ def process_file(file_path, grain_args, src_id=None):
     grained_tmp = file_path.with_name(f".{file_path.stem}.grain-tmp.mkv")
     mux_tmp = file_path.with_name(f".{file_path.stem}.grain-mux.mkv")
     temps = (vid_tmp, grained_tmp, mux_tmp)
+    completed_dest = DIR_COMPLETED / file_path.name
+    original_dest = DIR_ORIGINAL / file_path.name
     try:
         print(f"Analyzing file: {file_path.resolve()}")
+        for dest in (completed_dest, original_dest):
+            if dest.exists() or dest.is_symlink():
+                raise FileExistsError(f"destination already exists: {dest}")
         if src_id is None:
             src_id = run_json(["mkvmerge", "-J", safe_path_arg(file_path)])
         videos, skip_reason = check_av1_source(src_id)
@@ -380,8 +484,11 @@ def process_file(file_path, grain_args, src_id=None):
         print(f"    - OK: frames, tracks, chapters{att_note} match the input.")
 
         print("Moving files to final destinations...")
-        shutil.move(str(file_path), DIR_ORIGINAL / file_path.name)
-        shutil.move(str(mux_tmp), DIR_COMPLETED / file_path.name)
+        for dest in (completed_dest, original_dest):
+            if dest.exists() or dest.is_symlink():
+                raise FileExistsError(f"destination already exists: {dest}")
+        safe_move(mux_tmp, completed_dest)
+        safe_move(file_path, original_dest)
     finally:
         for tmp in temps:
             if tmp.exists():
@@ -439,8 +546,11 @@ def main(grain_args):
         d.mkdir(exist_ok=True, parents=True)
     print(f"av1grain: {' '.join(grain_args)}")
 
+    any_failed = False
+    unmoved = set()
+
     while True:
-        files = list_source_mkvs(current_dir)
+        files = [f for f in list_source_mkvs(current_dir) if f.resolve() not in unmoved]
         if not files:
             print("No more .mkv files found to process in the current directory. The script will now exit.")
             break
@@ -468,7 +578,21 @@ def main(grain_args):
         if skip_reason is not None:
             DIR_SKIPPED.mkdir(exist_ok=True, parents=True)
             dest = DIR_SKIPPED / file_path.name
-            shutil.move(str(file_path), dest)
+            try:
+                safe_move(file_path, dest)
+            except FileExistsError as e:
+                any_failed = True
+                unmoved.add(file_path.resolve())
+                log_file_path.write_text(
+                    f"SKIPPED (LEFT IN PLACE): {file_path.name}\n"
+                    f"Reason: {skip_reason}\n"
+                    f"Error: {e}\n"
+                    f"Time: {started.strftime('%Y-%m-%d %H:%M:%S')}\n",
+                    encoding="utf-8",
+                )
+                print(f"Skipping: {file_path.name} ({skip_reason})")
+                print(f"ERROR: Could not move '{file_path.name}': {e}. Left in place.", file=sys.stderr)
+                continue
             log_file_path.write_text(
                 f"SKIPPED: {file_path.name}\n"
                 f"Reason: {skip_reason}\n"
@@ -504,9 +628,19 @@ def main(grain_args):
                 runtime = str(datetime.now() - started).split(".")[0]
                 print(f"FINISHED LOG FOR: {file_path.name} (runtime {runtime})")
                 sys.stdout, sys.stderr = console_out, console_err
-        if failed and file_path.exists():
-            shutil.move(str(file_path), DIR_FAILED / file_path.name)
-            console_err.write(f"Moved to {DIR_FAILED / file_path.name}\n")
+        if failed:
+            any_failed = True
+            if file_path.exists():
+                failed_dest = DIR_FAILED / file_path.name
+                try:
+                    safe_move(file_path, failed_dest)
+                    console_err.write(f"Moved to {failed_dest}\n")
+                except FileExistsError as e:
+                    unmoved.add(file_path.resolve())
+                    console_err.write(f"ERROR: Could not move '{file_path.name}': {e}. Left in place.\n")
+
+    if any_failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
