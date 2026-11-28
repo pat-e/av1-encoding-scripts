@@ -1,13 +1,14 @@
 # Tools
 
-Two standalone helpers. They use the same folder workflow as the encoders: `cd` into a directory of `.mkv` files and run the script. One file at a time. Results land in `completed/`, untouched inputs in `original/`, failures in `failed/`, and one log per file in `conv_logs/`.
+Three standalone helpers. `mdegrain.py` and `av1grain.py` use the same folder workflow as the encoders: `cd` into a directory of `.mkv` files and run the script (one file at a time; results land in `completed/`, untouched inputs in `original/`, failures in `failed/`, and one log per file in `conv_logs/`). `nodownmix-apply.py` renames `.mkv` files in place with no external dependencies.
 
 | Script | When to run it |
 | :--- | :--- |
+| [`nodownmix-apply.py`](nodownmix-apply.py) | **Before** encoding to tag files with `.nodownmix.mkv` (per-file `--no-downmix`), or **after** with `--remove` to strip the tag. |
 | [`mdegrain.py`](mdegrain.py) | **Before** [`xav_automation.py`](../xav_automation.py). Denoise, and make the file something xav can take. |
 | [`av1grain.py`](av1grain.py) | **After** an AV1 encode. Add film grain to finished AV1 MKVs. The video frames are not re-encoded. |
 
-Both start with `#!/usr/bin/env python3`. Copy them (or a symlink) onto your `PATH`, the same way as [`cropdetect.py`](../cropdetect/cropdetect.py). `--help` prints the full text and exits. `--check` reports what is missing and does not touch any MKV.
+All three start with `#!/usr/bin/env python3`. Copy them (or a symlink) onto your `PATH`, the same way as [`cropdetect.py`](../cropdetect/cropdetect.py). `--help` prints the full text and exits. `mdegrain.py` and `av1grain.py` also support `--check` to report missing tools without touching any MKV.
 
 ## `mdegrain.py`
 
@@ -129,12 +130,40 @@ av1grain.py --preset 16mm
 av1grain.py --iso 400 --replace
 ```
 
+## `nodownmix-apply.py`
+
+Batch-add or remove the `.nodownmix` filename tag on `.mkv` files right before the `.mkv` extension (`Movie.2016.mkv` → `Movie.2016.nodownmix.mkv`). Leading queue prefixes such as `01 ` stay untouched so queue sorting is preserved. All three encoder scripts (`xav_automation.py`, `svt_opus_encoder.py`, `aom_opus_encoder.py`) recognize the tag case-insensitively and skip surround-to-stereo downmixing for that file while keeping the tag on the output in `completed/`.
+
+### Prerequisites
+
+Python 3 standard library only (no external tools).
+
+### Behavior
+
+- Renames files **in place** (does not create `completed/`, `original/`, `failed/`, or `conv_logs/`).
+- Defaults to the current directory (non-recursive) when no paths are passed; accepts any mix of `.mkv` files and folders.
+- Skips encoder work files (`*.prep.mkv`, `*.cfr.mkv`, `*.cfr_full.mkv`, `*.x264.mkv`, `*.hevc.mkv`, `*.ut.mkv`, `*.cfr_temp.mkv`, `*_xav.mkv`, `temp-*.mkv`, `output-*.mkv`).
+- Skips files that are already tagged (or untagged when using `--remove`) and refuses to overwrite an existing target file.
+- `--remove` strips a trailing `nodownmix` tag preceded by `.`, `-`, `_`, or whitespace (case-insensitive).
+
+### Usage
+
+```bash
+nodownmix-apply.py                       # Tag all .mkv files in the current folder
+nodownmix-apply.py file1.mkv file2.mkv   # Tag only specific files
+nodownmix-apply.py -n /path/to/folder    # Dry-run: preview renames without changing files
+nodownmix-apply.py --remove .            # Strip the nodownmix tag in the current folder
+nodownmix-apply.py -r /path/to/folder    # Scan subfolders recursively
+nodownmix-apply.py -q ...                # Quiet: only print warnings and errors
+nodownmix-apply.py --tag custom ...      # Use a custom tag instead of "nodownmix"
+```
+
 ## Suggested order
 
 ```text
-noisy source  →  mdegrain.py  →  completed/  →  xav_automation.py  →  completed/  →  av1grain.py
+noisy source  →  mdegrain.py  →  completed/  →  [nodownmix-apply.py]  →  xav_automation.py  →  completed/  →  av1grain.py
 ```
 
-Skip `mdegrain.py` when the source is already clean. Skip `av1grain.py` when you want the encode left grain-free. Do not point `av1grain.py` at an `mdegrain.py` result: that file is still H.264 or H.265.
+Run `nodownmix-apply.py` on any surround files you want kept surround before starting an encoder queue (and optionally `nodownmix-apply.py --remove` afterwards once you no longer need the visual marker in `completed/`). Skip `mdegrain.py` when the source is already clean. Skip `av1grain.py` when you want the encode left grain-free. Do not point `av1grain.py` at an `mdegrain.py` result: that file is still H.264 or H.265.
 
 [`mdegrain_old.py`](mdegrain_old.py) is a legacy version kept in this folder only as a reference.

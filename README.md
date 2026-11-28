@@ -10,6 +10,7 @@ Batch-encode `.mkv` files to **AV1** video and **Opus** audio. Drop the MKVs in 
 | [`cropdetect/cropdetect.py`](cropdetect/cropdetect.py) | ffmpeg cropdetect | Safe crop for mixed AR (flashbacks, IMAX). Own [readme](cropdetect/). |
 | [`tools/mdegrain.py`](tools/mdegrain.py) | MDegrain2 (mvtools) | Denoise before the xav queue. Default thsad 250, `--low` 150, `--high` 350. VFR and 4K/HDR. Own [readme](tools/). |
 | [`tools/av1grain.py`](tools/av1grain.py) | [grav1synth](https://github.com/rust-av/grav1synth) | Film grain on finished AV1 MKVs, no re-encode. Own [readme](tools/). |
+| [`tools/nodownmix-apply.py`](tools/nodownmix-apply.py) | Python stdlib | Batch-add or `--remove` `.nodownmix` tags before `.mkv` for per-file `--no-downmix` (supports `-n` dry-run, `-r` recursive). Own [readme](tools/). |
 
 Put the scripts (or symlinks) on your `PATH`, `cd` to a directory of `.mkv` files, and run the script you want:
 
@@ -21,7 +22,7 @@ svt_opus_encoder.py
 
 **Requires in `PATH`:** ffmpeg, ffprobe, mkvmerge, mkvextract, mkvpropedit, opusenc, mediainfo, HandBrakeCLI. Av1an scripts also need av1an, ffmsindex, and VapourSynth. xav needs `xav` built with SVT-AV1-Essential. Linux also needs `taskset` (util-linux) to pin the encode off the last two logical CPUs. On Windows 11 and Windows Server 2022 the same pin is a process affinity mask, with no extra tool. That mask names at most 64 logical CPUs; any beyond that stay free. Python [fonttools](https://github.com/fonttools/fonttools) is optional (Arch: `python-fonttools`, otherwise `pip install fonttools`). Without it, unused-font cleanup is skipped and every font stays attached.
 
-[`tools/`](tools/) has its own programs. `mdegrain.py` needs VapourSynth with ffms2, mvtools, and zsmooth. No flag uses thsad 250. `--low` is 150, `--high` is 350, and `--thsad N` sets the strength. Combining those flags prints a warning and exits without encoding. `av1grain.py` needs [grav1synth](https://github.com/rust-av/grav1synth). The list and the `--check` command are in that readme.
+[`tools/`](tools/) has its own programs. `mdegrain.py` needs VapourSynth with ffms2, mvtools, and zsmooth. No flag uses thsad 250. `--low` is 150, `--high` is 350, and `--thsad N` sets the strength. Combining those flags prints a warning and exits without encoding. `av1grain.py` needs [grav1synth](https://github.com/rust-av/grav1synth). `nodownmix-apply.py` uses only Python's standard library to batch-tag or untag `.mkv` files with `.nodownmix` before encoding (or `--remove` afterwards). The full list and `--check` commands are in that readme.
 
 Common flags: `--no-downmix` (or per file by ending a filename with `nodownmix` before `.mkv`, e.g. `Movie.2016-GROUP.nodownmix.mkv`, case-insensitive; the tag stays on the output file and the decision is logged in `conv_logs/`), `--autocrop` (av1an scripts), `--crf` / `--preset` / `--tune` / `--grain` where the encoder supports them, `--norm-i` / `--norm-tp` (defaults −18 LUFS / −1.5 dBTP), `--nofontsclean` / `-nfc` (keep every attached font). `xav_automation.py` also has `--workers`, `--lp`, `--reserve-threads`, and `--no-taskset`.
 
