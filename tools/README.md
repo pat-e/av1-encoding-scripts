@@ -72,9 +72,9 @@ mdegrain.py --reserve-threads 4
 
 ## `av1grain.py`
 
-Add AV1 film grain synthesis to every MKV in the current folder with [grav1synth](https://github.com/rust-av/grav1synth). Grain is only signalled in the AV1 headers. The decoder or player draws it. Video frames, audio, subtitles, chapters, and names stay as they were. The input must already be AV1 (a file from `completed/` after xav, SVT, or aom). A non-AV1 file goes to `failed/`.
+Add AV1 film grain synthesis to every MKV in the current folder with [grav1synth](https://github.com/rust-av/grav1synth). Grain is only signalled in the AV1 headers. The decoder or player draws it. Video frames, audio, subtitles, attachments (fonts, cover art), chapters, and names stay as they were. Only AV1 MKVs are processed: non-AV1 files are moved to `skipped/` (which is only created when a file is actually skipped) with a short log entry in `conv_logs/` explaining why.
 
-grav1synth writes old 3-letter language tags. The script puts the source IETF tags (`en`, `de`, …) back with `mkvpropedit`. It then checks that the frame count, the track list, and the chapter count match the input.
+To avoid libavformat/grav1synth dropping attachments, turning cover art into a second video track, or stripping IETF language tags, the script extracts the AV1 video track into a video-only intermediate with `mkvmerge`, runs `grav1synth apply` on that intermediate, and remuxes the grained video back with all original audio, subtitles, attachments, chapters, tags, and video metadata via `mkvmerge`. It then verifies that the frame count, duration, track list (including IETF tags and flags), attachments, and chapters match the input.
 
 A file that already has grain goes to `failed/` unless you pass `--replace`.
 
@@ -111,7 +111,7 @@ For `16mm`, `Classic35`, and `Modern35` the suffix picks the stock:
 
 ### Prerequisites
 
-Required on `PATH`: `grav1synth`, `mkvmerge`, `mkvpropedit`, `ffprobe`.
+Required on `PATH`: `grav1synth`, `mkvmerge`, `ffprobe`.
 
 ```bash
 cargo install grav1synth
