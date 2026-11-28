@@ -21,7 +21,8 @@
 # names at most one processor group (64 logical CPUs); any CPU past that stays
 # free. Workers are allowed_cpus with --lp 1 (30 workers on a 7950X3D) and
 # allowed_cpus // 2 for other --lp values (15 workers on a 7950X3D).
-# Audio: AAC/Opus remuxed. Else: Nightmode Dialogue pan (`<` so the mix cannot clip)
+# Audio: AAC/Opus remuxed. Else: Nightmode Dialogue pan (`<` so the mix cannot clip;
+# skip globally with --no-downmix or per file with a *nodownmix.mkv tag, kept on output)
 # → ffmpeg loudnorm 2-pass linear (I=-18, TP=-1.5, LRA=20) → opusenc.
 # Final mkvmerge: xav video + processed/remuxed audio + source subs/chapters.
 # Font attachments: only those referenced by remaining ASS/SSA (skip with --nofontsclean / -nfc).
@@ -87,6 +88,7 @@ LOUDNESS_LRA = 20.0
 CFR_SUFFIX = ".cfr.mkv"
 CFR_FULL_SUFFIX = ".cfr_full.mkv"
 PREP_SUFFIX = ".prep.mkv"
+NODOWNMIX_TAG_RE = re.compile(r"(?:^|[._\-\s])nodownmix$", re.IGNORECASE)
 
 # Fail-closed packet-PTS CFR probe. MediaInfo FrameRate_Mode is not proof.
 # Relative 1.2% is too tight for MKV 1ms ticks (24 fps = 41ms vs 42ms → fake 33% outliers).
@@ -1229,6 +1231,23 @@ def apply_constant_gain_loudness(input_path, output_path, track_index, sample_ra
     ])
 
 
+def has_nodownmix_tag(file_path):
+    """True when the filename ends with a case-insensitive 'nodownmix' tag before the extension."""
+    return bool(NODOWNMIX_TAG_RE.search(Path(file_path).stem))
+
+
+def resolve_file_no_downmix(file_path, global_no_downmix):
+    """Return (no_downmix_bool, log_reason) for one file."""
+    tagged = has_nodownmix_tag(file_path)
+    if global_no_downmix and tagged:
+        return True, "yes (--no-downmix flag + filename tag)"
+    if global_no_downmix:
+        return True, "yes (--no-downmix flag)"
+    if tagged:
+        return True, "yes (filename tag)"
+    return False, "no (default)"
+
+
 def downmix_filters(ch):
     """Nightmode Dialogue (Collier / Harrelson). pan '<' renormalizes so the mix cannot clip."""
     if ch == 6:
@@ -1330,6 +1349,7 @@ def process_audio_tracks(source_file, audio_temp_dir, no_downmix):
     plan = []
     audio_i = 0
     print("--- Starting Audio Processing ---")
+    print(f"    - Audio downmix: {'disabled (no-downmix)' if no_downmix else 'enabled (5.1/7.1 → stereo)'}")
     for stream in probe.get("streams", []):
         if stream.get("codec_type") != "audio":
             continue
@@ -2355,9 +2375,11 @@ def main(
             log_file_handle = open(log_file_path, "w", encoding="utf-8", buffering=1)
             sys.stdout = Tee(log_file_handle, original_stdout_console)
             sys.stderr = Tee(log_file_handle, original_stderr_console)
+            file_no_downmix, no_downmix_reason = resolve_file_no_downmix(file_path, no_downmix)
             print(f"STARTING LOG FOR: {file_path.name}")
             print(f"Processing started at: {date_for_runtime_calc}")
             print(f"Full input file path: {file_path.resolve()}")
+            print(f"No-downmix: {no_downmix_reason}")
             print("-" * shutil.get_terminal_size(fallback=(80, 24)).columns)
 
             print(f"Analyzing file: {file_path.resolve()}")
@@ -2389,7 +2411,7 @@ def main(
             else:
                 audio_temp_dir = tempfile.mkdtemp(prefix="audio_tmp_")
                 print(f"Audio temporary directory created at: {audio_temp_dir}")
-                audio_plan = process_audio_tracks(file_path, audio_temp_dir, no_downmix)
+                audio_plan = process_audio_tracks(file_path, audio_temp_dir, file_no_downmix)
                 mux_final(
                     muxed, xav_output, file_path, audio_plan,
                     clean_fonts=not no_font_clean,
@@ -2458,7 +2480,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--no-downmix",
         action="store_true",
-        help="Keep surround on re-encoded tracks (no Nightmode Dialogue pan). AAC/Opus are always remuxed.",
+        help=(
+            "Keep surround on re-encoded tracks (no Nightmode Dialogue pan) for all files. "
+            "Can also be enabled per file by ending the filename with 'nodownmix' before '.mkv' "
+            "(e.g. Movie.2016.GROUP.nodownmix.mkv, case-insensitive; tag is kept on the output). "
+            "AAC/Opus are always remuxed."
+        ),
     )
     parser.add_argument(
         "--preset",

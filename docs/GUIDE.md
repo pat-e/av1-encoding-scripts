@@ -37,7 +37,7 @@ The scripts require several external tools to be installed and available in your
     *   Extracts audio tracks to FLAC with DRC disabled (`-drc_scale 0`).
     *   Applies a two-pass linear constant-gain loudness normalization (Target: -18.0 LUFS, True Peak: -1.5 dBTP, LRA: 20 LU). Configurable via `--norm-i` and `--norm-tp`.
     *   After loudnorm, the FLAC is pinned back to the source sample rate so `opusenc` tags Input Sample Rate correctly (Opus still encodes at 48 kHz).
-    *   Downmixes 5.1/7.1 surround sound to stereo (unless `--no-downmix` is specified). All scripts use a robust multi-pass downmix filter fallback system to prevent clipping.
+    *   Downmixes 5.1/7.1 surround sound to stereo (unless `--no-downmix` is specified, or in `xav_automation.py` the filename ends with `nodownmix` before `.mkv`, case-insensitive). All scripts use a robust multi-pass downmix filter fallback system to prevent clipping.
     *   Encodes to Opus with bitrates automatically chosen based on the channel count (e.g., 128k for Stereo, 256k for 5.1).
     *   Directly remuxes existing `aac` or `opus` tracks without re-encoding.
     *   Preserves track languages (including IETF tags), titles, Matroska flags, and delays.
@@ -118,7 +118,7 @@ xav_automation.py [options]
 ```
 
 **Options:**
-*   `--no-downmix`: Keep surround on re-encoded tracks (no Nightmode Dialogue pan). AAC/Opus are always remuxed.
+*   `--no-downmix`: Keep surround on re-encoded tracks (no Nightmode Dialogue pan) for the whole batch. You can also trigger no-downmix for a single file without the flag by ending its filename with `nodownmix` right before `.mkv` (e.g. `Movie.2016-GROUP.nodownmix.mkv`, case-insensitive, preceded by `.`, `-`, `_`, or space). The tag is kept on the output filename in `completed/`, and each file’s decision is logged in `conv_logs/` (e.g. `No-downmix: yes (filename tag)`). AAC/Opus are always remuxed.
 *   `--preset <int>`: Override SVT-AV1 preset. Default: 1 if height ≤1080, else 2 (height only; HDR 1080p still uses preset 1 unless overridden).
 *   `--tune <int>`: SVT-AV1-Essential `--tune` mode: 0=VQ, 1=PSNR, 2=SSIM, 3=IQ, 4=MS_SSIM (default: 2 = SSIM).
 *   `--crf <int>`: Override SVT-AV1 CRF. Default: 30 for all resolutions (SDR and HDR). Always passed so Essential does not use CRF 35 above 1080p.
@@ -134,7 +134,7 @@ xav_automation.py [options]
 1. **CFR / pixel-format gate**: ffprobe packet PTS must prove CFR (fail-closed). MediaInfo `FrameRate_Mode` is not treated as proof of CFR. If MediaInfo reports VFR, HandBrake always runs. A few GOP-start or probe-window duration outliers are allowed so real CFR MKVs are not sent to HandBrake. xav accepts only `yuv420p` or `yuv420p10le`; anything else (4:2:2, 4:4:4, RGB, 12-bit+) is converted.
 2. **Video Preparation**: Skip HandBrake only when packets prove CFR, MediaInfo is not VFR, and the pixel format is already xav-compatible. Then mkvmerge video-only remuxes (1080p or 4K/HDR; no re-encode; keeps HDR10/DoVi track properties). Otherwise HandBrake: x264 all-intra for ≤1080p SDR 8-bit 4:2:0, `x264_10bit` all-intra for 1080p SDR that needs 10-bit, `x265_10bit` normal GOP for >1080p or HDR. ffmpeg is a fallback if HandBrake produces an empty file.
 3. **Video Encode**: `xav` handles autocrop, scene-detect, and chunking natively. Linux starts it as `taskset -c 0-(N-3) xav -e svt-av1 -p "--preset <p> --tune <t> --crf <c> --lp 2" -w <allowed/2> -b 1`. Windows starts the same `xav` command and sets that CPU list as the process affinity mask before `xav` runs, so the SVT workers inherit it. The last two logical CPUs stay free (on a 32-thread CPU: cores 0–29 and 15 workers, the same density as av1an `--set-thread-affinity 2` / `-w 15`). A Windows mask cannot name CPU 64 or higher, so those stay free as well and the worker count follows the masked CPUs. `--lp 2` keeps each SVT worker from auto-sizing to the whole CPU. No `av1an` or `.vpy` required. CRF is always 30 unless `--crf` is set (same as `svt_opus_encoder.py`), so Essential does not apply `--quality medium` / CRF 35 above 1080p.
-4. **Audio Processing**: Audio is extracted, optionally downmixed (with multiple filter fallbacks), normalized with a two-pass linear constant-gain loudnorm (sample rate restored after loudnorm), and encoded to Opus. AAC/Opus tracks are remuxed directly.
+4. **Audio Processing**: Audio is extracted, optionally downmixed (with multiple filter fallbacks; skipped globally via `--no-downmix` or per file via a `*nodownmix.mkv` filename tag, with the decision logged in `conv_logs/`), normalized with a two-pass linear constant-gain loudnorm (sample rate restored after loudnorm), and encoded to Opus. AAC/Opus tracks are remuxed directly.
 5. **Remuxing**: Combines using `mkvmerge` (xav video + processed/remuxed audio + source subs/chapters). Font attachments are filtered as described under Subtitle font cleanup; other attachments are copied. The `FONT_CLEAN` lines are written to that file’s log. Track metadata (flags, titles, languages) is restored from the source. Failed files move the source MKV to `failed/` while keeping video intermediates for easy retry resuming.
 
 ## Process workflow

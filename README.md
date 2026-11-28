@@ -23,7 +23,7 @@ svt_opus_encoder.py
 
 [`tools/`](tools/) has its own programs. `mdegrain.py` needs VapourSynth with ffms2, mvtools, and zsmooth. No flag uses thsad 250. `--low` is 150, `--high` is 350, and `--thsad N` sets the strength. Combining those flags prints a warning and exits without encoding. `av1grain.py` needs [grav1synth](https://github.com/rust-av/grav1synth). The list and the `--check` command are in that readme.
 
-Common flags: `--no-downmix`, `--autocrop` (av1an scripts), `--crf` / `--preset` / `--tune` / `--grain` where the encoder supports them, `--norm-i` / `--norm-tp` (defaults −18 LUFS / −1.5 dBTP), `--nofontsclean` / `-nfc` (keep every attached font). `xav_automation.py` also has `--workers`, `--lp`, `--reserve-threads`, and `--no-taskset`.
+Common flags: `--no-downmix`, `--autocrop` (av1an scripts), `--crf` / `--preset` / `--tune` / `--grain` where the encoder supports them, `--norm-i` / `--norm-tp` (defaults −18 LUFS / −1.5 dBTP), `--nofontsclean` / `-nfc` (keep every attached font). `xav_automation.py` also has `--workers`, `--lp`, `--reserve-threads`, and `--no-taskset`, and supports per-file no-downmix by ending a filename with `nodownmix` before `.mkv` (e.g. `Movie.2016-GROUP.nodownmix.mkv`, case-insensitive; the tag stays on the output file and the decision is logged in `conv_logs/`).
 
 Audio: AAC/Opus remuxed; everything else loudnorm → Opus. Output folders: `completed/`, `original/`, `failed/`, `conv_logs/`. Encodes resume from `.prep.mkv` / `temp-*.mkv` when present.
 
