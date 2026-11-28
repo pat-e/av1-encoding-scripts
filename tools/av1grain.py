@@ -170,10 +170,29 @@ def safe_move(src, dest):
         return
     try:
         src.unlink()
-    except OSError:
+    except OSError as unlink_err:
         # Both links exist; remove the new destination link to leave src intact.
-        dest.unlink(missing_ok=True)
-        raise
+        try:
+            dest.unlink(missing_ok=True)
+        except OSError as rollback_err:
+            same_file = False
+            try:
+                same_file = os.path.samefile(src, dest)
+            except OSError:
+                pass
+            if same_file:
+                print(
+                    f"WARNING: both '{src}' and '{dest}' exist as hardlinks to the same file "
+                    f"(unlink failed: {unlink_err}; rollback failed: {rollback_err}); remove one manually.",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"WARNING: move rollback failed for '{dest}' ({rollback_err}); "
+                    f"check both '{src}' and '{dest}' manually.",
+                    file=sys.stderr,
+                )
+        raise unlink_err
 
 
 def format_mkv_decimal(value):
@@ -580,7 +599,7 @@ def main(grain_args):
             dest = DIR_SKIPPED / file_path.name
             try:
                 safe_move(file_path, dest)
-            except FileExistsError as e:
+            except OSError as e:
                 any_failed = True
                 unmoved.add(file_path.resolve())
                 log_file_path.write_text(
@@ -635,7 +654,7 @@ def main(grain_args):
                 try:
                     safe_move(file_path, failed_dest)
                     console_err.write(f"Moved to {failed_dest}\n")
-                except FileExistsError as e:
+                except OSError as e:
                     unmoved.add(file_path.resolve())
                     console_err.write(f"ERROR: Could not move '{file_path.name}': {e}. Left in place.\n")
 
